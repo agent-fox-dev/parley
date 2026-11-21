@@ -18,6 +18,7 @@ command-line client. Both are written in Go, in the module
 | `internal/carrypatch` | carry-patch workspaces: the upstream credential, the upstream fetch and base, the set-up after a fresh clone and its repetition, the patch list in the transactional store, the guard and the routes under `/workspaces/:slug/patches`, the git runner every carry-patch operation uses, push control of the integration and patch branches (the push rules' controller, the forward to origin, the trigger after an accepted write with its mirror, and the landing guard), the rebuild trigger interface, the rebuild jobs' routes and enqueue, the rebuild handler that recomputes the integration branch, with its remembered-resolution entries, and the rollback of the integration branch and the rebuild preview (see [Carry-patch workspaces](#carry-patch-workspaces) and [Durable jobs](#durable-jobs)) |
 | `internal/change` | the changes: the change record and its versions (`SchemaStep`), opening (`Open`, `CheckOpen`, `Authorize`), recording versions (`RecordVersion`, and `RefUpdated`, the ref writer's ref-updated stage), retention (`SourceDeleted`, `ForkDeleted`, `WorkspaceDeleted`), the lookups and setters other features call in their own store transaction, the collaborators registered on the instance, and the routes under `/workspaces/:slug/changes` (see [Changes](#changes)) |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
+| `internal/codeindex` | the code index of the workspaces' default branches (see [The code index](#the-code-index)): the component with its records (`code_index_records`), the handler of the job type `code_index` that writes a commit's tree and builds agentkit-go's `codesearch` index over it, the notices that queue a build (`Queue`, `QueueIn`, `BranchMoved`), the reconcile and the sweep of the maintenance task, the status route `GET /workspaces/:slug/scm/code-index` and `Files`, the query of a loaded index. It imports `config`, `jobs`, `metrics`, `store`, `server` and `access`, and no other feature package: the hub hands it the workspace's record, repository and settings as functions |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, a registry of keys and whole sections that decides what the file may hold, and the keys it owns itself, among them the fork limits of `[forks]` (`Config.Forks`), whose `max_ttl` it refuses when shorter than `default_ttl`, the read bounds of `[scm]` (`Config.SCM{ReadTimeout, MaxFileSize}`), each refused at zero or below, the mergeability debounce of `[changes]` (`Config.Changes{MergeableDebounce}`), refused when it is not a duration, and the landing options of `[land]` (`Config.Land{MaxAttempts, Timeout, Workers, CommitterName, CommitterEmail}`), refused below 1, at a timeout of zero or below, or empty |
 | `internal/event` | the hub events: every significant state change as one event, written in the caller's store transaction with a hub-wide `seq` that is never reused; the event record and its JSON form, the emit calls `Emit` and `EmitNow`, the log's bounds, the read by position and the expiry of old positions, the following of commits for waiters and `OnCommit` callbacks, the counters, the keys of `[events]`, the route `GET /api/v1/events/log` with its long-poll and the Server-Sent Events stream `GET /api/v1/events` with its limits ([ADR 05](adr/05-deliver-events-by-reading-the-log-by-position.md)); the newest-first visible read the audit query takes (`ReadNewest`, `newest.go`), and the deletes and counts of retention (`retention.go`) |
 | `internal/forge` | the forge component, the hub's client of the GitHub or GitLab repository a workspace's remote lives on: the resolution of a remote target into repository, forge kind, API URL and credential (`Resolve`, `ParseRemote`, `ResolveCredential`), the outbound `Client` and its typed `Failure`s, the mapping of a failure to a hub error (`MapError`), the route helper every forge route is built with (`Component.Route`), forge paging, the two wire mappings, the read routes (see [Forge reads](#forge-reads)), the write routes with their events (see [Forge writes](#forge-writes)), and the webhook secret's routes, the public delivery ingress, the reduction of a delivery to hub events, the delivery record and its list (see [Forge webhooks](#forge-webhooks)) |
@@ -7627,6 +7628,91 @@ record; and
 `RemoveWorkspaceRules` is a `Remover` of owned data on the workspace
 service's `Teardown` set ([ADR 07](adr/07-register-the-teardown-collaborators-on-the-workspace-service.md)),
 which deletes a removed workspace's rules in the removal's transaction.
+
+
+## The code index
+
+A hub whose configuration has `[code_index]` keeps, for every repository
+workspace whose setting `code_index` is on, the files of the head commit of
+its default branch on disk (the **tree**) and a search index built from
+them, and brings both to the new head in the background whenever that head
+moves (`internal/codeindex`, composed by `internal/hub/codeindex.go`). A
+hub without the section gets the component, its status route and the
+setting, and nothing else: no handler is registered, nothing is queued and
+no directory is made. The index is agentkit-go's `codesearch` (a nested
+module on zoekt, taken at a commit of agentkit-go's main until a release
+has `Options.IndexDir`); only `parleyd` links it, and its outlines of
+languages other than Go need the cgo build of the hub image.
+
+**On disk.** Everything is under `<data dir>/code-index/<slug>/`, one
+directory per build, named after the commit it built:
+
+```
+code-index/<slug>/<commit>/tree     the commit's files
+code-index/<slug>/<commit>/index    the index codesearch stored (its IndexDir)
+code-index/<slug>/<commit>/run      where a loaded index works; removed when it is closed
+```
+
+A build never writes into the directory of the index there is: with
+`IndexDir`, `codesearch` loads the index stored for a directory instead of
+building it, so a tree changed in place would keep its old index. The
+record (`code_index_records`: the indexed commit, partial, files, built at,
+and the commit, text and time of the last failure) names the commit, and so
+the directory, of the index there is. A failed build removes its own
+directory and leaves the other.
+
+**The tree** is written by `gitrepo.(*Repo).WriteTree` from the
+repository's objects (`git ls-tree -r` and one `git cat-file --batch`): it
+is no checkout, so there is no `.git`, no hook runs and no attribute,
+filter or line-ending conversion applies. A symbolic link is written as a
+link, a submodule entry is left out, and every file is created through an
+`os.Root` of the tree without following what is there, so nothing is
+written outside it, whatever names the commit's tree holds.
+
+**A build** is a job of the type `code_index` in the hub's queue (ADR 09).
+An attempt reads the head as it is then, writes the tree, builds the index
+with the section's bounds, asks the index's own `code_search` tool whether
+a bound stopped it (the one place it says so) and closes it; the record is
+written in the transaction that settles the job (`Settled`), so a build
+whose job is gone with its workspace, or that a stop gave up, leaves no
+record and counts as no outcome. A bound leaves a partial index and a
+completed job; any other error fails the attempt, which the queue retries.
+`[code_index].workers` is the queue's limit of that type
+(`jobs.(*Queue).Limit`): a build beyond it stays queued and counts no
+attempt. Once a settlement has committed, the builds the record no longer
+names are removed and `parley_code_index_bytes` is measured.
+
+**What queues a build** is listed in
+[ADR 11](adr/11-tell-the-code-index-where-a-head-is-written.md): the ref
+writer's post-push listener, the clone observer, the branch move observer
+of a sync, the notice after a rebuild's publish, and the update observer
+for the setting. `Queue` makes a failed build that waits due at once
+(`jobs.(*Queue).Hasten`) and queues one more beside a running build
+(`EnqueueFollowUp`), so there is at most one pending build beside the one
+that runs, and it takes the head as it is when it starts.
+
+**The maintenance task** `code_index`, and the start hook after the queue
+has recovered, reconcile: a build is queued for every workspace whose index
+is not at its head and that has none pending (a failed one keeps its
+delay). The task then sweeps the directory: the directory and the record of
+a workspace that does not exist any more or that the hub keeps no index of
+go, and of the others every build but the one the record names and the last
+one this process began.
+
+**Removal.** A deleted workspace's record goes in the delete's transaction
+(a remover of ADR 07), its jobs with the queue's own remover, which also
+ends the build that runs, and its directory in the next maintenance pass.
+Turning the setting off cancels the waiting builds and interrupts the
+running one at once (`jobs.(*Queue).CancelPending` and `Interrupt`); the
+pass removes the rest. An archived workspace keeps everything.
+
+**Use.** `Files(ctx, slug, query)` loads the index the record names on its
+first use (`Build` over the stored directories loads; a partial index,
+which is not stored whole, is built again within its bounds) and keeps it
+until the record names another; the background work `code-index` closes
+the loaded indexes at the hub's stop. One that cannot be loaded is treated
+as none: its directory is removed and its build queued. The status route
+(`status.go`) answers from the record, the head and the queue.
 
 ## parley
 

@@ -1003,7 +1003,7 @@ name; a page is never refused for it.
 | `parley_http_requests_total` | counter | `method`, `path`, `status` | every HTTP request the hub answered, REST, git, the forge webhook ingress, `/healthz`, `/readyz`, `/version` and `/metrics` itself included. `method` is the request's method in upper case, `OTHER` for any method but `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, `CONNECT` and `TRACE`; `path` is the route that matched, as a template (`/api/v1/workspaces/{slug}/sync`, `/git/{org}/{repo}/info/refs`, `/healthz`), never the request's own path, and `unmatched` when no route matched (an unknown path, a method no route of the path has); `status` the three digits sent, `101` for a request whose connection the hub took over (a sandbox's attach) |
 | `parley_http_request_duration_seconds` | histogram | `method`, `path` | the time to answer, by the same `method` and `path`. Buckets `0.005`, `0.01`, `0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10` |
 | `parley_git_requests_total` | counter | `service` (`info-refs`, `upload-pack`, `receive-pack`), `result` (`ok`, `refused`, `error`) | git protocol requests, as in [Git over HTTP](#git-over-http) |
-| `parley_scm_requests_total` | counter | `op` (`refs`, `commits`, `tree`, `file`, `diff`, `compare`, `blame`, `search`, `outline`, `commit`, `ref_create`, `ref_move`, `ref_delete`, `rebase`), `result` (`ok`, `ref_moved`, `refused`, `error`) | source control API requests, reads and writes |
+| `parley_scm_requests_total` | counter | `op` (`refs`, `commits`, `tree`, `file`, `diff`, `compare`, `blame`, `search`, `outline`, `code_index`, `commit`, `ref_create`, `ref_move`, `ref_delete`, `rebase`), `result` (`ok`, `ref_moved`, `refused`, `error`) | source control API requests, reads and writes |
 | `parley_changes_open` | gauge | `workspace` | changes in state `draft` or `open` |
 | `parley_lands_total` | counter | `result` (`landed`, `conflict`, `blocked`, `failed`) | land attempts by final status |
 | `parley_land_attempts` | histogram | none | compare-and-swap tries per land attempt. Buckets `1`, `2`, `3`, `5`, `8`, `13` |
@@ -1029,6 +1029,9 @@ name; a page is never refused for it.
 | `parley_sandbox_denials_total` | counter | none | connections and requests the sandbox runtime blocked |
 | `parley_sandbox_checkpoints_total` | counter | `result` (`ok`, `empty`, `failed`) | checkpoints attempted |
 | `parley_sandbox_runtime_up` | gauge | none | `1` while the sandbox runtime is reachable |
+| `parley_code_index_builds_total` | counter | `outcome` (`ok`, `partial`, `failed`) | code index builds that ended; a build stopped by a bound is `partial`, and one ended from outside (the hub's stop, the workspace's delete, its setting turned off) is counted under none |
+| `parley_code_index_build_duration_seconds` | histogram | none | time a counted build ran, in seconds; buckets 0.1, 0.5, 1, 5, 10, 30, 60, 120, 300, 600 |
+| `parley_code_index_bytes` | gauge | none | bytes of the trees and indexes under the hub's code index directory, measured at start, after every build and after every maintenance pass, not at every scrape |
 
 The sandbox metrics stay at `0` while sandboxes are off. Counters start
 from zero when `parleyd` starts.
@@ -1499,7 +1502,7 @@ authenticates, cannot be changed. A refused request changes nothing.
 ## Workspace settings
 
 Every workspace object holds `settings`, a flat object with exactly these
-21 keys, each with its effective value: the value stored for the key when
+22 keys, each with its effective value: the value stored for the key when
 it was set, otherwise its default. Only the keys set are stored.
 
 | Key | Type | Values | Default |
@@ -1525,6 +1528,7 @@ it was set, otherwise its default. Only the keys set are stored.
 | `rebuild_fail_mode` | enum | `fail_fast`, `continue` | `fail_fast` |
 | `rebuild_push_integration_branch` | bool | | `false` |
 | `squash_merge_detection` | enum | `ancestry_only`, `content_based`, `both` | `both` |
+| `code_index` | bool | | `true` |
 
 A bool key is a JSON boolean, an enum or URL key a JSON string and
 `protected_branches` a JSON array of strings, in the order given. A URL key
@@ -1616,11 +1620,11 @@ slug of its org; `hub_url`, the workspace's git remote on the hub,
 `<[server].external_url>/git/<org_slug>/<slug>.git` with one trailing `/`
 of the external URL removed, or `null` when no external URL is configured;
 `access`, the caller's level (`owner` for the creator); and `settings`,
-all 21 setting keys with their effective values (see
+all 22 setting keys with their effective values (see
 [Workspace settings](#workspace-settings)).
 
 ```json
-{"slug":"demo","kind":"repository","workspace_mode":"standard","git_url":"https://example.com/a.git","default_branch":null,"owner_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","org_id":"5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b","org_slug":"octocat","status":"pending","display_name":"demo","description":"","head_sha":null,"origin_head_sha":null,"clone_error":null,"last_sync_at":null,"sync_error":null,"upstream_url":null,"integration_branch":null,"upstream_head_sha":null,"parent_slug":null,"fork_point":null,"expires_at":null,"auto_change":null,"purpose":null,"session_id":null,"settings":{"sync_enabled":true,"protected_branches":[],"protect.owner_push":true,"land.strategy":"rebase","land.by_author":true,"land.delete_source":true,"land.allow_override":true,"changes.require_intent":true,"changes.auto_restack":true,"audit_fetches":false,"forge_api_url":"","upstream_forge_api_url":"","patch_branch_source":"hub","patch_divergence_policy":"replace","push_patches_to_origin":false,"auto_rebuild_after_push":true,"auto_rebuild_after_sync":true,"rebuild_strategy":"rebase","rebuild_fail_mode":"fail_fast","rebuild_push_integration_branch":false,"squash_merge_detection":"both"},"hub_url":"https://hub.example/git/octocat/demo.git","access":"owner","created_at":"2026-11-14T10:30:15Z","updated_at":"2026-11-14T10:30:15Z"}
+{"slug":"demo","kind":"repository","workspace_mode":"standard","git_url":"https://example.com/a.git","default_branch":null,"owner_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","org_id":"5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b","org_slug":"octocat","status":"pending","display_name":"demo","description":"","head_sha":null,"origin_head_sha":null,"clone_error":null,"last_sync_at":null,"sync_error":null,"upstream_url":null,"integration_branch":null,"upstream_head_sha":null,"parent_slug":null,"fork_point":null,"expires_at":null,"auto_change":null,"purpose":null,"session_id":null,"settings":{"sync_enabled":true,"protected_branches":[],"protect.owner_push":true,"land.strategy":"rebase","land.by_author":true,"land.delete_source":true,"land.allow_override":true,"changes.require_intent":true,"changes.auto_restack":true,"audit_fetches":false,"forge_api_url":"","upstream_forge_api_url":"","patch_branch_source":"hub","patch_divergence_policy":"replace","push_patches_to_origin":false,"auto_rebuild_after_push":true,"auto_rebuild_after_sync":true,"rebuild_strategy":"rebase","rebuild_fail_mode":"fail_fast","rebuild_push_integration_branch":false,"squash_merge_detection":"both","code_index":true},"hub_url":"https://hub.example/git/octocat/demo.git","access":"owner","created_at":"2026-11-14T10:30:15Z","updated_at":"2026-11-14T10:30:15Z"}
 ```
 
 | Status | When |
@@ -4474,6 +4478,55 @@ with cgo.
 
 ```json
 {"path":"router.go","resolved_sha":"3d0c5a1f0b6e2d5c8a7f4e9b1c2d3e4f5a6b7c8d","language":"Go","supported":true,"declarations":[{"kind":"const","name":"MaxRoutes","container":"","signature":"const MaxRoutes","exported":true,"start_line":4,"end_line":4},{"kind":"type","name":"Router","container":"","signature":"type Router struct","exported":true,"start_line":6,"end_line":8},{"kind":"method","name":"Handle","container":"Router","signature":"func (r *Router) Handle(pattern string)","exported":true,"start_line":10,"end_line":12},{"kind":"func","name":"NewRouter","container":"","signature":"func NewRouter() *Router","exported":true,"start_line":14,"end_line":16},{"kind":"func","name":"match","container":"","signature":"func match(pattern, path string) bool","exported":false,"start_line":18,"end_line":20}]}
+```
+
+
+## `GET /api/v1/workspaces/{slug}/scm/code-index`
+
+Answers which commit the code index of the workspace `{slug}` holds and
+what state it is in. The hub keeps a code index of the head of the default
+branch of every repository workspace when its configuration has
+`[code_index]` (see [configuration.md](configuration.md)) and the
+workspace's setting `code_index` is on (see
+[Workspace settings](#workspace-settings)); it builds it in the background
+whenever that head moves. The route takes the admin token, an API key or a
+PAT, declares the scope `git:read` for a PAT and needs read access to the
+workspace, as the [source control reads](#source-control-reads) do, and its
+requests are counted in `parley_scm_requests_total` under the op
+`code_index`. It carries no entity tag: its answer changes without a ref
+moving. It takes no query parameter.
+
+| Member | Value |
+|---|---|
+| `workspace` | the workspace the answer is of: `{slug}`, or the parent's slug when `{slug}` is a task fork, which has no index of its own and is answered for its parent |
+| `enabled` | `true` when the hub has `[code_index]` and the workspace's setting `code_index` is on |
+| `state` | `off`, `queued`, `building`, `ready` or `failed` (below) |
+| `head_sha` | the head of the default branch, `null` while the workspace has no repository or no such branch |
+| `indexed_sha` | the commit the index there is was built from, `null` when there is none |
+| `partial` | `true` when a bound (`max_files`, `max_size`, `build_timeout`) stopped the build of that index, which then holds some of the files; `false` when there is none |
+| `files_indexed` | how many files that index holds, `0` when there is none |
+| `built_at` | when that index was built, RFC 3339 in UTC, `null` when there is none |
+| `error` | the failure of the last build when it failed, with what the hub keeps secret removed and cut to 1,024 bytes; `null` otherwise. A build that succeeds clears it |
+
+`indexed_sha`, `partial`, `files_indexed` and `built_at` describe the index
+there is in every state: while a build of a new head runs or waits, and
+after one failed, they are those of the index built before.
+
+| `state` | When |
+|---|---|
+| `off` | `enabled` is `false`. What is left of an index is removed in the next maintenance pass |
+| `building` | a build of the workspace is running |
+| `ready` | no build is running and `indexed_sha` is `head_sha` |
+| `failed` | no build is running and the last build of `head_sha` failed; it is retried with growing delays, and at once when the head moves |
+| `queued` | otherwise: the index is not at the head and a build waits or is due, a workspace without a repository yet included |
+
+| Status | When |
+|---|---|
+| `200 OK` | the status, also with the feature or the setting off |
+| `401`, `403` `insufficient_scope`, `404` `not_found` | the checks of the source control reads |
+
+```json
+{"workspace":"demo","enabled":true,"state":"ready","head_sha":"3d0c5a1f0b6e2d5c8a7f4e9b1c2d3e4f5a6b7c8d","indexed_sha":"3d0c5a1f0b6e2d5c8a7f4e9b1c2d3e4f5a6b7c8d","partial":false,"files_indexed":412,"built_at":"2026-11-21T16:05:12Z","error":null}
 ```
 
 ## Source control writes
