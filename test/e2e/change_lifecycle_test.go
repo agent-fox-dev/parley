@@ -27,14 +27,13 @@ type lifecycleHub struct {
 
 func startLifecycleHub(t *testing.T) *lifecycleHub {
 	t.Helper()
-	return startLifecycleHubTOML(t, "")
+	return startLifecycleHubExtra(t, hubExtra{})
 }
 
-// startLifecycleHubTOML is startLifecycleHub with toml added to the hub's
-// config.toml.
-func startLifecycleHubTOML(t *testing.T, toml string) *lifecycleHub {
+// startLifecycleHubExtra is startLifecycleHub with extra.
+func startLifecycleHubExtra(t *testing.T, extra hubExtra) *lifecycleHub {
 	t.Helper()
-	h := &lifecycleHub{forkHub: startForkHubTOML(t, nil, toml, func(c *hub.Composition) {
+	h := &lifecycleHub{forkHub: startForkHubExtra(t, nil, extra, func(c *hub.Composition) {
 		c.AdjustChange(func(d *change.Deps) { d.MergeableDebounce = 0 })
 	})}
 	owner := cloneAs(t, h.forkHub, h.key, "demo")

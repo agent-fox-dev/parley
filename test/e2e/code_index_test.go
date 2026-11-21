@@ -3,7 +3,12 @@ package e2e
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -40,7 +45,7 @@ func indexFollows(t *testing.T, index func() *codeindex.Component, slug, repo, a
 func TestCodeIndex_FollowsTheHeadWhateverMovesIt(t *testing.T) {
 	parallel(t)
 	t.Run("a push, a land and the source control API", func(t *testing.T) {
-		h := startLifecycleHubTOML(t, codeIndexOn)
+		h := startLifecycleHubExtra(t, hubExtra{TOML: codeIndexOn})
 		index, repo := h.comp.CodeIndex, h.repo("demo")
 		// The hub's set-up pushed to main already.
 		indexFollows(t, index, "demo", repo, "the first clone and a push")
@@ -97,7 +102,7 @@ func TestCodeIndex_FollowsTheHeadWhateverMovesIt(t *testing.T) {
 	t.Run("a sync and a reclone", func(t *testing.T) {
 		origin := pushOrigin(t)
 		var comp *hub.Composition
-		h := startWorkspaceHubTOML(t, origin, "demo", nil, codeIndexOn, func(c *hub.Composition) { comp = c })
+		h := startWorkspaceHubExtra(t, origin, "demo", nil, hubExtra{TOML: codeIndexOn}, func(c *hub.Composition) { comp = c })
 		index, repo := func() *codeindex.Component { return comp.CodeIndex() }, comp.Workspaces().RepoPath("demo")
 		h.createReady(t, "demo", origin.URL())
 		indexFollows(t, index, "demo", repo, "the first clone")
@@ -158,4 +163,130 @@ func TestCodeIndex_FollowsTheHeadWhateverMovesIt(t *testing.T) {
 		}
 		indexFollows(t, index, "acme-fork", repo, "a rebuild")
 	})
+}
+
+// codeIndexStatus is what parley scm code-index prints.
+type codeIndexStatus struct {
+	Enabled      bool    `json:"enabled"`
+	State        string  `json:"state"`
+	IndexedSHA   *string `json:"indexed_sha"`
+	Partial      bool    `json:"partial"`
+	FilesIndexed int     `json:"files_indexed"`
+	BuiltAt      *string `json:"built_at"`
+}
+
+// codeIndexUntil runs parley scm code-index, as run does, until it prints
+// the state want or 30 s have passed, and returns what it printed last.
+func codeIndexUntil(t *testing.T, run func() ran, want string) codeIndexStatus {
+	t.Helper()
+	var st codeIndexStatus
+	var last ran
+	waitUntil(30*time.Second, func() bool {
+		last = run()
+		st = codeIndexStatus{}
+		return last.code == 0 && json.Unmarshal([]byte(last.stdout), &st) == nil && st.State == want
+	})
+	if st.State != want {
+		t.Fatalf("parley scm code-index exited %d and printed %q (stderr %s), want the state %s within 30 s", last.code, last.stdout, last.stderr, want)
+	}
+	return st
+}
+
+// codeIndexBuilds is the hub's count of ended builds by outcome.
+func codeIndexBuilds(t *testing.T, h *hubtest.Hub) map[string]float64 {
+	t.Helper()
+	resp, err := http.Get(h.URL("/metrics"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	_, samples := parseExposition(t, resp.Body)
+	counts := map[string]float64{}
+	for _, outcome := range []string{"ok", "partial", "failed"} {
+		counts[outcome] = samples[`parley_code_index_builds_total{outcome="`+outcome+`"}`]
+	}
+	return counts
+}
+
+// A developer lands a change and sees the index follow; an operator
+// restarts the hub and no index is built again; the developer turns the
+// index of the workspace off and it is gone after a maintenance pass.
+func TestCodeIndex_FollowsALandSurvivesARestartAndGoesWithItsSetting(t *testing.T) {
+	parallel(t)
+	h := startLifecycleHubExtra(t, hubExtra{TOML: codeIndexOn, MaintenanceInterval: 200 * time.Millisecond})
+	status := func() ran { return h.runAs(t, h.key, "scm", "code-index", "demo") }
+
+	agent := cloneAs(t, h.forkHub, h.agent, "demo--t1")
+	agent("checkout", "--quiet", "-b", "feat")
+	commitFile(t, agent, "landed.go", "package landed\n\nfunc Landed() {}\n", "Add landed.go")
+	agent("push", "--quiet", "origin", "feat")
+	n := h.open(t, h.agent, "demo--t1", "feat", map[string]any{"intent": "why"})
+	if code, body := h.land(t, h.key, n, "?wait=30"); code != http.StatusOK || body["status"] != "landed" {
+		t.Fatalf("land the change = %d %v, want it landed", code, body)
+	}
+	landed := gitrepotest.Refs(t, h.repo("demo"), "refs/heads/")["main"]
+
+	var st codeIndexStatus
+	waitUntil(30*time.Second, func() bool {
+		st = codeIndexUntil(t, status, "ready")
+		return st.IndexedSHA != nil && *st.IndexedSHA == landed
+	})
+	if !st.Enabled || st.Partial || st.IndexedSHA == nil || *st.IndexedSHA != landed || st.BuiltAt == nil {
+		t.Fatalf("parley scm code-index demo printed %+v, want ready, enabled, not partial and the landed commit %s", st, landed)
+	}
+	tree := h.comp.CodeIndex().TreeDir("demo", landed)
+	if content, err := os.ReadFile(filepath.Join(tree, "landed.go")); err != nil || !strings.Contains(string(content), "func Landed") {
+		t.Errorf("the tree of demo holds landed.go as %q (%v), want the file the change added", content, err)
+	}
+	if n := codeIndexBuilds(t, h.Hub); n["ok"] < 1 || n["failed"] != 0 {
+		t.Errorf("builds by outcome = %v, want at least one ok and none failed", n)
+	}
+
+	h.Restart(t)
+	after := codeIndexUntil(t, status, "ready")
+	if after.IndexedSHA == nil || *after.IndexedSHA != landed || after.BuiltAt == nil || *after.BuiltAt != *st.BuiltAt {
+		t.Errorf("after the restart parley scm code-index demo printed %+v, want the index of %s built at %s as before", after, landed, *st.BuiltAt)
+	}
+	// A maintenance pass has run by now; it found nothing to build.
+	time.Sleep(500 * time.Millisecond)
+	if n := codeIndexBuilds(t, h.Hub); n["ok"] != 0 || n["partial"] != 0 || n["failed"] != 0 {
+		t.Errorf("builds after the restart = %v, want none", n)
+	}
+
+	if r := h.runAs(t, h.key, "workspace", "update", "demo", "--setting", "code_index=false"); r.code != 0 {
+		t.Fatalf("workspace update --setting code_index=false exited %d: %s", r.code, r.stderr)
+	}
+	off := codeIndexUntil(t, status, "off")
+	waitUntil(10*time.Second, func() bool {
+		_, err := os.Stat(filepath.Dir(filepath.Dir(tree)))
+		return os.IsNotExist(err)
+	})
+	if _, err := os.Stat(filepath.Dir(filepath.Dir(tree))); !os.IsNotExist(err) || off.Enabled {
+		t.Errorf("after the setting was turned off the status is %+v and the directory of demo is there (%v), want off and nothing of demo left", off, err)
+	}
+	if gone := codeIndexUntil(t, status, "off"); gone.IndexedSHA != nil {
+		t.Errorf("after a maintenance pass parley scm code-index demo printed %+v, want nothing left of the index", gone)
+	}
+}
+
+// An operator bounds the index below the size of a repository, which gets
+// a partial index that says so.
+func TestCodeIndex_GivesAnOversizedRepositoryAPartialIndex(t *testing.T) {
+	parallel(t)
+	origin := gitrepotest.SmartOrigin(t, gitrepotest.WithBasicAuth("x-token-auth", syncToken))
+	files := map[string]string{}
+	for i := range 10 {
+		files[fmt.Sprintf("f%d.go", i)] = fmt.Sprintf("package big\n\nfunc F%d() {}\n", i)
+	}
+	origin.Branch("main", gitrepotest.Commit(t, origin.Dir(), "ten files", files))
+	h := startWorkspaceHubExtra(t, origin, "big", nil, hubExtra{TOML: "[code_index]\nmax_files = 3\n"})
+	h.createReady(t, "big", origin.URL())
+
+	st := codeIndexUntil(t, func() ran { return h.run(t, "scm", "code-index", "big") }, "ready")
+	if !st.Partial || st.FilesIndexed > 3 || st.FilesIndexed < 1 || !st.Enabled {
+		t.Errorf("parley scm code-index big printed %+v, want ready and partial with at most 3 files", st)
+	}
+	if n := codeIndexBuilds(t, h.Hub); n["partial"] != 1 || n["ok"] != 0 || n["failed"] != 0 {
+		t.Errorf("builds by outcome = %v, want one partial", n)
+	}
 }

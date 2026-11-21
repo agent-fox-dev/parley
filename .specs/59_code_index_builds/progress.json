@@ -3,7 +3,7 @@
   "spec_id": "59",
   "spec_name": "code_index_builds",
   "schema_version": 3,
-  "updated_at": "2026-11-21T16:03:59Z",
+  "updated_at": "2026-11-21T16:08:03Z",
   "tasks": [
     {
       "id": 1,
@@ -546,7 +546,45 @@
     },
     {
       "id": 6,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "PATH-1",
+          "tests": [
+            {
+              "test": "./test/e2e:TestCodeIndex_FollowsALandSurvivesARestartAndGoesWithItsSetting",
+              "passed": {
+                "at": "2026-11-21T16:07:59Z",
+                "tree": "bc210c9666f7e48d786e1b1d2a82bb92a61a6a23"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "PATH-2",
+          "tests": [
+            {
+              "test": "./test/e2e:TestCodeIndex_FollowsALandSurvivesARestartAndGoesWithItsSetting",
+              "passed": {
+                "at": "2026-11-21T16:07:59Z",
+                "tree": "bc210c9666f7e48d786e1b1d2a82bb92a61a6a23"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "PATH-3",
+          "tests": [
+            {
+              "test": "./test/e2e:TestCodeIndex_GivesAnOversizedRepositoryAPartialIndex",
+              "passed": {
+                "at": "2026-11-21T16:07:59Z",
+                "tree": "bc210c9666f7e48d786e1b1d2a82bb92a61a6a23"
+              }
+            }
+          ]
+        }
+      ]
     }
   ]
 }

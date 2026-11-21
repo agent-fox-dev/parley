@@ -57,12 +57,19 @@ func startWorkspaceHub(t *testing.T, origin *gitrepotest.Origin, slug string, co
 // for time.Now.
 func startWorkspaceHubAt(t *testing.T, origin *gitrepotest.Origin, slug string, now func() time.Time, compose ...func(*hub.Composition)) *workspaceHub {
 	t.Helper()
-	return startWorkspaceHubTOML(t, origin, slug, now, "", compose...)
+	return startWorkspaceHubExtra(t, origin, slug, now, hubExtra{}, compose...)
 }
 
-// startWorkspaceHubTOML is startWorkspaceHubAt with toml added to the hub's
-// config.toml, such as a section that turns a feature on.
-func startWorkspaceHubTOML(t *testing.T, origin *gitrepotest.Origin, slug string, now func() time.Time, toml string, compose ...func(*hub.Composition)) *workspaceHub {
+// hubExtra is what a test adds to the hub a starter starts: text for its
+// config.toml, such as a section that turns a feature on, and the time
+// between two maintenance passes, the hub's own when zero.
+type hubExtra struct {
+	TOML                string
+	MaintenanceInterval time.Duration
+}
+
+// startWorkspaceHubExtra is startWorkspaceHubAt with extra.
+func startWorkspaceHubExtra(t *testing.T, origin *gitrepotest.Origin, slug string, now func() time.Time, extra hubExtra, compose ...func(*hub.Composition)) *workspaceHub {
 	t.Helper()
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
@@ -71,12 +78,13 @@ func startWorkspaceHubTOML(t *testing.T, origin *gitrepotest.Origin, slug string
 	h := &workspaceHub{root: t.TempDir(), origin: origin}
 	h.Hub = hubtest.StartWith(t, hubtest.Config{
 		Server: `external_url = "https://hub.example/"`,
-		TOML:   "[workspace]\npath = " + quote(h.root) + "\nworkers = 2\n" + toml,
+		TOML:   "[workspace]\npath = " + quote(h.root) + "\nworkers = 2\n" + extra.TOML,
 		Env: map[string]string{
 			"GIT_SSL_CAINFO":     origin.CAFile(),
 			secret.EnvCurrentKey: base64.StdEncoding.EncodeToString(raw),
 		},
-		Now: now,
+		Now:                 now,
+		MaintenanceInterval: extra.MaintenanceInterval,
 		Compose: func(c *hub.Composition) {
 			c.AdjustWorkspace(func(d *workspace.Deps) {
 				w, _, err := workspace.BySlug(context.Background(), d.Store.Main(), slug)
