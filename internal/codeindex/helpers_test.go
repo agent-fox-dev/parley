@@ -364,11 +364,20 @@ func (s *seam) waitEnded(t *testing.T, part string) {
 	}
 }
 
-// hold makes the builds of the trees whose path holds part wait, and
-// returns what lets them go.
+// hold makes the builds of the trees whose path holds part wait from now
+// on, and returns what lets them go.
 func (s *seam) hold(part string) (release func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// The builds that began before are not the ones held: forgotten, so
+	// that waitBegan waits for one that began under this hold.
+	for drained := false; !drained; {
+		select {
+		case <-s.began:
+		default:
+			drained = true
+		}
+	}
 	ch := make(chan struct{})
 	s.held[part] = ch
 	return sync.OnceFunc(func() { close(ch) })

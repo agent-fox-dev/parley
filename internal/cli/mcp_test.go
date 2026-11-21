@@ -247,6 +247,33 @@ func TestMCPList_ServesTheStateOfTheCodeIndexAsAReadingTool(t *testing.T) {
 	}
 }
 
+func TestMCPList_ServesCodeSearchAndSymbolsAsReadingTools(t *testing.T) {
+	tools := mcpList(t, defaultOptions(), "--no-code-mode", "--read-only")
+	for _, tc := range []struct {
+		name     string
+		required []string
+		optional map[string]string
+	}{
+		{"scm_code_search", []string{"query", "slug"}, map[string]string{"limit": "integer"}},
+		{"scm_symbols", []string{"name", "slug"}, map[string]string{"exact": "boolean", "kind": "string", "path": "string", "limit": "integer"}},
+	} {
+		in := toolNamed(t, tools, tc.name).InputSchema
+		if required := slices.Sorted(slices.Values(in.Required)); !slices.Equal(required, tc.required) {
+			t.Errorf("%s requires %v, want %v", tc.name, in.Required, tc.required)
+		}
+		for _, param := range tc.required {
+			if in.Properties[param]["type"] != "string" {
+				t.Errorf("%s: the parameter %s is %v, want a string", tc.name, param, in.Properties[param])
+			}
+		}
+		for param, typ := range tc.optional {
+			if in.Properties[param]["type"] != typ {
+				t.Errorf("%s: the parameter %s is %v, want %s", tc.name, param, in.Properties[param], typ)
+			}
+		}
+	}
+}
+
 func TestMCPList_ServesTheGroupsNamed(t *testing.T) {
 	cmds := helpCommands(t, defaultOptions())
 	in := func(groups ...string) func(string, commandHelp) bool {

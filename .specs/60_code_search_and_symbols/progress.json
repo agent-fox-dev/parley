@@ -3,7 +3,7 @@
   "spec_id": "60",
   "spec_name": "code_search_and_symbols",
   "schema_version": 3,
-  "updated_at": "2026-11-21T17:04:24Z",
+  "updated_at": "2026-11-21T17:17:29Z",
   "tasks": [
     {
       "id": 1,
@@ -452,7 +452,57 @@
     },
     {
       "id": 5,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-6.1",
+          "tests": [
+            {
+              "test": "./internal/cli:TestSCM_ReadsSendOneGetAndPrintTheAnswer",
+              "failed": {
+                "at": "2026-11-21T17:04:24Z",
+                "tree": "afc0806cf64858f314090f09d34cea90214dd134"
+              },
+              "passed": {
+                "at": "2026-11-21T17:17:28Z",
+                "tree": "3c40a0920b29c93650e54b31f2c8ee9a07eabd8e"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.2",
+          "tests": [
+            {
+              "test": "./internal/cli:TestSCM_ReadsSendOneGetAndPrintTheAnswer",
+              "failed": {
+                "at": "2026-11-21T17:04:24Z",
+                "tree": "afc0806cf64858f314090f09d34cea90214dd134"
+              },
+              "passed": {
+                "at": "2026-11-21T17:17:28Z",
+                "tree": "3c40a0920b29c93650e54b31f2c8ee9a07eabd8e"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.3",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCPList_ServesCodeSearchAndSymbolsAsReadingTools",
+              "failed": {
+                "at": "2026-11-21T17:04:24Z",
+                "tree": "afc0806cf64858f314090f09d34cea90214dd134"
+              },
+              "passed": {
+                "at": "2026-11-21T17:17:28Z",
+                "tree": "3c40a0920b29c93650e54b31f2c8ee9a07eabd8e"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 6,
