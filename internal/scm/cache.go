@@ -101,3 +101,20 @@ func uncached(h http.Header) func() {
 		}
 	}
 }
+
+// Revalidated gives the answer of a read that another package serves under
+// the source control API the caching headers of a read to revalidate, with
+// an entity tag digested from the request's path and query and parts, and
+// reports whether the caller's copy is current, in which case it has
+// answered 304 with no body. The read calls it once what its answer is
+// computed from is known and before the costly part.
+func Revalidated(w http.ResponseWriter, r *http.Request, parts ...string) bool {
+	return notModified(w, r, false, parts...)
+}
+
+// Uncached is what restores the caching headers of h, as they are before a
+// read's handler runs, for an error answer: no entity tag, and the
+// Cache-Control and Vary the server set for every answer. A read another
+// package serves takes it before its handler runs and calls it when the
+// handler failed.
+func Uncached(h http.Header) func() { return uncached(h) }

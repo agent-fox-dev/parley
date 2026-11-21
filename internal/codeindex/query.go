@@ -54,7 +54,13 @@ func (c *Component) query(op string, h server.HandlerFunc) server.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) error {
 		ctx, cancel := context.WithTimeoutCause(r.Context(), c.deps.ReadTimeout, errReadTimeout)
 		defer cancel()
+		// A refusal carries none of the caching headers its handler set
+		// before it failed.
+		uncached := scm.Uncached(w.Header())
 		err := h(w, r.WithContext(ctx))
+		if err != nil {
+			uncached()
+		}
 		if _, answered := errors.AsType[*server.Error](err); err != nil && !answered && context.Cause(ctx) == errReadTimeout {
 			err = server.NewError("scm_timeout", http.StatusServiceUnavailable,
 				fmt.Sprintf("the read did not finish within the read timeout of %s", c.deps.ReadTimeout))
@@ -280,6 +286,11 @@ func (c *Component) getSearch(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	defer done()
+	// The answer is the index's of this commit to this query: a caller who
+	// holds it is told so before the index is asked.
+	if scm.Revalidated(w, r, indexed) {
+		return nil
+	}
 	res, err := idx.Search(ctx, q, limit)
 	var bad *QueryError
 	switch {
@@ -380,6 +391,9 @@ func (c *Component) getSymbols(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	defer done()
+	if scm.Revalidated(w, r, indexed) {
+		return nil
+	}
 	found, answered, err := idx.Symbols(ctx, q)
 	if err != nil {
 		return err

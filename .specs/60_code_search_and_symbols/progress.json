@@ -3,7 +3,7 @@
   "spec_id": "60",
   "spec_name": "code_search_and_symbols",
   "schema_version": 3,
-  "updated_at": "2026-11-21T16:59:20Z",
+  "updated_at": "2026-11-21T17:04:24Z",
   "tasks": [
     {
       "id": 1,
@@ -388,7 +388,67 @@
     },
     {
       "id": 4,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-4.1",
+          "no_red": "the checks the two routes share take a fork's parent since task 1 and the waiting rule is the parent's since task 3, whose tests failed first; this test asserts the fork's answers, a token bound to the fork and the wait for the parent's build, and fails once any of them is the fork's own",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestQuery_AnswersAForkFromItsParentsIndexAndSaysSo",
+              "passed": {
+                "at": "2026-11-21T17:04:21Z",
+                "tree": "11ac636e7a129683dda9e2f75cee8d1c574959cf"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.1",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestQuery_TagsAnAnswerByTheIndexedCommitAndTheQuery",
+              "failed": {
+                "at": "2026-11-21T17:00:20Z",
+                "tree": "fe41882a7e33c3f75e5fd82dcb7b93ee5a54f5a8"
+              },
+              "passed": {
+                "at": "2026-11-21T17:04:21Z",
+                "tree": "11ac636e7a129683dda9e2f75cee8d1c574959cf"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.2",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestQuery_AnswersNotModifiedWithoutAskingTheIndex",
+              "failed": {
+                "at": "2026-11-21T17:00:20Z",
+                "tree": "fe41882a7e33c3f75e5fd82dcb7b93ee5a54f5a8"
+              },
+              "passed": {
+                "at": "2026-11-21T17:04:21Z",
+                "tree": "11ac636e7a129683dda9e2f75cee8d1c574959cf"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.3",
+          "no_red": "before an answer carries a tag no refusal can keep one; the test fails once a refusal after the tag was set, such as a query the index cannot parse, still carries it",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestQuery_LeavesARefusalWithoutATagAndUncached",
+              "passed": {
+                "at": "2026-11-21T17:04:21Z",
+                "tree": "11ac636e7a129683dda9e2f75cee8d1c574959cf"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 5,
