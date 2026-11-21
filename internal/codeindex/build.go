@@ -60,6 +60,8 @@ type attempt struct {
 	took      time.Duration
 	// err is why the build failed, nil when it built.
 	err error
+	// moved says that the head was another commit when the build ended.
+	moved bool
 }
 
 // workspaceDir is the directory that holds everything of the workspace
@@ -97,16 +99,48 @@ func (c *Component) Queue(ctx context.Context, slug string) error {
 	if err != nil || !found || !c.indexes(ws) {
 		return err
 	}
-	return c.deps.Store.Tx(ctx, func(tx *sql.Tx) error { return c.queueIn(ctx, tx, slug) })
+	return c.deps.Store.Tx(ctx, func(tx *sql.Tx) error { return c.queueIn(ctx, tx, slug, true) })
 }
 
-// queueIn is Queue in tx, for a workspace the hub keeps an index of.
-func (c *Component) queueIn(ctx context.Context, tx *sql.Tx, slug string) error {
+// QueueIn is Queue in tx, for a caller that learns of a new head inside a
+// transaction of its own: the build is queued when tx commits.
+func (c *Component) QueueIn(ctx context.Context, tx *sql.Tx, slug string) error {
+	if !c.Enabled() {
+		return nil
+	}
+	ws, found, err := c.deps.Workspace(ctx, slug)
+	if err != nil || !found || !c.indexes(ws) {
+		return err
+	}
+	return c.queueIn(ctx, tx, slug, true)
+}
+
+// BranchMoved queues a build of the workspace slug when branch, a branch
+// that has just moved in it, is its default branch.
+func (c *Component) BranchMoved(ctx context.Context, slug, branch string) error {
+	if !c.Enabled() {
+		return nil
+	}
+	ws, found, err := c.deps.Workspace(ctx, slug)
+	if err != nil || !found || !c.indexes(ws) || ws.DefaultBranch != branch {
+		return err
+	}
+	return c.deps.Store.Tx(ctx, func(tx *sql.Tx) error { return c.queueIn(ctx, tx, slug, true) })
+}
+
+// queueIn queues, in tx, a build of the workspace slug, which the hub keeps
+// an index of. With hasten, a build that failed and waits is made due at
+// once, as for a head that moved; without, it keeps its delay, as for a
+// look at a head that did not.
+func (c *Component) queueIn(ctx context.Context, tx *sql.Tx, slug string, hasten bool) error {
 	payload := json.RawMessage(`{}`)
 	_, err := c.deps.Jobs.Enqueue(ctx, tx, JobType, slug, payload)
 	dup, pending := errors.AsType[*jobs.DuplicateError](err)
 	if !pending {
 		return err
+	}
+	if !hasten {
+		return nil
 	}
 	if hastened, err := c.deps.Jobs.Hasten(ctx, tx, JobType, slug); err != nil || hastened {
 		return err
@@ -162,6 +196,11 @@ func (h buildHandler) Run(ctx context.Context, j jobs.Job) error {
 	start := c.deps.Now()
 	a.files, a.partial, a.err = c.build(ctx, repo, ws.Slug, head)
 	a.took = c.deps.Now().Sub(start)
+	// A head that moved while the build ran, whose notice was lost or came
+	// before the build's job was running, is built next.
+	if now, found, err := repo.ResolveBranch(ctx, ws.DefaultBranch); err == nil && found && now != head {
+		a.moved = true
+	}
 	if a.err != nil {
 		// What a failed build wrote is of no use; the index there was is
 		// in another directory and stays.
@@ -255,8 +294,64 @@ func (h buildHandler) Settled(ctx context.Context, tx *sql.Tx, j jobs.Job, _ boo
 		if err := recordBuilt(ctx, tx, a.slug, a.sha, a.partial, a.files, now); err != nil {
 			return err
 		}
+		if a.moved {
+			// The job is settled, so this is the workspace's one pending
+			// build, or the one a notice queued already is.
+			if err := c.queueIn(ctx, tx, a.slug, false); err != nil {
+				return err
+			}
+		}
 	}
 	_ = c.deps.Metrics.Add(metrics.CodeIndexBuildsTotal, map[string]string{"outcome": outcome}, 1)
 	_ = c.deps.Metrics.Observe(metrics.CodeIndexBuildDurationSeconds, nil, a.took.Seconds())
 	return nil
+}
+
+// Reconcile queues a build for every workspace the hub keeps an index of
+// whose index is not at the head of its default branch and that has no
+// build pending. It is what makes the index follow a head whose move no
+// one reported, and what a hub does at its start; a build that failed and
+// waits for its next attempt keeps waiting.
+func (c *Component) Reconcile(ctx context.Context) error {
+	if !c.Enabled() {
+		return nil
+	}
+	all, err := c.deps.Workspaces(ctx)
+	if err != nil {
+		return err
+	}
+	var failures []error
+	for _, ws := range all {
+		if !c.indexes(ws) || ws.DefaultBranch == "" {
+			continue
+		}
+		behind, err := c.behind(ctx, ws)
+		if err == nil && behind {
+			err = c.deps.Store.Tx(ctx, func(tx *sql.Tx) error { return c.queueIn(ctx, tx, ws.Slug, false) })
+		}
+		if err != nil {
+			failures = append(failures, fmt.Errorf("code index of %s: %w", ws.Slug, err))
+		}
+	}
+	return errors.Join(failures...)
+}
+
+// behind reports whether the index of ws is not at the head of its default
+// branch. A workspace without a repository or without that branch has
+// nothing to index yet and is not behind.
+func (c *Component) behind(ctx context.Context, ws Workspace) (bool, error) {
+	repo, err := c.deps.Repos(ctx, ws.Slug)
+	if err != nil {
+		// No repository yet, or none any more: its clone reports itself.
+		return false, nil
+	}
+	head, found, err := repo.ResolveBranch(ctx, ws.DefaultBranch)
+	if err != nil || !found {
+		return false, err
+	}
+	rec, _, err := c.Record(ctx, ws.Slug)
+	if err != nil {
+		return false, err
+	}
+	return rec.IndexedSHA != head || !c.stored(ws.Slug, head), nil
 }

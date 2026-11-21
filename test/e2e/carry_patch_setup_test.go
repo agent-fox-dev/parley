@@ -34,7 +34,8 @@ func startCarryPatchHubWith(t *testing.T, origin, up *gitrepotest.Origin, now fu
 }
 
 // startCarryPatchHubConfig starts a hub as startCarryPatchHub does, with
-// what cfg sets of its clock, composition and maintenance interval.
+// what cfg sets of its clock, composition and maintenance interval, and
+// its TOML added to the hub's config.toml.
 func startCarryPatchHubConfig(t *testing.T, origin, up *gitrepotest.Origin, cfg hubtest.Config) *workspaceHub {
 	t.Helper()
 	var bundle []byte
@@ -56,7 +57,7 @@ func startCarryPatchHubConfig(t *testing.T, origin, up *gitrepotest.Origin, cfg 
 	h := &workspaceHub{root: t.TempDir(), origin: origin}
 	h.Hub = hubtest.StartWith(t, hubtest.Config{
 		Server:              `external_url = "https://hub.example/"`,
-		TOML:                "[workspace]\npath = " + quote(h.root) + "\nworkers = 2\n",
+		TOML:                "[workspace]\npath = " + quote(h.root) + "\nworkers = 2\n" + cfg.TOML,
 		Env:                 map[string]string{"GIT_SSL_CAINFO": caFile, secret.EnvCurrentKey: base64.StdEncoding.EncodeToString(raw)},
 		Now:                 cfg.Now,
 		Compose:             cfg.Compose,

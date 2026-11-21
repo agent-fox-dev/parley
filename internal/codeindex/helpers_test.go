@@ -154,6 +154,9 @@ func (w *world) commit(t *testing.T, slug, branch string, put map[string]string,
 	body := map[string]any{"branch": branch, "message": "change", "operations": ops}
 	if at := gitrepotest.Refs(t, w.workspaces.RepoPath(slug), "refs/heads/")[branch]; at != "" {
 		body["expected_head_sha"] = at
+	} else {
+		// A new branch, on the workspace's main.
+		body["base_ref"] = "main"
 	}
 	status, raw := w.Call(t, http.MethodPost, "/api/v1/workspaces/"+slug+"/scm/commits", w.key, body)
 	var answer struct {

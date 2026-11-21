@@ -50,6 +50,8 @@ type Deps struct {
 	// Workspace reads what the component needs of the workspace slug; found
 	// is false when there is none.
 	Workspace func(ctx context.Context, slug string) (ws Workspace, found bool, err error)
+	// Workspaces lists every repository workspace of the hub.
+	Workspaces func(ctx context.Context) ([]Workspace, error)
 	// Repos opens the repository of the workspace slug.
 	Repos func(ctx context.Context, slug string) (Repository, error)
 	// Metrics is told of every build that ended; nil tells no one.

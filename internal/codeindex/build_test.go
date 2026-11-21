@@ -258,9 +258,8 @@ func TestBuild_RunsAtMostTheConfiguredWorkersAtOnce(t *testing.T) {
 		release[slug] = s.hold(string(filepath.Separator) + slug + string(filepath.Separator))
 		t.Cleanup(release[slug])
 	}
-	for _, slug := range slugs {
-		w.queue(t, slug)
-	}
+	// The maintenance pass queues the build of each: queueing one here too
+	// could add a second beside a build that pass had already started.
 	count := func() (running []string, queued int) {
 		for _, slug := range slugs {
 			for _, status := range w.jobs(t, slug) {

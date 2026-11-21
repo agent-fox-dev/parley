@@ -3,7 +3,7 @@
   "spec_id": "59",
   "spec_name": "code_index_builds",
   "schema_version": 3,
-  "updated_at": "2026-11-21T06:47:11Z",
+  "updated_at": "2026-11-21T07:05:45Z",
   "tasks": [
     {
       "id": 1,
@@ -214,7 +214,78 @@
     },
     {
       "id": 3,
-      "state": "pending"
+      "state": "in_progress",
+      "evidence": [
+        {
+          "covers": "REQ-4.1",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestFollow_BuildsAWorkspaceOnceItHasItsRepository",
+              "failed": {
+                "at": "2026-11-21T07:03:49Z",
+                "tree": "1cc34b6a9fdf593794cf72aec4e2e21800f1d3f5"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.2",
+          "tests": [
+            {
+              "test": "./test/e2e:TestCodeIndex_FollowsTheHeadWhateverMovesIt",
+              "failed": {
+                "at": "2026-11-21T07:03:49Z",
+                "tree": "1cc34b6a9fdf593794cf72aec4e2e21800f1d3f5"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.3",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestFollow_KeepsOnePendingBuildBesideTheRunningOne",
+              "failed": {
+                "at": "2026-11-21T07:03:49Z",
+                "tree": "1cc34b6a9fdf593794cf72aec4e2e21800f1d3f5"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.4",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestFollow_BuildsAtStartWhatMovedWhileTheHubWasDown",
+              "failed": {
+                "at": "2026-11-21T07:03:49Z",
+                "tree": "1cc34b6a9fdf593794cf72aec4e2e21800f1d3f5"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.3",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestFollow_BuildsAWorkspaceWhoseSettingIsTurnedOn",
+              "failed": {
+                "at": "2026-11-21T07:03:49Z",
+                "tree": "1cc34b6a9fdf593794cf72aec4e2e21800f1d3f5"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.4",
+          "no_red": "a fork must get no build, and a hub that queues no build on any notice yet gives it none; the test fails once a notice of a fork's branch queues one",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestFollow_KeepsNothingOfAFork"
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 4,

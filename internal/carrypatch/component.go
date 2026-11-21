@@ -73,6 +73,11 @@ type Deps struct {
 	// tests set it, to look at the repository and the job between patches
 	// or to change them as another writer would.
 	BeforeRebuildPatch func(job string, i int)
+	// AfterRebuildPublish, when set, is told that a rebuild has moved the
+	// integration branch of a workspace, once the move is committed and
+	// outside any store transaction: the one move of a branch by this
+	// package that no ref write reports.
+	AfterRebuildPublish func(ctx context.Context, slug, branch string)
 	// BeforeRebuildPublish, when set, is called by an attempt of the
 	// rebuild job with the job's id once every patch is processed and
 	// before the publish reads the integration branch, outside any store

@@ -50,9 +50,16 @@ func startForkHubAt(t *testing.T, now func() time.Time, more ...string) *forkHub
 // hub's composition after the harness's own changes.
 func startForkHubWith(t *testing.T, now func() time.Time, compose func(*hub.Composition), more ...string) *forkHub {
 	t.Helper()
+	return startForkHubTOML(t, now, "", compose, more...)
+}
+
+// startForkHubTOML is startForkHubWith with toml added to the hub's
+// config.toml.
+func startForkHubTOML(t *testing.T, now func() time.Time, toml string, compose func(*hub.Composition), more ...string) *forkHub {
+	t.Helper()
 	origin := newOrigin(t)
 	h := &forkHub{ticks: make(chan time.Time)}
-	h.workspaceHub = startWorkspaceHubAt(t, origin, "demo", now, func(c *hub.Composition) {
+	h.workspaceHub = startWorkspaceHubTOML(t, origin, "demo", now, toml, func(c *hub.Composition) {
 		h.comp = c
 		c.AdjustForks(func(d *fork.Deps) {
 			d.SweepTicks = func() (<-chan time.Time, func()) { return h.ticks, func() {} }
