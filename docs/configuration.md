@@ -1,54 +1,71 @@
 # Configuration
 
-`parleyd` reads one configuration file, `config.toml`, and the environment
-variables named below. `parley` reads the environment variables
-`PARLEY_ENDPOINT_URL` and `PARLEY_CONFIG_DIR`, and `parley login` writes its
-own configuration file, also named `config.toml` (see [`parley`](#parley)).
+How to configure a hub and its client: where settings come from, what each
+group of keys controls and when you would change it, and the tables of
+keys with their types and defaults.
 
-## `parleyd`
+## Contents
 
-### The configuration file
+| Section | What you find there |
+|---|---|
+| [How the hub is configured](#how-the-hub-is-configured) | Where the file is looked for, environment references, what a wrong file does at start |
+| [The configuration file](#the-configuration-file) | A minimal file, a production file, the value formats |
+| [Server and storage](#server-and-storage) | Listening, storage, logging, and the keys of forks, git, source control, the code index, changes, landing, claims and events |
+| [Sign-in providers](#sign-in-providers) | Setting up sign-in end to end, and its keys |
+| [Sandboxes](#sandboxes) | Enabling sandboxes: the gateway, limits, profiles, credentials, exposed secrets |
+| [Secret keys](#secret-keys) | What the keys protect, running without one, rotating, losing one |
+| [Retention](#retention) | What the hub removes by itself, and when |
+| [Environment variables](#environment-variables) | Everything the hub reads from its environment |
+| [Configuring the client](#configuring-the-client) | The client's configuration file and environment |
 
-`parleyd` reads `config.toml` once, when it starts:
+## How the hub is configured
 
-- from `$XDG_CONFIG_HOME/config.toml` when `XDG_CONFIG_HOME` is set and not
-  empty (a relative `XDG_CONFIG_HOME` is taken relative to the working
-  directory);
-- otherwise from `config.toml` in the working directory.
+The hub, `parleyd`, takes its whole configuration from one file,
+`config.toml`, read once when it starts. Everything has a default, so a hub
+without a file runs; you add a key only where the default does not fit. To
+change a value you edit the file and restart the hub.
 
-A missing file means every key has its default. The directory the file is
-looked for in is the *config dir*. The `config` member of the `listening`
-line is the absolute path that was looked for, also when the file does not
-exist (see [cli.md](cli.md#log-lines)).
+A setting reaches the hub in one of four ways, and each has one job:
 
-The config dir also receives the admin token file, `admin_token` (mode
-`0600`), when `parleyd` runs with `--admin-email` on a new hub or with
-`--reset-admin-token`. It holds the hub's admin token in clear text; save the
-token and delete the file, since the hub does not start while it is there
-(see [cli.md](cli.md#the-admin-token)). The config dir must exist for the
-file to be written.
+| Source | What it carries | Why |
+|---|---|---|
+| Defaults | every key | a new hub runs without a file |
+| `config.toml` | every setting an operator chooses | one file to review, version and diff |
+| `${NAME}` references in the file | values you do not want in the file, such as a client secret | the file can be committed or put in a ConfigMap while the secret stays in the environment |
+| Environment variables read directly | where the file is, where the data goes, the secret keys, proxies | they are needed before the file is read, or must never be in it |
 
-The file is TOML and is checked strictly: invalid TOML, a section or a key
-no part of the hub registers, and a value of the wrong type or out of range
-each stop the start with exit status `1` and one error line that names the
-line or the key (`section.key`). An error about a key does not quote the
-key's value; the one exception is a provider `name` given twice, which can
-only be `github` or `google`. An error about invalid TOML carries the TOML
-parser's own message, which can quote the text at the mistake, such as
-`expected value but found "hunter2" instead` for an unquoted string. For
-example:
+No environment variable overrides a key of the file, and no flag sets one:
+the file is the only place a key's value comes from, so what you read in it
+is what the hub runs with. The two flags of `parleyd`, `--admin-email` and
+`--reset-admin-token`, manage the admin token and exit without serving (see
+[cli.md](cli.md#running-the-hub-parleyd)).
 
-```json
-{"time":"2026-11-13T12:11:38.609972Z","level":"ERROR","msg":"cannot start","error":"configuration file /srv/parley/config.toml: server.prot: unknown key"}
-```
+### Where the file is
+
+`parleyd` looks for `config.toml` in `$XDG_CONFIG_HOME` when that variable
+is set and not empty (a relative value is taken from the working
+directory), and in the working directory otherwise. That directory is the
+*config dir*. Relative paths in the file (a key file, a TLS certificate, a
+token file) are taken from it, and the hub writes its admin token file,
+`admin_token`, there, so the config dir must exist and be writable when you
+bootstrap or reset the admin token. The hub does not start while that file
+is there: save the token and delete the file.
+
+When the hub starts, its `listening` log line carries the absolute path it
+looked for as `config`, also when no file exists there.
 
 ### Environment references
 
-In a string value, `${NAME}` is replaced by the value of the environment
-variable `NAME`, and `$$` by one `$`. A `$` followed by neither `{` nor `$`
-stays as it is. References are replaced after the file is parsed, in string
-values only: never in section or key names, integers or booleans, so a
-variable cannot add, remove or rename a key.
+In any string value, `${NAME}` is replaced by the value of the environment
+variable `NAME`, and `$$` by one `$`. A `$` followed by anything else stays
+as it is.
+
+```toml
+[[oauth.providers]]
+name = "github"
+client_id = "Iv1.0123456789abcdef"
+client_secret = "${GITHUB_CLIENT_SECRET}"
+```
 
 | Value | Result |
 |---|---|
@@ -57,447 +74,752 @@ variable cannot add, remove or rename a key.
 | `"pa$$word"` | `pa$word` |
 | `"cost $5"` | `cost $5` |
 
-A reference to a variable that is not set (set to the empty string is set),
-a `${` without a closing `}`, and a name that is not a letter or `_` followed
-by letters, digits or `_`, are errors of the key that holds them. The error
-names the key. For a variable that is not set, it also names the variable.
-For a malformed name, it quotes the reference as written, such as `${A B}`.
-It never quotes a variable's value.
+References are replaced after the file is parsed and in string values only,
+so a variable can never add, remove or rename a key, and never changes an
+integer or a boolean. A reference to a variable that is not set stops the
+start (a variable set to the empty string is set), and so do a `${` without
+its `}` and a name that is not a letter or `_` followed by letters, digits
+or `_`. The error names the key and the variable, never a value.
 
-### Keys
+### What a wrong file does
 
-| Key | Type | Default | Meaning |
-|---|---|---|---|
-| `[server].bind` | string | `"0.0.0.0"` | the address the hub listens on; not empty |
-| `[server].port` | integer | `8080` | the TCP port the hub listens on, `0` to `65535`; `0` lets the system choose |
-| `[server].external_url` | string | `""` | the URL clients reach the hub at; empty, or an absolute `http` or `https` URL. A workspace object's `hub_url` is built from it, and is `null` while it is empty (see [api.md](api.md#post-apiv1workspaces)) |
-| `[server].max_body_size` | string | `"1MB"` | the largest REST request body: a positive whole number followed by `KB`, `MB` or `GB`, in any letter case, in powers of 1024; a larger body is answered `413` (see [api.md](api.md#request-bodies)); the commit route has its own limit, `[scm].max_commit_size` |
-| `[database].path` | string | see below | the transactional store's file; its directory is the data directory |
-| `[workspace].path` | string | see below | the workspace root, where the repositories live |
-| `[workspace].workers` | integer | `4` | how many workspace jobs run at the same time; at least `1`. It bounds the clones of the workspaces' copies: further clone work waits and starts in the order it was recorded |
-| `[logging].level` | string | `"info"` | `trace`, `debug`, `info`, `warn` or `error`, in any letter case; lines below it are not written |
-| `[logging].log_health_probes` | boolean | `false` | write an access-log line, at debug level, for requests to `/healthz` and `/readyz` |
-| `[limits].requests_per_minute` | integer | `600` | how many REST requests one credential, or one client address without a valid credential, may send in a window of 60 seconds; `0` turns the rate limit off (see [api.md](api.md#rate-limit)) |
-| `[forks].default_ttl` | string | `"7d"` | the lifetime of a task fork created without a `ttl`: a whole number followed by `s`, `m`, `h` or `d`, at least `5m` |
-| `[forks].max_ttl` | string | `"30d"` | the longest `ttl` a task fork may ask for: a whole number followed by `s`, `m`, `h` or `d`, not shorter than `[forks].default_ttl` (equal is accepted). A requested `ttl` is judged by a stricter form than these two keys: a whole number above zero followed by `m`, `h` or `d`, from `5m` to `max_ttl` inclusive; the fork's `expires_at` is the instant of the request plus the `ttl`, in whole seconds UTC |
-| `[forks].max_per_workspace` | integer | `200` | how many task forks one workspace may have; at least `1` |
-| `[forks].expire_on_land` | boolean | `true` | let the sweep remove a task fork before its lifetime ends, once all its changes have landed or been abandoned, every own branch of it is the source of one of them, its last activity is at least 24 hours old and it has no sandbox `provisioning` or `ready` (see [api.md](api.md#expiry-of-a-task-fork)); `false` keeps every fork until its `expires_at`, and the sweep then asks nothing about a fork's changes. |
-| `[events].retention` | string | `"30d"` | how long an event stays in the event log, which `GET /api/v1/events` and `GET /api/v1/events/log` read from: a whole number followed by `s`, `m`, `h` or `d`, at least `1h` (see [api.md](api.md#get-apiv1events)), and not longer than `[audit].max_age`: a longer value stops `parleyd` before it listens, with `events.retention (<value>) must not be longer than audit.max_age (<value>)`; equal values are accepted. The retention run's `event_log` step applies it, at start and every hour (see [Retention](#retention)) |
-| `[events].max_sse_connections` | integer | `500` | how many event streams (`GET /api/v1/events`) may be open at once; at least `1`. A stream beyond it is answered `503` with `Retry-After: 5`; held long-polls of `GET /api/v1/events/log` do not count (see [api.md](api.md#get-apiv1events)) |
-| `[git].timeout` | string | `"30m"` | how long one git request may take, from its arrival: on ref discovery or the fetch exchange, a task fork's copy of its parent's refs, waiting for another request's copy into the same fork included, and the run of `git upload-pack` share it; on the push exchange, the fork's copy and the push's work up to its ref transaction share it. A whole number followed by `s`, `m`, `h` or `d`, above zero. When it runs out during the copy, the request is answered `500 internal error`; during the run of `git upload-pack`, `git` is killed with every process it started, and the answer, if no pack data was sent yet, ends with the in-band error `ERR request timed out`; during a push before its ref transaction, the push's `git` processes are killed, its objects discarded, no ref moves and every ref is reported `unpack push timed out` with `ng <ref> unpacker error`; a push whose ref transaction has started is finished (see [api.md](api.md#git-over-http)) |
-| `[git].max_push_size` | string | `"0"` | the largest pack one push may send, counted after its commands and push options (after gzip decoding): `"0"` for no limit, a whole number of bytes such as `"104857600"`, or a whole number followed by `KB`, `MB` or `GB` (powers of 1024, any letter case) such as `"100MB"`. A pack of exactly the limit is accepted; at one byte more the hub stops reading, nothing changes, and every ref is reported `unpack pack exceeds the maximum push size` with `ng <ref> unpacker error`. `[server].max_body_size` does not apply to the git routes. The same limit holds the git bundle of a sandbox's checkpoint: a bundle larger than it fails the checkpoint, which stores no ref (see [api.md](api.md)) |
-| `[scm].read_timeout` | string | `"30s"` | how long one source control read (`GET /api/v1/workspaces/{slug}/scm/…`) may take, from the moment its route begins handling it: a whole number followed by `s`, `m`, `h` or `d`, above zero (`"0s"` is refused). When it runs out, every `git` process of the read is killed with every process it started; a read that has not begun its answer is answered `503` `scm_timeout`, and one whose answer has begun is cut off (see [api.md](api.md#source-control-reads)) |
-| `[scm].max_file_size` | string | `"32MB"` | the largest file `GET /api/v1/workspaces/{slug}/scm/file` serves: a positive whole number followed by `KB`, `MB` or `GB`, in any letter case, in powers of 1024 (`"32MB"` is 33,554,432 bytes; `"0"` is refused); a larger file is answered `413` `payload_too_large`, a file of exactly the limit is served (see [api.md](api.md#get-apiv1workspacesslugscmfile)) |
-| `[code_index]` | section | absent | the section itself turns the code index on: a hub whose file holds it, even empty, keeps a tree and a search index of the default branch's head of every repository workspace whose setting `code_index` is on, under `<data dir>/code-index/`, and builds them in the background whenever that head moves (see [api.md](api.md#get-apiv1workspacesslugscmcode-index)). A hub without it builds nothing and creates no such directory. An unknown key in it is refused, and every failure of the section is reported together, each as `code_index.<key>`. On a platform where the index cannot run, a hub with the section refuses to start (`the code index is not supported on this platform (<os>/<arch>): remove [code_index] from the configuration`) |
-| `[code_index].max_files` | integer | `100000` | the most files one index holds, 1 or more; a workspace with more gets a partial index |
-| `[code_index].max_size` | string | `"1GB"` | the most bytes of content one index holds, in the size format of `[scm].max_file_size`; past it the index is partial |
-| `[code_index].build_timeout` | string | `"5m"` | the longest the index of one build may take to build: a whole number followed by `s`, `m`, `h` or `d`, above zero; an index that reaches it keeps what it has as a partial index (it may run up to a quarter longer). Writing the commit's files to disk comes before it and is not bounded by it |
-| `[code_index].workers` | integer | `2` | how many builds run at once, 1 to 16; a build that finds no free worker waits in the queue. The hub's job queue runs four jobs at once and the builds never take its last place, so a value above 3 acts as 3 |
-| `[scm].max_commit_size` | string | `"32MB"` | the largest body of `POST /api/v1/workspaces/{slug}/scm/commits`, in the size format of `[scm].max_file_size` (`"0"` is refused); it is that route's body limit in place of `[server].max_body_size`, so a commit may carry more than the other routes take. A larger body is answered `413` `payload_too_large` before it is parsed (see [api.md](api.md#post-apiv1workspacesslugscmcommits)) |
-| `[changes].mergeable_debounce` | string | `"5s"` | the shortest time between the starts of two mergeability checks of one change: a whole number followed by `s`, `m`, `h` or `d`, `"0s"` for none. A trigger that arrives inside the interval is computed when it ends; triggers that arrive while a check of the change waits or runs leave one check, and one change's interval never delays another's. A negative value or one that is not a duration stops `parleyd` before it listens, with an error naming `changes.mergeable_debounce` (see [api.md](api.md#mergeability)) |
-| `[changes].max_stack_depth` | integer | `20` | the deepest a change may sit in a stack, counted as the changes in its chain of `depends_on` links down to one with none, itself included; at least `1`. A change deeper than it is still linked and its versions recorded, with `needs_restack` `true` and `restack_reason` `stack_too_deep`; a change at or under it is not flagged. A value below `1` stops `parleyd` before it listens, with the error `configuration file <path>: changes.max_stack_depth: must be at least 1` (see [api.md](api.md#changes)) |
-| `[land].max_attempts` | integer | `10` | how many times one land attempt tries to move its target branch with a compare-and-swap; when every try lost because another write moved the target, the attempt ends `failed` with `error` `contention`. At least `1`; a smaller value stops `parleyd` before it listens, with the error `configuration file <path>: land.max_attempts: must be at least 1` (see [api.md](api.md#landing)) |
-| `[land].timeout` | string | `"5m"` | how long one land attempt may take, counted from its creation, waiting for a worker included, or, for an attempt a stop left `running` and the next start runs again, from that start: a whole number followed by `s`, `m`, `h` or `d`, above zero (`"0s"` is refused with `land.timeout: must be above zero`, a value that is not a duration with an error naming `land.timeout`). When it passes, the attempt's work is stopped, every `git` process it runs is killed with the processes it started, and the attempt ends `failed` with `error` `timeout`; it never moves the target afterwards (see [api.md](api.md#landing)) |
-| `[land].workers` | integer | `8` | how many land attempts are computed at once; a further attempt waits, `running`, until a worker is free, and none fails because all are busy. At least `1`, else `land.workers: must be at least 1` stops `parleyd` before it listens |
-| `[land].committer_name` | string | `"Parley"` | the committer name of every commit a land or a rebuild makes (a rebuild's merge commits have it as author too); the empty string stops `parleyd` before it listens, with `land.committer_name: must not be empty` |
-| `[land].committer_email` | string | `"parley@localhost"` | the committer e-mail address of every commit a land or a rebuild makes; the empty string stops `parleyd` before it listens, with `land.committer_email: must not be empty` |
-| `[awareness].default_claim_ttl` | string | `"1h"` | the lifetime of a claim created without a `ttl`: a whole number followed by `s`, `m`, `h` or `d`, above zero, not longer than `[awareness].max_claim_ttl`; a longer one stops `parleyd` before it listens, with `awareness.default_claim_ttl: must not be longer than awareness.max_claim_ttl` (see [api.md](api.md#claims)) |
-| `[awareness].max_claim_ttl` | string | `"24h"` | the longest `ttl` a claim may ask for, at creation and at renewal: a whole number followed by `s`, `m`, `h` or `d`, above zero (`"0s"` is refused with `awareness.max_claim_ttl: must be longer than 0s`, a value that is not a duration with an error naming `awareness.max_claim_ttl`) |
-| `[awareness].max_claims_per_workspace` | integer | `1000` | how many active claims one workspace may hold (for a task fork, its parent, where its claims are stored); a further claim is answered `429` `claim_limit_reached`. At least `1`, else `awareness.max_claims_per_workspace: must be at least 1` stops `parleyd` before it listens. One session may hold at most 50 active claims, which no key changes |
-| `[audit].write_timeout` | string | `"2s"` | how long one write of agent telemetry may take, its wait for the analytical store's write lock included: the lookup and the insert of a single record, or the whole transaction of a batch. A whole number followed by `ms`, `s`, `m`, `h` or `d`, at least `100ms`; a smaller value stops `parleyd` before it listens, with `audit.write_timeout: must be at least 100ms`, and a value that is not such a duration with an error naming `audit.write_timeout`. A write that runs out is rolled back and answered `503` `unavailable` with `Retry-After: 5`, and nothing of the request is stored (see [api.md](api.md#agent-telemetry)); the hub's own record of sandbox use is held to it too |
-| `[audit].max_age` | string | `"90d"` | how long hub events, run events, session outcomes, tool calls and tool errors are kept: a whole number followed by `s`, `m`, `h` or `d`, at least `1d` (see [Retention](#retention)) |
-| `[audit].max_runs` | integer | `50` | how many runs with telemetry each workspace keeps: the run events, outcomes, tool calls, tool errors and traces of its older runs are deleted, its postmortems and sessions kept; at least `1` |
-| `[audit].trace_max_age` | string | `"30d"` | how long trace records are kept; a duration as for `max_age`, at least `1d` |
-| `[audit].postmortem_max_age` | string | `"180d"` | how long a postmortem is kept, counted from its `ingested_at`; at least `1d` |
-| `[audit].orphan_retention` | string | `"30d"` | how long the sessions, usage records, telemetry and hub events of a workspace that no longer exists are kept, each counted from its own time; at least `1d` |
-| `[sessions].max_age` | string | `"90d"` | how long an ended session and its usage records are kept, counted from its `started_at`; at least `1d`. An `active` session is never deleted by it |
-| `[sessions].max_active_age` | string | `"7d"` | how long a session may stay `active`, counted from its `started_at`: an older one is ended as `timeout` with `error_message` `session exceeded maximum active age`; at least `1h` |
-| `[webhooks].max_per_workspace` | integer | `20` | how many event webhooks one workspace may have, in any state; at least `0`, and `0` refuses every create. A create beyond it is answered `429` `webhook_limit_reached` (see [api.md](api.md#event-webhooks)) |
-| `[webhooks].timeout` | string | `"10s"` | how long one delivery attempt, ping or redelivery may take, from resolving the receiver's host to its response status: a whole number followed by `s`, `m`, `h` or `d`, from `1s` to `60s`. An attempt without a status by then fails with `error` `timeout`; the response body is never waited for |
-| `[webhooks].allow_private` | boolean | `false` | let an event webhook's URL name, or resolve to, a loopback, link-local (the cloud metadata address included), private, shared (`100.64.0.0/10`), unique-local, "this network" (`0.0.0.0/8`), unspecified or multicast address, at create, at a change of the URL and at every attempt |
-| `[webhooks].allow_insecure` | boolean | `false` | accept `http://` URLs whose host is a loopback address (a literal address in `127.0.0.0/8`, `::1`, or the name `localhost`), and lift the refusal of the destination for exactly those; every other URL still needs `https` |
-| `[secrets].key_file` | string | `""` | a file holding the current secret key, read only when `PARLEY_SECRETS_KEY` is unset or empty; a relative path is taken from the directory of `config.toml` (see [Secret keys](#secret-keys)) |
+The file is checked strictly, because a misspelled key that is silently
+ignored is a setting you believe you made. Each of these stops the start
+with exit status `1` and one `cannot start` line that names the line or the
+key as `section.key`:
 
-`[database].path` and `[workspace].path`, set or not, are resolved to
-absolute paths:
+- invalid TOML;
+- a section or a key the hub does not know;
+- a value of the wrong type or outside its range;
+- two keys that contradict each other, such as `[forks].max_ttl` shorter
+  than `[forks].default_ttl`.
 
-| `[database].path` / `[workspace].path` | `XDG_DATA_HOME` set and not empty | otherwise |
-|---|---|---|
-| not set | `$XDG_DATA_HOME/parley.db` / `$XDG_DATA_HOME/workspaces` | `data/parley.db` / `data/workspaces` in the working directory |
-| a bare name, such as `hub.db` | under `$XDG_DATA_HOME` | under the working directory |
-| a relative path with a directory, such as `var/hub.db` | under the working directory | under the working directory |
-| an absolute path | kept | kept |
+```json
+{"time":"2026-11-13T12:11:38.609972Z","level":"ERROR","msg":"cannot start","error":"configuration file /srv/parley/config.toml: server.prot: unknown key"}
+```
 
-The analytical store is `analytics.db` in the data directory. `parleyd`
-creates the data directory and the workspace root when they are missing,
-with missing parents, with mode `0700`; a directory that exists keeps its
-mode.
+Nothing is opened or created before the file is accepted, so you can fix
+the key and start again. An error about a key does not quote the key's
+value. An error about invalid TOML carries the parser's message, which can
+quote the text at the mistake, so read it before you paste it anywhere.
+The `[sandbox]` and `[code_index]` sections report all their mistakes
+together; elsewhere the first one is reported.
 
-### OAuth providers
+## The configuration file
 
-Each `[[oauth.providers]]` table configures one login provider:
+### A minimal file
+
+A hub with no file listens on `0.0.0.0:8080`, keeps its data under `data/`
+in the working directory and is administered with the admin token. The
+smallest file that lets people sign in adds one provider:
 
 ```toml
 [[oauth.providers]]
 name = "github"
 client_id = "Iv1.0123456789abcdef"
-client_secret = "${GH_SECRET}"
+client_secret = "${GITHUB_CLIENT_SECRET}"
 ```
 
-| Key | Meaning |
-|---|---|
-| `name` | `github` or `google`; each at most once |
-| `client_id` | not empty |
-| `client_secret` | not empty; `parleyd` replaces its value by `[redacted]` in every log line |
-| `authorize_url`, `token_url`, `userinfo_url` | absolute `http` or `https` URLs; default to the provider's public endpoints |
+### A production file
 
-The default endpoints are, for `github`,
-`https://github.com/login/oauth/authorize`,
-`https://github.com/login/oauth/access_token` and
-`https://api.github.com/user`, and for `google`,
-`https://accounts.google.com/o/oauth2/v2/auth`,
-`https://oauth2.googleapis.com/token` and
-`https://openidconnect.googleapis.com/v1/userinfo`. The `[oauth]` section
-holds nothing else.
-
-### Sandboxes
-
-The `[sandbox]` section turns sandboxes on: a file that holds it, even
-empty, enables them, and a file without it leaves them off. An empty
-section is invalid, since `gateway_url` is required. With the section,
-`[server].external_url` must be set.
+A hub that other people and agents reach needs its public URL, a place for
+its data that you back up, a secret key, and usually a code index and
+sandboxes:
 
 ```toml
 [server]
-external_url = "https://parley.example"
+bind = "0.0.0.0"
+port = 8080
+external_url = "https://parley.example.com"
+
+[database]
+path = "/var/lib/parley/data/parley.db"
+
+[workspace]
+path = "/var/lib/parley/data/workspaces"
+workers = 4
+
+[logging]
+level = "info"
+
+[secrets]
+key_file = "/etc/parley/secrets.key"
+
+[[oauth.providers]]
+name = "github"
+client_id = "Iv1.0123456789abcdef"
+client_secret = "${GITHUB_CLIENT_SECRET}"
+
+[land]
+committer_name = "Parley"
+committer_email = "parley@parley.example.com"
+
+[code_index]
 
 [sandbox]
-gateway_url = "https://openshell.example:8443"
-token_file = "openshell.token"
+gateway_url = "https://openshell.internal:8443"
+tls_cert = "/etc/parley/openshell-client.crt"
+tls_key = "/etc/parley/openshell-client.key"
+tls_ca = "/etc/parley/openshell-ca.crt"
+
+[[sandbox.credentials]]
+name = "model"
+provider_profile = "anthropic"
+secret = "ANTHROPIC_API_KEY"
 
 [[sandbox.profiles]]
 name = "agent"
+default = true
+image = "registry.example.com/agent:1.4"
+cpu = "2"
+memory = "4Gi"
 ttl = "4h"
+credentials = ["model"]
 ```
+
+The hub runs as one process on one data directory: never start a second
+hub on the same data. In a container, the hub image sets
+`XDG_CONFIG_HOME=/var/lib/parley/config` and
+`XDG_DATA_HOME=/var/lib/parley/data` on one volume, so the file needs no
+`[database]` or `[workspace]` path. The Kubernetes manifests in
+`deploy/kubernetes/` mount `config.toml` from a ConfigMap as a single file
+inside that config dir (so the admin token file can still be written beside
+it), give the hub the keys of a Secret as environment variables for the
+`${NAME}` references, and run exactly one replica with the `Recreate`
+strategy.
+
+### Value formats
+
+| Format | Written as | Examples |
+|---|---|---|
+| Duration | a whole number followed by `s`, `m`, `h` or `d` (24 hours) | `"30s"`, `"5m"`, `"7d"` |
+| Size | a positive whole number followed by `KB`, `MB` or `GB`, in any letter case, in powers of 1024 | `"1MB"`, `"32mb"` |
+| Path | absolute, or relative to the config dir | `"secrets.key"` |
+
+Durations and sizes are TOML strings. `[database].path` and
+`[workspace].path` resolve differently from other paths (see
+[Storage](#storage)).
+
+## Server and storage
+
+These sections decide where the hub listens, where it keeps its data, what
+it logs, and the limits and timeouts of its features. The defaults suit a
+hub of the size the [performance targets](performance.md) describe; change
+a key when the reason given for it applies to you.
+
+### Listening and the public URL
+
+Set `external_url` on every hub that someone other than you reaches: the
+hub cannot know the address clients see it at behind a proxy or an ingress,
+and it needs that address for workspace URLs, for sign-in redirects and for
+sandboxes.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `[server].bind` | string | `"0.0.0.0"` | the address the hub listens on; not empty |
+| `[server].port` | integer | `8080` | the TCP port, `0` to `65535`; `0` lets the system choose |
+| `[server].external_url` | string | `""` | the URL clients reach the hub at: empty, or an absolute `http` or `https` URL. A workspace's `hub_url` is built from it and is `null` while it is empty; a sign-in redirect to a page of the hub must match it; sandboxes require it |
+| `[server].max_body_size` | size | `"1MB"` | the largest REST request body; a larger one is answered `413`. Commits and git pushes have their own limits, below |
+| `[limits].requests_per_minute` | integer | `600` | how many REST requests one credential, or one client address without a valid credential, may send in 60 seconds; `0` turns the rate limit off (see [api.md](api.md#using-the-api)) |
+
+### Storage
+
+The hub keeps everything on local disk: a transactional store, an
+analytical store (`analytics.db`, beside the transactional one) and the
+repositories. The directory of `[database].path` is the *data directory*;
+it is what `parleyd backup` copies. Put it on a disk you back up.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `[database].path` | string | see below | the transactional store's file; its directory is the data directory |
+| `[workspace].path` | string | see below | the workspace root, where the repositories live |
+| `[workspace].workers` | integer | `4` | how many workspace jobs, such as clones, run at once; at least `1`. Further work waits and starts in the order it was recorded. Raise it when many workspaces are created at the same time and the disk and network keep up |
+
+| `path` is | With `XDG_DATA_HOME` set | Otherwise |
+|---|---|---|
+| not set | `$XDG_DATA_HOME/parley.db` and `$XDG_DATA_HOME/workspaces` | `data/parley.db` and `data/workspaces` in the working directory |
+| a bare name, such as `hub.db` | under `$XDG_DATA_HOME` | under the working directory |
+| a relative path with a directory | under the working directory | under the working directory |
+| an absolute path | kept | kept |
+
+The hub creates the data directory and the workspace root when they are
+missing, with mode `0700`; a directory that exists keeps its mode.
+
+### Logging
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `[logging].level` | string | `"info"` | `trace`, `debug`, `info`, `warn` or `error`, in any letter case; lines below it are not written |
+| `[logging].log_health_probes` | boolean | `false` | write an access-log line, at debug level, for `/healthz` and `/readyz`. Off by default because probes would drown the log |
+
+### Task forks
+
+Task forks are cheap and short-lived, and these keys keep them that way:
+every fork expires, and a workspace cannot collect them without bound (see
+[api.md](api.md#task-forks-and-workspace-tokens)).
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `[forks].default_ttl` | duration | `"7d"` | the lifetime of a fork created without a `ttl`; at least `5m` |
+| `[forks].max_ttl` | duration | `"30d"` | the longest `ttl` a fork may ask for (a request gives it in `m`, `h` or `d`, from `5m`); not shorter than `default_ttl` |
+| `[forks].max_per_workspace` | integer | `200` | how many forks one workspace may have; at least `1`. Raise it for a workspace many agents work on at once |
+| `[forks].expire_on_land` | boolean | `true` | remove a fork before its lifetime ends once its work is finished: all its changes landed or abandoned, every branch of its own the source of one of them, no activity for 24 hours and no sandbox `provisioning` or `ready`. `false` keeps every fork until it expires |
+
+### Git and source control
+
+The limits here protect the hub from one request that takes too long or
+sends too much. Raise a size when your repositories need it; raise a
+timeout when clones of a large repository over a slow link are cut off.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `[git].timeout` | duration | `"30m"` | how long one git fetch or push may take, above zero. A fetch that runs out is cut off; a push that runs out before its refs move changes nothing and reports every ref as failed; a push whose refs have started to move is finished |
+| `[git].max_push_size` | string | `"0"` | the largest pack one push may send: `"0"` for no limit, a number of bytes such as `"104857600"`, or a size such as `"100MB"`. A larger push is refused whole. The same limit bounds a sandbox checkpoint's bundle |
+| `[scm].read_timeout` | duration | `"30s"` | how long one source control read may take, above zero; one that runs out is answered `503` `scm_timeout`, or cut off when its answer has begun |
+| `[scm].max_file_size` | size | `"32MB"` | the largest file the file route serves; a larger one is answered `413` `payload_too_large` |
+| `[scm].max_commit_size` | size | `"32MB"` | the largest body of a commit through the API, in place of `[server].max_body_size`; a larger one is answered `413` `payload_too_large` |
+
+See [api.md](api.md#git-over-http) and [api.md](api.md#source-control).
+
+### Code index
+
+The code index gives agents code search and symbol lookup over the default
+branch of a workspace. It is off unless the file holds the `[code_index]`
+section; the section alone, even empty, turns it on. The hub then keeps a
+tree and a search index for every repository workspace whose `code_index`
+setting is on, under `code-index/` in the data directory, and rebuilds them
+in the background whenever the default branch moves. Leave it off on a hub
+whose disk cannot hold a second copy of each default branch. On a platform
+where the index cannot run, a hub with the section refuses to start.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `[code_index].max_files` | integer | `100000` | the most files one index holds, `1` or more; a workspace with more gets a partial index |
+| `[code_index].max_size` | size | `"1GB"` | the most bytes of content one index holds; past it the index is partial |
+| `[code_index].build_timeout` | duration | `"5m"` | the longest one index may take to build, above zero; an index that reaches it keeps what it has as a partial index |
+| `[code_index].workers` | integer | `2` | how many builds run at once, `1` to `16`; others wait. Builds share the hub's job queue and never take its last place, so a value above `3` acts as `3` |
+
+See [api.md](api.md#source-control).
+
+### Changes and landing
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `[changes].mergeable_debounce` | duration | `"5s"` | the shortest time between two mergeability checks of one change; `"0s"` for none. It keeps a burst of pushes from computing the same answer many times; lower it when you want `mergeable` sooner and have CPU to spare |
+| `[changes].max_stack_depth` | integer | `20` | the deepest a change may sit in a stack, itself included; at least `1`. A deeper change is still recorded, flagged `needs_restack` with the reason `stack_too_deep` |
+| `[land].max_attempts` | integer | `10` | how many times one land attempt tries to move its target branch when other writes keep moving it first; at least `1`. When every try loses, the attempt fails with `contention` |
+| `[land].timeout` | duration | `"5m"` | how long one land attempt may take, waiting for a worker included; above zero. One that runs out fails with `timeout` and never moves the target |
+| `[land].workers` | integer | `8` | how many land attempts are computed at once; at least `1`. Further attempts wait and none fails because all workers are busy |
+| `[land].committer_name` | string | `"Parley"` | the committer name of every commit a land or a rebuild makes; not empty |
+| `[land].committer_email` | string | `"parley@localhost"` | the committer e-mail address of those commits; not empty. Set it to an address of your domain so the commits are attributable |
+
+See [api.md](api.md#changes) and [api.md](api.md#landing).
+
+### Claims
+
+A claim tells other agents that someone is working on a path. Claims expire
+so that a crashed agent does not block a path for ever (see
+[api.md](api.md#awareness)).
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `[awareness].default_claim_ttl` | duration | `"1h"` | the lifetime of a claim created without a `ttl`; above zero, not longer than `max_claim_ttl` |
+| `[awareness].max_claim_ttl` | duration | `"24h"` | the longest `ttl` a claim may ask for, at creation and at renewal; above zero |
+| `[awareness].max_claims_per_workspace` | integer | `1000` | how many active claims one workspace, its task forks included, may hold; at least `1`. A further claim is answered `429` `claim_limit_reached` |
+
+### Events, telemetry and event webhooks
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `[events].retention` | duration | `"30d"` | how long an event stays in the event log that streams and long-polls read; at least `1h` and not longer than `[audit].max_age` (see [Retention](#retention)) |
+| `[events].max_sse_connections` | integer | `500` | how many event streams may be open at once; at least `1`. A further stream is answered `503` with `Retry-After: 5`; held long-polls do not count |
+| `[audit].write_timeout` | duration | `"2s"` | how long one write of agent telemetry may take; also takes `ms`, at least `100ms`. A write that runs out stores nothing and is answered `503` `unavailable` with `Retry-After: 5` |
+| `[webhooks].max_per_workspace` | integer | `20` | how many event webhooks one workspace may have; `0` or more, and `0` refuses every create. One beyond it is answered `429` `webhook_limit_reached` |
+| `[webhooks].timeout` | duration | `"10s"` | how long one delivery attempt may take until the receiver's status, from `1s` to `60s` |
+| `[webhooks].allow_private` | boolean | `false` | let a webhook's URL name or resolve to a loopback, link-local, private, shared or otherwise internal address. Off by default so that a webhook cannot be pointed at your internal network or a cloud metadata address; turn it on only when the receivers live there |
+| `[webhooks].allow_insecure` | boolean | `false` | accept `http://` URLs to a loopback host (`127.0.0.0/8`, `::1`, `localhost`), for a receiver on the hub's own machine; every other URL still needs `https` |
+
+See [api.md](api.md#audit-and-events) and [api.md](api.md#event-webhooks).
+
+### Fixed values
+
+These are not configurable; plan around them.
+
+| Setting | Value |
+|---|---|
+| Shutdown | in-flight requests get 15 seconds after `SIGTERM` or `SIGINT`, and the whole stop takes at most 30 seconds; give the hub a little longer before you kill it |
+| Idempotency records | kept for 24 hours, across restarts |
+| Event webhook delivery records | kept for 7 days after their last attempt |
+| Claims per session | at most 50 active |
+| Workspace sandbox rules | at most 50 per workspace |
+
+## Sign-in providers
+
+People sign in to the hub through an identity provider; the hub has no
+passwords. Each `[[oauth.providers]]` table configures one provider, and a
+hub without any is used with the admin token and the tokens it issues.
+
+When someone signs in, the hub exchanges the provider's code, reads a
+stable user id and a verified e-mail address, creates the user on first
+sign-in, and issues an API key. The first user whose e-mail equals the
+address given to `parleyd --admin-email` becomes an admin, as long as no
+admin user exists.
+
+### Setting one up
+
+1. Register an OAuth application with the provider (GitHub or Google). As
+   its redirect URI, allow what your clients use: `parley login` listens on
+   `http://127.0.0.1:<port>/callback`, and the hub accepts a redirect that
+   is `http` on `localhost` or `127.0.0.1`, or that has the scheme, host
+   and port of `[server].external_url`.
+2. Give the hub the client id in the file and the client secret through
+   the environment:
+
+   ```toml
+   [server]
+   external_url = "https://parley.example.com"
+
+   [[oauth.providers]]
+   name = "github"
+   client_id = "Iv1.0123456789abcdef"
+   client_secret = "${GITHUB_CLIENT_SECRET}"
+   ```
+
+3. Restart the hub with `GITHUB_CLIENT_SECRET` set, and check that it
+   offers the provider:
+
+   ```sh
+   curl https://parley.example.com/api/v1/auth/providers
+   ```
+
+4. Sign in:
+
+   ```sh
+   parley login --endpoint-url https://parley.example.com --provider github
+   ```
+
+See [cli.md](cli.md#parley-login-and-your-account) and
+[api.md](api.md#signing-in-and-your-account).
+
+### Keys
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `name` | string | required | `github` or `google`; each at most once |
+| `client_id` | string | required | the application's client id; not a secret |
+| `client_secret` | string | required | the application's client secret; the hub replaces it by `[redacted]` in every log line |
+| `authorize_url`, `token_url`, `userinfo_url` | string | the provider's public endpoints | absolute `http` or `https` URLs; set them for a self-hosted provider such as GitHub Enterprise |
+
+The `[oauth]` section holds nothing but these tables. The default endpoints
+are:
+
+| Provider | `authorize_url` | `token_url` | `userinfo_url` |
+|---|---|---|---|
+| `github` | `https://github.com/login/oauth/authorize` | `https://github.com/login/oauth/access_token` | `https://api.github.com/user` |
+| `google` | `https://accounts.google.com/o/oauth2/v2/auth` | `https://oauth2.googleapis.com/token` | `https://openidconnect.googleapis.com/v1/userinfo` |
+
+## Sandboxes
+
+A sandbox is where an agent runs: an isolated environment with a task fork
+checked out. Parley does not isolate anything itself. Sandboxes run on an
+OpenShell gateway that you operate, and the hub is its control plane: it
+decides who gets a sandbox of which shape, connects it to the fork and the
+secrets, enforces lifetimes and quotas, and saves the work.
+
+Two defaults shape everything below:
+
+- **No network.** A sandbox reaches the hub and nothing else. Code an
+  agent writes or downloads is untrusted, so every other destination is
+  one you allowed: through a profile's policy, an attached credential, or
+  a rule a person approved.
+- **No real credentials.** A sandbox sees placeholders. The gateway puts
+  the real value on a request outside the sandbox, and only on requests
+  to the endpoints that credential is for. A leaked environment therefore
+  leaks nothing, unless you chose to expose a secret.
+
+Sandboxes are off unless the file holds a `[sandbox]` section; without it
+every sandbox route answers `404` `sandboxes_disabled`. See
+[architecture.md](architecture.md#sandboxes) for the model and
+[api.md](api.md#sandboxes) for using one.
+
+### Enabling sandboxes
+
+1. **Point the hub at the gateway** and choose exactly one way to
+   authenticate. Sandboxes also need `[server].external_url`, because a
+   sandbox reaches the hub at that address.
+
+   ```toml
+   [server]
+   external_url = "https://parley.example.com"
+
+   [sandbox]
+   gateway_url = "https://openshell.internal:8443"
+   token_file = "openshell.token"
+   ```
+
+2. **Define at least one profile**, the template of a sandbox. The
+   profile's image must hold `git` and a writable working directory
+   `/workspace`; `containers/sandbox/Dockerfile` builds a reference image.
+
+   ```toml
+   [[sandbox.profiles]]
+   name = "agent"
+   default = true
+   image = "registry.example.com/agent:1.4"
+   ttl = "4h"
+   ```
+
+3. **Attach credentials** the agent needs, such as a model key. A
+   credential joins a secret stored in the hub to a provider profile of
+   the gateway, which says which variable holds the placeholder, which
+   hosts the credential is for and which programs may use it.
+
+   ```toml
+   [[sandbox.credentials]]
+   name = "model"
+   provider_profile = "anthropic"
+   secret = "ANTHROPIC_API_KEY"
+
+   [[sandbox.profiles]]
+   name = "agent"
+   default = true
+   image = "registry.example.com/agent:1.4"
+   ttl = "4h"
+   credentials = ["model"]
+   ```
+
+   Store the secret where the sandbox's workspace finds it (see
+   [cli.md](cli.md#parley-secrets-and-parley-vars)); storing needs a
+   [secret key](#secret-keys):
+
+   ```sh
+   printf '%s' "$ANTHROPIC_API_KEY" | parley secrets create ANTHROPIC_API_KEY --from-stdin --org acme
+   ```
+
+4. **Expose a secret only when a tool cannot work with a placeholder**,
+   such as a client that signs requests itself (see
+   [Exposed secrets](#exposed-secrets)).
+
+5. **Restart the hub.** Before it listens, it checks the gateway, within
+   30 seconds, and does not start if a check fails: the gateway is healthy
+   and its release is supported; the OpenShell workspace exists (the hub
+   creates it); every `provider_profile` you named is known to the gateway;
+   no exposed secret has the name of a variable an attached provider
+   profile declares; every `policy` file is valid. Then list the profiles
+   and create a sandbox:
+
+   ```sh
+   parley sandbox profiles
+   parley sandbox create acme-app --wait
+   ```
+
+### The gateway
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `runtime` | string | `"openshell"` | the sandbox runtime; `openshell` only |
-| `gateway_url` | string | required | the OpenShell gateway: an `https` URL, or an `http` URL to `localhost`, an address in `127.0.0.0/8` or `::1`; without user information, a query, a fragment, or a path other than `/` |
-| `tls_cert`, `tls_key` | string | `""` | the client certificate and its key for mutual TLS, both or neither; each a readable file |
-| `tls_ca` | string | `""` | a readable file of CA certificates the gateway's certificate is checked against |
-| `token_file` | string | `""` | a readable file holding the bearer token; its content without surrounding white space must not be empty. It is read once, when `parleyd` starts |
-| `oidc_issuer`, `oidc_client_id`, `oidc_client_secret_file` | string | `""` | OIDC client credentials, all three or none: the issuer by the rule of `gateway_url` except that it may have a path, and a readable, non-empty file holding the client secret |
-| `openshell_workspace` | string | `"parley"` | the OpenShell workspace the hub owns: 1 to 63 lower-case letters, digits, `_` or `-`, starting with a letter or a digit. A gateway of release 0.1.9 takes at most 19 lower-case letters, digits and `-`, and refuses another name at the start-up check. Two hubs must not share one: each installs its own `parley-hub` there |
-| `max_ttl` | duration | `"24h"` | more than `0` |
-| `idle_timeout` | duration | `"30m"` | `0` or more; `0` disables the idle stop |
-| `max_sandboxes` | integer | `200` | at least `1` |
-| `max_per_org` | integer | `100`, or `max_sandboxes` when that is smaller | at least `1` and at most `max_sandboxes` |
-| `max_per_workspace` | integer | `50` | at least `1` |
-| `max_per_user` | integer | `20` | at least `1` |
-| `allow_workspace_rules` | boolean | `true` | |
-| `max_exec_timeout` | duration | `"30m"` | more than `0` |
-| `max_concurrent_execs` | integer | `8` | at least `1` |
-| `max_transfer_size` | string | `"1GB"` | in the size format of `[server].max_body_size` |
-| `log_retention` | duration | `"7d"` | more than `0` |
-| `reconcile_interval` | duration | `"1m"` | from `10s` to `10m`, both included |
-| `[[sandbox.profiles]]` | tables | required | the sandbox profiles, at least one |
-| `[[sandbox.credentials]]` | tables | none | the credentials profiles may attach |
+| `gateway_url` | string | required | the gateway: an `https` URL, or an `http` URL to `localhost`, `127.0.0.0/8` or `::1`; without user information, query, fragment, or a path other than `/` |
+| `tls_cert`, `tls_key` | path | `""` | the client certificate and its key for mutual TLS; both or neither |
+| `tls_ca` | path | `""` | CA certificates the gateway's certificate is checked against; may accompany any way to authenticate |
+| `token_file` | path | `""` | a file holding a bearer token, not empty; read once, at start |
+| `oidc_issuer`, `oidc_client_id`, `oidc_client_secret_file` | string, string, path | `""` | OIDC client credentials, all three or none; the hub obtains a token from the issuer and renews it before it expires |
+| `openshell_workspace` | string | `"parley"` | the OpenShell workspace the hub owns: 1 to 63 lower-case letters, digits, `_` or `-`, starting with a letter or a digit. A gateway of release 0.1.9 accepts at most 19 lower-case letters, digits and `-` |
 
-The four `max_…` counts are the quotas of sandbox creation: a create is
-refused with `429 sandbox_capacity` when the sandboxes in state
-`provisioning` or `ready` would exceed `max_sandboxes` on the hub,
-`max_per_org` in the workspace's org, `max_per_workspace` in the workspace
-and its task forks, or `max_per_user` for the creating user, checked in
-that order (see [api.md](api.md#post-apiv1workspacesslugsandboxes)).
+Configure exactly one of mutual TLS, `token_file` and OIDC; none or more
+than one stops the start. The hub supports OpenShell releases from `0.1.0`
+up to, but not including, `0.2.0`. It owns everything in its OpenShell
+workspace, so two hubs must not share one.
 
-The next four bound the use of a sandbox (see [api.md](api.md#using-a-sandbox)):
-`max_exec_timeout` is the longest `timeout` an exec may ask for (a longer one
-is refused, not lowered; an exec without one gets 60 seconds, or this value
-when it is smaller); `max_concurrent_execs` is how many execs may run at once
-in one sandbox, another being refused with `429 rate_limited`;
-`max_transfer_size` bounds the body of an upload and the bytes sent of a
-download; and `log_retention` is how long the stored lines of a sandbox's
-main process and policy log are kept.
-
-`reconcile_interval` is the time between two passes in which the hub
-brings its sandbox records back in line with the runtime (exits, lost
-sandboxes, the runtime's leftovers, overdue idle stops and expiries); one
-pass also runs at start, before the hub listens. The idle stop and the
-expiry are checked every minute besides (see
-[api.md](api.md#the-life-of-a-sandbox)). A profile's `idle_timeout` is how
-long a `ready` sandbox may go without activity before the hub stops it,
-and its `checkpoint` whether the hub checkpoints a sandbox before it stops
-or deletes it and when its main process ends.
-
-`allow_workspace_rules` says whether an approval of a sandbox's network
-proposal may save its rule on the workspace (`scope` `workspace`, see
-[api.md](api.md#the-network-policy-of-a-sandbox)). With `false` such an
-approval is refused with `403 workspace_rules_disabled`; the rules saved
-earlier stay listed, are still recorded with every new sandbox, and can be
-deleted. A profile's `allow_proposals` says whether the proposals of its
-sandboxes reach a person: the value a sandbox was created with counts, and
-a proposal of a sandbox created without it is rejected at the runtime and
-not stored.
-
-A duration is a whole number followed by one of `s`, `m`, `h` or `d` (24
-hours), such as `30m` or `7d`. Relative paths in `tls_cert`, `tls_key`,
-`tls_ca`, `token_file`, `oidc_client_secret_file` and a profile's `policy`
-are taken from the config dir.
-
-Exactly one way to authenticate to the gateway is configured: mutual TLS
-(`tls_cert` with `tls_key`), `token_file`, or the three OIDC keys. `tls_ca`
-may accompany any of them. With none, or with more than one, the failure
-names `sandbox.gateway_url` and the ways found, such as
-`sandbox.gateway_url: configure exactly one way to authenticate, found:
-mutual TLS, token_file`. A pair or a triple that is incomplete names the keys
-it misses instead.
-
-The hub connects to the gateway's host and port (when `gateway_url` gives
-none, 443, or 80 for an `http` gateway), over TLS for an `https` URL and without it for an `http` one.
-With mutual TLS it presents the client certificate; with `token_file` it
-sends the file's content as a bearer token, also over `http` to a loopback
-gateway; with OIDC it obtains a token from `oidc_issuer` with the client
-credentials grant on its first call to the gateway and renews it before it
-expires. The hub supports the OpenShell releases from `0.1.0`, included, to
-`0.2.0`, excluded, compared as semantic versions after an optional leading
-`v`; a release that is not a semantic version is outside the range.
-
-Once the file is accepted and the stores are open, and before it listens,
-`parleyd` checks the gateway once, within 30 seconds in all, in this order,
-and does not start on the first failure (see [cli.md](cli.md) for the
-error line): it reads the gateway's health and release and refuses an
-unhealthy gateway or a release outside the range; it makes sure the
-`openshell_workspace` exists, creating it when it does not; it installs the
-provider profile `parley-hub` of the hub credential a sandbox reaches the hub
-with, its placeholder in `PARLEY_API_KEY`, for the host and port of
-`[server].external_url` (443 for `https` and 80 for `http` when the URL gives
-none), its `/api/v1/` and `/git/` paths and any program, inspected as HTTP; it reads, once each, the provider profiles the
-`[[sandbox.credentials]]` name, and refuses one the gateway does not know;
-it refuses a name in a profile's `expose_secrets` or
-`optional_expose_secrets` that is a variable declared by the provider
-profile of a credential the same profile attaches through `credentials` or
-`optional_credentials`; and it sends each profile's `policy` file to the
-gateway for validation and keeps the hosts the gateway reports it allows.
-The built-in policy is not sent. A gateway that cannot validate a policy
-file fails the start for a profile that names one: the OpenShell SDK the hub
-is built with has no call for it, so against an OpenShell gateway every
-profile stays on the built-in policy. A second start finds the workspace and
-replaces `parley-hub`, so nothing is created twice.
-
-A profile is the template of a sandbox. Its table may hold these keys and
-no other:
+### Limits
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `name` | string | required | 1 to 63 lower-case letters, digits, `_` or `-`, starting with a letter or a digit; unique among the profiles |
+| `max_ttl` | duration | `"24h"` | the ceiling of every profile's `ttl`; above zero |
+| `idle_timeout` | duration | `"30m"` | how long a `ready` sandbox may go without activity before the hub stops it, for profiles that do not say; `0` disables the idle stop |
+| `max_sandboxes` | integer | `200` | how many sandboxes may be `provisioning` or `ready` on the hub; at least `1` |
+| `max_per_org` | integer | `100`, or `max_sandboxes` when smaller | the same count per organization; at least `1`, at most `max_sandboxes` |
+| `max_per_workspace` | integer | `50` | the same count per workspace with its task forks; at least `1` |
+| `max_per_user` | integer | `20` | the same count per creating user; at least `1` |
+| `max_exec_timeout` | duration | `"30m"` | the longest `timeout` an exec may ask for; a longer one is refused. An exec without one gets 60 seconds, or this value when it is smaller |
+| `max_concurrent_execs` | integer | `8` | how many execs may run at once in one sandbox; another is answered `429` `rate_limited` |
+| `max_transfer_size` | size | `"1GB"` | the largest upload or download |
+| `log_retention` | duration | `"7d"` | how long the stored log lines of a sandbox are kept; above zero |
+| `reconcile_interval` | duration | `"1m"` | how often the hub brings its records back in line with the runtime (exits, lost sandboxes, leftovers), from `10s` to `10m`. Idle stops and expiries are checked every minute whatever this says |
+| `allow_workspace_rules` | boolean | `true` | let an approval of a network proposal save its rule on the workspace, for every later sandbox there. With `false` such an approval is answered `403` `workspace_rules_disabled`; rules saved earlier still apply and can be deleted |
+
+A create that would exceed a quota is answered `429` `sandbox_capacity`.
+The quotas exist because every sandbox holds resources of the runtime: size
+them to what the gateway's cluster can run.
+
+### Profiles
+
+A profile is fixed for the life of the hub process: to change one, edit the
+file and restart. A `[[sandbox.profiles]]` table holds:
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `name` | string | required | 1 to 63 lower-case letters, digits, `_` or `-`, starting with a letter or a digit; unique |
 | `default` | boolean | `false` | the profile a sandbox gets when its creator names none; at most one profile sets it |
-| `description` | string | `""` | |
-| `image` | string | `""` | the sandbox image; `""` leaves it to the runtime. It holds `git` and the working directory `/workspace`, writable by its default user: OpenShell creates a sandbox without a working directory, and the hub runs its commands there (see `containers/sandbox/Dockerfile`) |
-| `cpu`, `memory` | string | `""` | the sandbox's resources; `""` leaves them to the runtime |
-| `gpu` | integer | `0` | `0` or more |
-| `ttl` | duration | required | more than `0` and at most `max_ttl` |
-| `idle_timeout` | duration | the section's `idle_timeout` | `0` or more; `0` disables the idle stop |
-| `policy` | string | `""` | a readable file holding the base network policy; `""` is the built-in policy |
-| `credentials` | list of strings | `[]` | names of `[[sandbox.credentials]]` tables the sandbox gets |
-| `optional_credentials` | list of strings | `[]` | as `credentials`; a name may not be in both lists |
-| `expose_secrets` | list of strings | `[]` | names of secrets whose values the sandbox's environment gets, by the rules below |
-| `optional_expose_secrets` | list of strings | `[]` | as `expose_secrets`; a name may not be in both lists |
-| `hub_access` | string | `"fork"` | `fork` or `none` |
-| `env` | table of strings | `{}` | the sandbox's environment: each key matches `^[A-Za-z_][A-Za-z0-9_]*$` and does not start with `PARLEY_` or `OPENSHELL_` |
-| `checkpoint` | boolean | `true` | |
-| `allow_proposals` | boolean | `true` | |
-| `tool_server` | string | `""` | the absolute path of the tool server (`agentkit-tools`) in the profile's image, at most 256 bytes; `""` gives the profile's sandboxes no tools. `parleyd` does not check at start that the image holds the file: one that lacks it answers `502 tool_server_failed` on first use |
+| `description` | string | `""` | shown in the profile list |
+| `image` | string | `""` | the sandbox image; empty leaves it to the runtime |
+| `cpu`, `memory` | string | `""` | resource limits as the runtime understands them, such as `"2"` and `"4Gi"`; empty leaves them to the runtime |
+| `gpu` | integer | `0` | the number of GPUs asked for |
+| `ttl` | duration | required | the default and longest lifetime of a sandbox of this profile; above zero, at most `max_ttl` |
+| `idle_timeout` | duration | the section's `idle_timeout` | as the section's key, for this profile |
+| `policy` | path | `""` | an OpenShell policy file, the base network policy; empty is the built-in policy, which allows no egress and lets the workload write only its working directory |
+| `credentials` | list of strings | `[]` | names of `[[sandbox.credentials]]` tables every sandbox of the profile gets; a secret that is missing fails the creation |
+| `optional_credentials` | list of strings | `[]` | as `credentials`, skipped when the secret does not exist; a name may not be in both lists |
+| `expose_secrets` | list of strings | `[]` | names of secrets whose real values go into the sandbox's environment (see below) |
+| `optional_expose_secrets` | list of strings | `[]` | as `expose_secrets`, skipped when the secret does not exist; a name may not be in both lists |
+| `hub_access` | string | `"fork"` | `fork`: the sandbox gets a credential for its workspace on the hub, as a placeholder in `PARLEY_API_KEY`. `none`: it cannot reach the hub |
+| `env` | table of strings | `{}` | fixed, non-secret environment; shown in responses. A key is a valid variable name and does not start with `PARLEY_` or `OPENSHELL_` |
+| `checkpoint` | boolean | `true` | save the sandbox's work to the fork when it stops, expires or is deleted, and when its main process ends |
+| `allow_proposals` | boolean | `true` | let sandboxes of the profile ask a person for more network access; with `false` their proposals are rejected at the runtime |
+| `tool_server` | string | `""` | the absolute path of the tool server (`agentkit-tools`) in the image, at most 256 bytes; empty gives the sandboxes no tools. The path is not checked at start: an image without the file answers `502` `tool_server_failed` on first use |
 
-A name in `expose_secrets` or `optional_expose_secrets` matches
-`^[A-Za-z_][A-Za-z0-9_]*$`, does not start with `PARLEY_` or `OPENSHELL_`, is
-none of the reserved secret names `GIT_PAT`, `GIT_USERNAME`, `GIT_PASSWORD`,
+The hub adds the rule for its own API and git endpoints, and the rules of
+the attached credentials, to whatever base policy a profile has. The hub
+validates a `policy` file against the gateway at start, and a gateway that
+cannot validate one stops the start. Current OpenShell gateways cannot, so
+leave `policy` empty and widen network access through credentials and
+approved proposals.
+
+### Credentials
+
+A `[[sandbox.credentials]]` table holds exactly:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `name` | string | what profiles refer to; the shape of a profile name, unique |
+| `provider_profile` | string | the id of a provider profile the gateway knows; not empty |
+| `secret` | string | the name of the secret holding the value; not empty |
+
+### Exposed secrets
+
+`expose_secrets` puts the real value of a secret into the sandbox's
+environment, in a variable with the secret's name. It is off unless you
+list a name, because it gives up the protection above:
+
+- code in the sandbox, anything the agent downloads included, can read
+  the value and send it wherever the sandbox's network policy allows;
+- a program can write it to a file, and a checkpoint or a commit can then
+  carry it into the fork;
+- the hub redacts the value only in the sandbox logs it stores and in the
+  text of events and errors, not in exec output, the terminal, downloaded
+  files or checkpoints.
+
+Prefer a credential whenever the tool can work with a placeholder. The
+profile list and every sandbox show the names of exposed secrets, never a
+value. A name must be a valid variable name, must not start with `PARLEY_`
+or `OPENSHELL_`, must not be a key of the profile's `env`, and must not be
+one of the reserved secret names `GIT_PAT`, `GIT_USERNAME`, `GIT_PASSWORD`,
 `UPSTREAM_GIT_PAT`, `UPSTREAM_GIT_USERNAME`, `UPSTREAM_GIT_PASSWORD` and
-`FORGE_WEBHOOK_SECRET` in any letter case, and is not a key of the profile's
-`env`. Whether the secret exists is not checked when `parleyd` starts.
+`FORGE_WEBHOOK_SECRET`, in any letter case. Whether the secret exists is
+checked when a sandbox is created, not when the hub starts.
 
-A configured credential is a secret a profile may attach to its sandboxes.
-Its table holds exactly:
+### Mistakes in the section
 
-| Key | Type | Default | Meaning |
-|---|---|---|---|
-| `name` | string | required | the pattern of a profile's name; unique among the credentials |
-| `provider_profile` | string | required | the id of the OpenShell provider profile that says how the runtime may use it; not empty |
-| `secret` | string | required | the name of the secret holding its value; not empty |
+The whole section is checked before any store is opened, and every mistake
+is reported in one error, each naming its key: `sandbox.<key>`,
+`sandbox.profiles[<name>].<key>`, `sandbox.credentials[<name>].<key>` or
+`server.external_url`. The error quotes configured names where that helps,
+and never a secret, the content of a file or an `env` value.
 
-The section is checked as a whole, after the rest of the file is accepted
-and before any store is opened. Every failure is reported in one error, the
-failures separated by `; `, each naming its key: `sandbox.<key>`,
-`sandbox.profiles[<name>].<key>`, `sandbox.credentials[<name>].<key>` (the
-zero-based index in place of a name that is missing or not a valid name), or
-`server.external_url`. An unknown key in the section, a profile or a
-credential is a failure like the others. A failure about an `env` key, a
-listed credential or an exposed secret quotes that key or name, such as
-`sandbox.profiles[agent].credentials: "nope" is not the name of a
-[[sandbox.credentials]] table`. Beyond those configured names, no failure
-quotes a value, so the error holds no secret and neither the content of `token_file` or `oidc_client_secret_file`, nor
-the user information of a URL, nor the value of an `env` entry. For
-example:
-
-```
-configuration file /srv/parley/config.toml: sandbox.runtime: must be openshell; sandbox.max_ttl: must be more than 0; sandbox.reconcile_interval: must be from 10s to 10m; sandbox.gatway_url: unknown key; server.external_url: must be set when the [sandbox] section is present
+```text
+configuration file /srv/parley/config.toml: sandbox.max_ttl: must be more than 0; sandbox.gatway_url: unknown key; server.external_url: must be set when the [sandbox] section is present
 ```
 
-### Secret keys
+## Secret keys
 
-The hub seals every stored secret with AES-256-GCM under the operator's
-current key, and opens values sealed under the previous key during a
-rotation. Each key is standard base64 with padding (`=`) of exactly 32
-bytes, such as the output of `openssl rand -base64 32`; white space around
-it is ignored, the URL-safe alphabet is not accepted.
+The hub stores secrets for you: origin and forge credentials, the secrets
+sandboxes use, webhook signing secrets. It encrypts every one of them at
+rest with a key that only you hold, so that a copy of the data directory or
+a backup does not give the secrets away. The key is not in the data
+directory unless you put it there, and the hub never logs it.
+
+A key is 32 random bytes in standard base64 with padding. Create one with:
+
+```sh
+openssl rand -base64 32
+```
+
+White space around it is ignored; the URL-safe alphabet is not accepted.
 
 | Source | Holds |
 |---|---|
 | `PARLEY_SECRETS_KEY` | the current key |
-| `[secrets].key_file` | the current key, when `PARLEY_SECRETS_KEY` is unset or empty; the file is not read otherwise |
-| `PARLEY_SECRETS_KEY_PREVIOUS` | the previous key, optional |
+| `[secrets].key_file` | a file holding the current key, read only when `PARLEY_SECRETS_KEY` is unset or empty; a relative path is taken from the config dir |
+| `PARLEY_SECRETS_KEY_PREVIOUS` | the previous key, during a rotation |
 
-`parleyd` loads the keys with the configuration, before it opens the stores,
-also for `--admin-email`, `--reset-admin-token` and `backup`. A key that is
-not 32 bytes of standard padded base64, or a key file that cannot be read,
-stops it with one error line and exit status `1`: `cannot start` for a start
-and the bootstrap, `backup failed` for `backup`. The line's `error` names the
-variable or the file, never the value:
+The keys are loaded before the hub opens its stores, for a start, for
+`--admin-email`, `--reset-admin-token` and `backup` alike. A malformed key
+or a key file that cannot be read stops the hub with one error line naming
+the variable or the file, never the value, and nothing has been touched
+(see [adr/06](adr/06-load-the-secret-keys-before-the-stores-open.md)).
 
-```
-PARLEY_SECRETS_KEY: must be standard padded base64 of exactly 32 bytes
-[secrets].key_file "/srv/parley/secrets.key": cannot be read: no such file or directory
-```
+When the hub starts it writes the line `secret encryption` with
+`key_configured`, `previous_key_present` and `undecryptable_secrets`, the
+number of stored values neither key opens. Watch that last number after
+every change of keys.
 
-Without a current key the hub starts, lists and deletes secrets, and refuses
-to store one. What the start logs about the keys is in
-[cli.md](cli.md#log-lines).
+### Without a key
 
-To rotate the key, restart `parleyd` with the new key as the current key
-(`PARLEY_SECRETS_KEY` or the key file) and the former one as
-`PARLEY_SECRETS_KEY_PREVIOUS`. New values are sealed under the new key at
-once, and values under the former key still open. The maintenance pass, run
-right after the start and then every hour, seals every value under the
-former key again under the new one and writes the line `secret
-re-encryption` with `remaining`, the number of values not yet under the new
-key. Once a pass reports `remaining` `0`, restart `parleyd` without
-`PARLEY_SECRETS_KEY_PREVIOUS`. A value the former key does not open stays
-as it is and keeps `remaining` above `0`.
+A hub without a current key starts and warns that secrets cannot be
+stored. It lists and deletes secrets and refuses to store one, and features
+that need to store or read a secret answer `503` `secrets_unavailable`.
+That is fine for a first try, not for a hub people use.
 
-### Environment variables
+### Rotating the key
+
+1. Restart the hub with the new key as the current key and the former one
+   as `PARLEY_SECRETS_KEY_PREVIOUS`. New values are sealed under the new
+   key at once, and values under the former key still open.
+2. Wait. Right after the start and then every hour, the hub seals the
+   values under the former key again under the new one, and writes the
+   line `secret re-encryption` with `remaining`, the number of values not
+   yet under the new key.
+3. Once a pass reports `remaining` `0`, restart the hub without
+   `PARLEY_SECRETS_KEY_PREVIOUS`.
+
+A value the former key does not open stays as it is and keeps `remaining`
+above `0`.
+
+### Losing a key
+
+There is no recovery: a value sealed under a key you no longer have cannot
+be opened by anyone. The hub still starts, counts those values in
+`undecryptable_secrets`, and lets you list and delete them; you store each
+secret again under the new key. Keep the key where your backups of the data
+directory are not, and keep it as long as any backup sealed under it.
+
+## Retention
+
+The hub's audit records, telemetry and sessions grow with every agent run.
+Retention removes what is older than you need, so the stores stay bounded.
+Each kind of record has its own limit, so you can keep postmortems and the
+audit trail longer than the bulkier traces.
+
+A retention run starts right after the hub starts and then every hour. It
+removes:
+
+| What | When | Key | Default |
+|---|---|---|---|
+| A session that is still `active` | ended as `timeout` once it started longer ago than | `[sessions].max_active_age`, at least `1h` | `"7d"` |
+| Run events, session outcomes, tool calls, tool errors | older than | `[audit].max_age`, at least `1d` | `"90d"` |
+| The telemetry of a workspace's oldest runs (postmortems and sessions are kept) | when the workspace has telemetry of more runs than | `[audit].max_runs`, at least `1` | `50` |
+| Trace records | older than | `[audit].trace_max_age`, at least `1d` | `"30d"` |
+| Postmortems | ingested longer ago than | `[audit].postmortem_max_age`, at least `1d` | `"180d"` |
+| Ended sessions with their usage records | started longer ago than | `[sessions].max_age`, at least `1d` | `"90d"` |
+| Events in the event log (they stay readable through the audit route) | older than | `[events].retention`, at least `1h` | `"30d"` |
+| Event webhook delivery records that are not `pending` | last attempted more than 7 days ago | fixed | |
+| Hub events | older than | `[audit].max_age` | `"90d"` |
+| Everything recorded for a workspace that no longer exists | each record older than | `[audit].orphan_retention`, at least `1d` | `"30d"` |
+
+Two things are separate from this run: a sandbox's stored log lines are
+kept for `[sandbox].log_retention`, and no environment variable sets any
+retention value.
+
+What you can rely on:
+
+- A record is removed only when it is strictly older than its limit.
+- An event leaves the event log before it can be deleted, so the log never
+  has a hole. A client that resumes a stream from a position that has left
+  the log is answered `410` `cursor_expired`; the events themselves stay
+  readable through the audit route until `[audit].max_age`. This is why
+  `[events].retention` may not be longer than `[audit].max_age`.
+- The newest event is never removed, whatever its age.
+- An `active` session is never deleted, only ended.
+- The records of a task fork count as orphaned only when its parent
+  workspace is gone too.
+
+Lower `[audit].max_age` or `[audit].max_runs` when the analytical store
+grows faster than your disk allows; raise them when you audit further
+back. Raise `[events].retention` when clients stay disconnected for longer
+than 30 days and must resume their stream.
+
+### Watching retention
+
+A run has eleven steps: `stale_sessions`, `run_records`, `max_runs`,
+`traces`, `postmortems`, `sessions`, `event_log`, `webhook_deliveries`,
+`hub_events`, `orphans` and `gauges`, which refreshes the metrics
+`parley_audit_records` and `parley_agent_sessions_active`. A step that
+fails is logged as `retention step failed`, counted in
+`parley_retention_errors_total{step}`, and does not stop the steps after
+it. `parley_retention_last_run_timestamp_seconds` moves only when every
+step succeeded, so alert on it standing still (see
+[api.md](api.md#health-version-and-metrics)).
+
+## Environment variables
+
+The hub reads these variables itself, once, when it starts:
 
 | Variable | Effect |
 |---|---|
-| `XDG_CONFIG_HOME` | the directory `config.toml` is read from |
-| `XDG_DATA_HOME` | where the stores and the workspace root go when `[database].path` and `[workspace].path` do not say (see above) |
+| `XDG_CONFIG_HOME` | the config dir, where `config.toml` is read and `admin_token` is written; default: the working directory |
+| `XDG_DATA_HOME` | where the stores and the workspace root go when `[database].path` and `[workspace].path` do not say (see [Storage](#storage)) |
 | `PARLEY_SECRETS_KEY` | the current secret key (see [Secret keys](#secret-keys)) |
-| `PARLEY_SECRETS_KEY_PREVIOUS` | the previous secret key, during a rotation (see [Secret keys](#secret-keys)) |
-| any variable a `${NAME}` reference names | its value replaces the reference |
-| `GIT_SSL_CAINFO`, `SSL_CERT_FILE`, `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` | passed on to every `git` process the hub runs against an origin, for origins behind a private certificate authority or a proxy (see below) |
-| `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` (or their lower-case names) | also read once, when the hub starts, by its forge client: a forge request goes through the proxy they name, directly for a host `NO_PROXY` lists (see [Forge reads](api.md#forge-reads)). The hub reads no forge token or API URL from its environment: `GITHUB_TOKEN`, `GH_TOKEN`, `GITLAB_TOKEN`, `GITHUB_API_URL` and `GITLAB_API_URL` are ignored |
+| `PARLEY_SECRETS_KEY_PREVIOUS` | the previous secret key, during a rotation |
+| any variable a `${NAME}` reference names | its value replaces the reference (see [Environment references](#environment-references)) |
+| `PATH` | where `git` is found |
+| `GIT_SSL_CAINFO`, `SSL_CERT_FILE` | passed on to the `git` the hub runs against an origin, for an origin whose certificate a private authority signed |
+| `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` | passed on to that `git`, and used (also under their lower-case names) for the hub's requests to a forge |
 
-`parleyd` runs `git` with a fixed minimal environment, away from the
-configuration and credential stores of the account that runs it: apart from
-`PATH`, through which `git` and the programs it starts are found, no other
-variable of `parleyd`'s environment reaches `git`, so an origin whose
-certificate a private authority signed needs `GIT_SSL_CAINFO` (or
-`SSL_CERT_FILE`) set for `parleyd`, and an origin reached through a proxy
-needs the proxy variables. They are read once, when `parleyd` starts. The
-`ssh` of a `git@` origin runs in batch mode (`GIT_SSH_COMMAND=ssh -o
-BatchMode=yes`), so a call that would need a password or a host key answer
-fails rather than waits. A `git` process that contacts a remote (origin or a
-carry-patch workspace's upstream) runs with `GIT_ALLOW_PROTOCOL=https:ssh`,
-set after every variable above so that none widens it: a redirect or a
-remote helper cannot take `git` to another transport. A remote whose URL is
-not `https://`, `ssh://` or `[user@]host:path` (`http://`, `git://`,
-`file://`, a local path, `<helper>::<address>`) is refused before `git`
-starts.
+The hub runs `git` with a minimal environment of its own, away from the
+configuration and credential stores of the account that runs it. Apart from
+`PATH` and the variables above, nothing of the hub's environment reaches
+`git`, so set them for `parleyd` itself when an origin sits behind a
+private certificate authority or a proxy. Two consequences are worth
+knowing: an `ssh` origin is contacted in batch mode, so a call that would
+need a password or a host key answer fails instead of waiting; and a
+remote must be `https://`, `ssh://` or `[user@]host:path`, with no other
+transport reachable through a redirect or a helper.
 
-### Retention
+The hub reads no forge token or API URL from its environment:
+`GITHUB_TOKEN`, `GH_TOKEN`, `GITLAB_TOKEN`, `GITHUB_API_URL` and
+`GITLAB_API_URL` are ignored. Forge credentials are stored as secrets (see
+[api.md](api.md#forge)).
 
-The keys of `[audit]` (other than `write_timeout`) and of `[sessions]` set
-how long the audit and session records are kept. The maintenance task
-`retention` applies them once right after the hub starts and then every
-hour, in eleven steps that always run in this order:
+## Configuring the client
 
-| Step | What it does |
-|---|---|
-| `stale_sessions` | ends every `active` session started before now minus `[sessions].max_active_age` as `timeout`, with `ended_at` now, `error_message` `session exceeded maximum active age` and `duration_ms` from `started_at`; it writes no hub event |
-| `run_records` | deletes the run events, session outcomes, tool calls and tool errors whose `timestamp` is older than `[audit].max_age` |
-| `max_runs` | for each workspace with telemetry of more than `[audit].max_runs` runs, deletes the run events, outcomes, tool calls, tool errors and traces of its oldest runs; a run's age is its earliest such record, and of two runs equally old the lower `run_id` is the older. Postmortems and sessions are kept |
-| `traces` | deletes the trace records older than `[audit].trace_max_age` |
-| `postmortems` | deletes the postmortems ingested before now minus `[audit].postmortem_max_age` |
-| `sessions` | deletes the ended sessions started before now minus `[sessions].max_age`, with their usage records and links |
-| `event_log` | moves the start of the event log past the events older than `[events].retention`; they stay stored for `GET /api/v1/audit`, and a resume position before the new start is answered `410` `cursor_expired` |
-| `webhook_deliveries` | deletes the event webhook delivery records, pings included, that are not `pending` and whose last attempt, or without an attempt their creation, is more than 7 days old; a `pending` record is never deleted (see [api.md](api.md#event-webhooks)) |
-| `hub_events` | deletes the hub events older than `[audit].max_age` |
-| `orphans` | deletes the sessions (whatever their status), usage records, telemetry of all six kinds and hub events of a workspace slug no workspace has (for a task fork's slug `<parent>--<name>`, only when the parent is gone too), once each is older than `[audit].orphan_retention` by its own time |
-| `gauges` | sets the metrics `parley_audit_records` and `parley_agent_sessions_active` from the stored records (see [api.md](api.md#get-metrics)) |
+`parley` needs two things to talk to a hub: the hub's URL and a credential.
+Each comes from the first of these that is not empty:
 
-A record is deleted only when it is strictly older than its limit: one
-whose time equals now minus the limit is kept. A hub event is deleted, by
-`hub_events` or by `orphans`, only once it has left the event log, so that
-the log never has a hole: an event still in the log stays until a later run
-after `event_log` has moved past it (an `[audit].orphan_retention` shorter
-than `[events].retention` keeps an orphan's events for `[events].retention`).
-The event with the highest `seq` is never deleted and never leaves the event
-log, whatever its age, and a hub event without a workspace is never an
-orphan.
+| Setting | Flag | Variable | Key in the client file |
+|---|---|---|---|
+| Hub URL | `--endpoint-url` | `PARLEY_ENDPOINT_URL` | `endpoint_url` |
+| Credential | `--api-key` | `PARLEY_API_KEY` | `api_key` |
 
-A step that fails or panics is logged as `retention step failed` with its
-`step`, counted in `parley_retention_errors_total{step}`, and the next step
-runs; the task then fails, naming the failed steps. Only a run in which
-every step succeeded sets `parley_retention_last_run_timestamp_seconds` to
-the time it ended. A stop of the hub ends the run before its next step.
+The order lets one machine hold a default in the file, a script or a
+sandbox override it with variables, and a single command override both with
+a flag. Values are not trimmed. The credential is an API key, a personal
+access token or the admin token. The hub URL must be an absolute `http` or
+`https` URL with a host and without a query or fragment.
 
-A retention value that is not such a duration stops `parleyd` before it
-listens, with an error naming the key as `section.key` (`audit.max_age:
-must be a duration with a unit of s, m, h or d, such as 90d: …`); one below
-its minimum with `audit.max_age: must be at least 1d` (`at least 1h` for
-`sessions.max_active_age`, `at least 1` for `audit.max_runs`).
+```sh
+# once, on your machine: writes the file
+parley login --endpoint-url https://parley.example.com
 
-### Fixed values
+# in automation: no file needed
+export PARLEY_ENDPOINT_URL=https://parley.example.com
+export PARLEY_API_KEY="$PARLEY_PAT"
+parley workspace list
+```
 
-| Setting | Value |
-|---|---|
-| Shutdown grace | 15 seconds: how long in-flight requests get to finish after `SIGTERM` or `SIGINT` |
-| Maintenance loop grace | 15 seconds: how long a stop waits for the running maintenance task to end |
-| Stop limit | 30 seconds: the longest a stop waits for anything after `SIGTERM` or `SIGINT`; a piece of background work's grace is at most this |
-| Idempotency records | kept in the transactional store for 24 hours, so they survive a restart (see [api.md](api.md#idempotency)) |
-
-See [cli.md](cli.md) for how `parleyd` is started and stopped.
-
-## `parley`
-
-| Variable | Effect |
-|---|---|
-| `PARLEY_ENDPOINT_URL` | the URL of the hub, for example `http://127.0.0.1:8080`, when the flag `--endpoint-url` is absent or empty |
-| `PARLEY_API_KEY` | the credential a command presents to the hub (an API key, a personal access token or the admin token), when the flag `--api-key` is absent or empty. `parley login` does not take it |
-| `PARLEY_CONFIG_DIR` | the directory of the client configuration file, when set and not empty; otherwise `.parley` in the home directory (`$HOME`) |
-
-Each setting comes from the first non-empty of its flag, its variable and
-its key in the client configuration file: the hub URL from
-`--endpoint-url`, `PARLEY_ENDPOINT_URL` and `endpoint_url`, the credential
-from `--api-key`, `PARLEY_API_KEY` and `api_key`. An empty or unset variable
-gives nothing, and values are not trimmed. A command that needs the hub and
-a credential and finds no value for one fails before any request with a
-`client_error`, and so does one given a hub URL that is not an absolute
-`http` or `https` URL with a host and without a query or fragment. `parley version` without a URL prints the client's build
-alone. See [cli.md](cli.md#settings-the-hub-url-and-the-credential).
+A command that needs a setting and finds none fails with a `client_error`
+before it sends anything. `parley version` without a URL prints the
+client's build alone.
 
 ### The client configuration file
 
-The client configuration file is `config.toml` in the client's config
-directory: `$PARLEY_CONFIG_DIR/config.toml`, or `~/.parley/config.toml`. It
-is TOML and holds the hub URL and the credential, so it is private:
+The file is `config.toml` in the client's config directory:
+`$PARLEY_CONFIG_DIR` when that is set and not empty, `.parley` in your home
+directory otherwise.
 
 | Key | Value |
 |---|---|
-| `endpoint_url` | the hub URL, without trailing slashes; every command that talks to the hub, `parley version` and `parley login` included, uses it when neither `--endpoint-url` nor `PARLEY_ENDPOINT_URL` gives one |
-| `api_key` | the credential of the last login, an API key or a personal access token; a command that needs a credential uses it when neither `--api-key` nor `PARLEY_API_KEY` gives one |
+| `endpoint_url` | the hub URL, without trailing slashes |
+| `api_key` | the credential of the last login |
 | `user_id` | the `id` of the user the credential belongs to |
-
-For example:
 
 ```toml
 api_key = "parley_abcd1234_0123456789abcdefghijABCDEFGHIJ01"
@@ -505,31 +827,22 @@ endpoint_url = "http://127.0.0.1:8080"
 user_id = "0b5c6f2e-8d1a-4c3b-9e7f-2a4d6c8e0f13"
 ```
 
-A command reads the file only when its flags and the variables leave a
-setting it needs empty, so a command given every setting by flags or
-variables never reads it. Reading the file creates nothing. A missing file,
-and a missing home directory when `PARLEY_CONFIG_DIR` is unset or empty,
-count as an empty file. A file that cannot be read, is not valid TOML, or holds
-`endpoint_url`, `api_key` or `user_id` with a value that is not a string is
-an error (`client_error`) whose message names the file's path; for invalid
-TOML it gives the line and column, never the file's text, which holds a
-credential. A command that needed a setting from it then fails before any
-request; `parley version` instead writes one `warning: ` line naming the
-file and prints the client's build alone, with exit status `0`.
+The file holds a credential, so it is private: `parley login` is the only
+command that writes it, and it always leaves it with mode `0600` (and
+creates a missing config directory with mode `0700`). A login replaces the
+file as a whole or not at all. It sets the three keys and keeps every other
+key and table, but not comments or the order of keys. `parley login` takes
+a credential from `--api-key` alone, never from `PARLEY_API_KEY` or the
+file.
 
-Only `parley login` writes the file. It reads the file before it sends
-anything, so a file it could not read fails the login and is left as it
-is, and after a successful login sets these three keys and saves the file.
-The save keeps every other key and table with its value, but not comments
-or the order of the keys. It writes a temporary file in the same directory,
-sets its mode to `0600` whatever the umask and the old file's mode, and
-renames it over `config.toml`, so the file is replaced as a whole and ends
-with mode `0600`; a missing config directory is created with mode `0700`.
-A save that cannot write the new file or replace the old one, or finds a
-file it cannot parse, fails with a `client_error` naming the path; one
-that has no path because there is no home directory fails with the
-`client_error` `cannot save the config file: cannot find the config
-directory: set PARLEY_CONFIG_DIR or HOME: …`. Either way it removes its
-temporary file and leaves the old file byte for byte as it was. `parley login` does not read
-`api_key`, and `PARLEY_API_KEY` does not change it. See
-[cli.md](cli.md#parley-login).
+A command reads the file only when its flags and the variables leave a
+setting empty, so a command given everything by flags or variables never
+touches it. A missing file counts as empty. A file that cannot be read, is
+not valid TOML, or holds one of the three keys with a value that is not a
+string is a `client_error` naming the file's path, never its text: the
+command fails before any request, and `parley version` prints a warning and
+the client's build. A login that cannot read the file fails and leaves it
+as it is.
+
+See [cli.md](cli.md#using-parley) and
+[cli.md](cli.md#parley-login-and-your-account).
