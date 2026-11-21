@@ -72,6 +72,9 @@ type Component struct {
 	// attempts are what the attempts of the build jobs did, by job id, from
 	// a run to its settlement.
 	attempts map[string]*attempt
+	// building is the commit of the last build of each workspace this
+	// process began, by slug.
+	building map[string]string
 }
 
 // Bind gives the component its dependencies, the defaults in place of the

@@ -3,7 +3,7 @@
   "spec_id": "59",
   "spec_name": "code_index_builds",
   "schema_version": 3,
-  "updated_at": "2026-11-21T07:05:45Z",
+  "updated_at": "2026-11-21T15:52:32Z",
   "tasks": [
     {
       "id": 1,
@@ -214,7 +214,7 @@
     },
     {
       "id": 3,
-      "state": "in_progress",
+      "state": "done",
       "evidence": [
         {
           "covers": "REQ-4.1",
@@ -222,8 +222,12 @@
             {
               "test": "./internal/codeindex:TestFollow_BuildsAWorkspaceOnceItHasItsRepository",
               "failed": {
-                "at": "2026-11-21T07:03:49Z",
-                "tree": "1cc34b6a9fdf593794cf72aec4e2e21800f1d3f5"
+                "at": "2026-11-21T07:10:19Z",
+                "tree": "9bab6f3b7e2dfdafd2f9b6c970ef8599f8183cba"
+              },
+              "passed": {
+                "at": "2026-11-21T15:52:23Z",
+                "tree": "2b8fc434e82e93394b60bd185491dcddf5246364"
               }
             }
           ]
@@ -234,8 +238,12 @@
             {
               "test": "./test/e2e:TestCodeIndex_FollowsTheHeadWhateverMovesIt",
               "failed": {
-                "at": "2026-11-21T07:03:49Z",
-                "tree": "1cc34b6a9fdf593794cf72aec4e2e21800f1d3f5"
+                "at": "2026-11-21T07:10:19Z",
+                "tree": "9bab6f3b7e2dfdafd2f9b6c970ef8599f8183cba"
+              },
+              "passed": {
+                "at": "2026-11-21T15:52:23Z",
+                "tree": "2b8fc434e82e93394b60bd185491dcddf5246364"
               }
             }
           ]
@@ -246,8 +254,12 @@
             {
               "test": "./internal/codeindex:TestFollow_KeepsOnePendingBuildBesideTheRunningOne",
               "failed": {
-                "at": "2026-11-21T07:03:49Z",
-                "tree": "1cc34b6a9fdf593794cf72aec4e2e21800f1d3f5"
+                "at": "2026-11-21T07:10:19Z",
+                "tree": "9bab6f3b7e2dfdafd2f9b6c970ef8599f8183cba"
+              },
+              "passed": {
+                "at": "2026-11-21T15:52:23Z",
+                "tree": "2b8fc434e82e93394b60bd185491dcddf5246364"
               }
             }
           ]
@@ -258,8 +270,12 @@
             {
               "test": "./internal/codeindex:TestFollow_BuildsAtStartWhatMovedWhileTheHubWasDown",
               "failed": {
-                "at": "2026-11-21T07:03:49Z",
-                "tree": "1cc34b6a9fdf593794cf72aec4e2e21800f1d3f5"
+                "at": "2026-11-21T07:10:19Z",
+                "tree": "9bab6f3b7e2dfdafd2f9b6c970ef8599f8183cba"
+              },
+              "passed": {
+                "at": "2026-11-21T15:52:23Z",
+                "tree": "2b8fc434e82e93394b60bd185491dcddf5246364"
               }
             }
           ]
@@ -270,8 +286,12 @@
             {
               "test": "./internal/codeindex:TestFollow_BuildsAWorkspaceWhoseSettingIsTurnedOn",
               "failed": {
-                "at": "2026-11-21T07:03:49Z",
-                "tree": "1cc34b6a9fdf593794cf72aec4e2e21800f1d3f5"
+                "at": "2026-11-21T07:10:19Z",
+                "tree": "9bab6f3b7e2dfdafd2f9b6c970ef8599f8183cba"
+              },
+              "passed": {
+                "at": "2026-11-21T15:52:23Z",
+                "tree": "2b8fc434e82e93394b60bd185491dcddf5246364"
               }
             }
           ]
@@ -281,7 +301,27 @@
           "no_red": "a fork must get no build, and a hub that queues no build on any notice yet gives it none; the test fails once a notice of a fork's branch queues one",
           "tests": [
             {
-              "test": "./internal/codeindex:TestFollow_KeepsNothingOfAFork"
+              "test": "./internal/codeindex:TestFollow_KeepsNothingOfAFork",
+              "passed": {
+                "at": "2026-11-21T15:52:23Z",
+                "tree": "2b8fc434e82e93394b60bd185491dcddf5246364"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.5",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestMaintenance_QueuesWhatIsBehindAndRemovesWhatIsStray",
+              "failed": {
+                "at": "2026-11-21T07:09:28Z",
+                "tree": "a11e2840513af2fb7d45e13e31e155593d76121d"
+              },
+              "passed": {
+                "at": "2026-11-21T15:52:23Z",
+                "tree": "2b8fc434e82e93394b60bd185491dcddf5246364"
+              }
             }
           ]
         }

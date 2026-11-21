@@ -193,6 +193,15 @@ func (h buildHandler) Run(ctx context.Context, j jobs.Job) error {
 	}
 
 	a := &attempt{slug: ws.Slug, sha: head}
+	// From here on the directory of this build is no leftover, though no
+	// record names it until its settlement has committed, which nothing
+	// reports; so it stays the workspace's last build until the next one.
+	c.mu.Lock()
+	if c.building == nil {
+		c.building = map[string]string{}
+	}
+	c.building[ws.Slug] = head
+	c.mu.Unlock()
 	start := c.deps.Now()
 	a.files, a.partial, a.err = c.build(ctx, repo, ws.Slug, head)
 	a.took = c.deps.Now().Sub(start)
@@ -354,4 +363,82 @@ func (c *Component) behind(ctx context.Context, ws Workspace) (bool, error) {
 		return false, err
 	}
 	return rec.IndexedSHA != head || !c.stored(ws.Slug, head), nil
+}
+
+// Sweep removes from the code index directory what no index needs: the
+// directory of a workspace that does not exist any more or that the hub
+// keeps no index of, with its record, and, of a workspace it keeps one of,
+// every build but the one its record names and the one being built.
+func (c *Component) Sweep(ctx context.Context) error {
+	if !c.Enabled() {
+		return nil
+	}
+	entries, err := os.ReadDir(filepath.Join(c.deps.DataDir, DirName))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read the code index directory: %w", err)
+	}
+	var failures []error
+	for _, e := range entries {
+		if err := c.sweepWorkspace(ctx, e.Name()); err != nil {
+			failures = append(failures, fmt.Errorf("code index of %s: %w", e.Name(), err))
+		}
+	}
+	return errors.Join(failures...)
+}
+
+// sweepWorkspace is Sweep for the directory named slug.
+func (c *Component) sweepWorkspace(ctx context.Context, slug string) error {
+	ws, found, err := c.deps.Workspace(ctx, slug)
+	if err != nil {
+		return err
+	}
+	dir := c.workspaceDir(slug)
+	if !found || !c.indexes(ws) {
+		// A build of it may still run, for a workspace whose setting was
+		// just turned off; what it writes goes with the next pass.
+		if err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error { return RemoveWorkspace(ctx, tx, slug) }); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		delete(c.building, slug)
+		c.mu.Unlock()
+		return os.RemoveAll(dir)
+	}
+	rec, _, err := c.Record(ctx, slug)
+	if err != nil {
+		return err
+	}
+	builds, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	var failures []error
+	for _, b := range builds {
+		// The build under way is asked for last: one that began after the
+		// record was read is kept, not taken for a leftover.
+		if b.Name() == rec.IndexedSHA || b.Name() == c.buildingOf(slug) {
+			continue
+		}
+		failures = append(failures, os.RemoveAll(filepath.Join(dir, b.Name())))
+	}
+	return errors.Join(failures...)
+}
+
+// RemoveWorkspace deletes, in tx, the record of the workspace slug.
+func RemoveWorkspace(ctx context.Context, tx *sql.Tx, slug string) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM code_index_records WHERE workspace_slug = ?`, slug); err != nil {
+		return fmt.Errorf("delete the code index record of %s: %w", slug, err)
+	}
+	return nil
+}
+
+// buildingOf is the commit of the last build of the workspace slug this
+// process began, "" for none.
+func (c *Component) buildingOf(slug string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.building[slug]
 }

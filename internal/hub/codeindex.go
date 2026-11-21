@@ -19,7 +19,8 @@ import (
 const codeIndexHook = "code-index"
 
 // codeIndexTask is the maintenance task that queues a build for every
-// workspace whose index is not at its head.
+// workspace whose index is not at its head and removes the trees and
+// indexes no workspace needs.
 const codeIndexTask = "code_index"
 
 // composeCodeIndex composes the code index: the trees and indexes of the
@@ -112,7 +113,9 @@ func composeCodeIndex(c *Composition) {
 		// while the hub was down is queued here.
 		return comp.Reconcile(ctx)
 	})
-	c.AddMaintenanceTask(codeIndexTask, func(ctx context.Context, _ *Runtime) error { return comp.Reconcile(ctx) })
+	c.AddMaintenanceTask(codeIndexTask, func(ctx context.Context, _ *Runtime) error {
+		return errors.Join(comp.Reconcile(ctx), comp.Sweep(ctx))
+	})
 }
 
 // codeIndexWorkspaces lists every repository workspace as the code index
