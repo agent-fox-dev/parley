@@ -43,6 +43,8 @@ type Workspace struct {
 	DefaultBranch string
 	// Indexed is the workspace's setting code_index.
 	Indexed bool
+	// Parent is the slug of a fork's parent, "" for a repository workspace.
+	Parent string
 }
 
 // Repository is what a build reads of a workspace's repository.
@@ -303,7 +305,7 @@ func (h buildHandler) Settled(ctx context.Context, tx *sql.Tx, j jobs.Job, _ boo
 	switch {
 	case a.err != nil:
 		outcome = outcomeFailed
-		if err := recordFailed(ctx, tx, a.slug, a.sha, c.deps.Scrub(a.err.Error()), now); err != nil {
+		if err := recordFailed(ctx, tx, a.slug, a.sha, c.failureText(a.err), now); err != nil {
 			return err
 		}
 	default:

@@ -92,7 +92,7 @@ var catalogue = []Metric{
 	{Name: SCMRequestsTotal, Type: Counter,
 		Help: "Source control API requests.",
 		Labels: []Label{closed("op", "refs", "commits", "tree", "file", "diff", "compare", "blame", "search", "outline",
-			"commit", "ref_create", "ref_move", "ref_delete", "rebase"),
+			"code_index", "commit", "ref_create", "ref_move", "ref_delete", "rebase"),
 			closed("result", "ok", "ref_moved", "refused", "error")}},
 	{Name: ChangesOpen, Type: Gauge,
 		Help:   "Changes in state draft or open.",

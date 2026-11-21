@@ -3,7 +3,7 @@
   "spec_id": "59",
   "spec_name": "code_index_builds",
   "schema_version": 3,
-  "updated_at": "2026-11-21T15:58:58Z",
+  "updated_at": "2026-11-21T16:03:59Z",
   "tasks": [
     {
       "id": 1,
@@ -409,7 +409,140 @@
     },
     {
       "id": 5,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-6.1",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestStatus_AnswersTheStateOfTheIndex",
+              "failed": {
+                "at": "2026-11-21T16:00:24Z",
+                "tree": "a40c8c312f150646d7dda12b0d081d625a38742e"
+              },
+              "passed": {
+                "at": "2026-11-21T16:03:55Z",
+                "tree": "95ce653ede2eb7f9762bd764d7b244269debed8e"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.2",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestStatus_AnswersOffWhereNoIndexIsKept",
+              "failed": {
+                "at": "2026-11-21T16:00:24Z",
+                "tree": "a40c8c312f150646d7dda12b0d081d625a38742e"
+              },
+              "passed": {
+                "at": "2026-11-21T16:03:55Z",
+                "tree": "95ce653ede2eb7f9762bd764d7b244269debed8e"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.3",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestStatus_AnswersForTheParentOfAFork",
+              "failed": {
+                "at": "2026-11-21T16:00:24Z",
+                "tree": "a40c8c312f150646d7dda12b0d081d625a38742e"
+              },
+              "passed": {
+                "at": "2026-11-21T16:03:55Z",
+                "tree": "95ce653ede2eb7f9762bd764d7b244269debed8e"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.4",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestStatus_ShowsAFailureScrubbedAndCut",
+              "failed": {
+                "at": "2026-11-21T16:00:24Z",
+                "tree": "a40c8c312f150646d7dda12b0d081d625a38742e"
+              },
+              "passed": {
+                "at": "2026-11-21T16:03:55Z",
+                "tree": "95ce653ede2eb7f9762bd764d7b244269debed8e"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.5",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestStatus_AppliesTheAccessRuleOfTheSourceControlReads",
+              "failed": {
+                "at": "2026-11-21T16:00:24Z",
+                "tree": "a40c8c312f150646d7dda12b0d081d625a38742e"
+              },
+              "passed": {
+                "at": "2026-11-21T16:03:55Z",
+                "tree": "95ce653ede2eb7f9762bd764d7b244269debed8e"
+              }
+            },
+            {
+              "test": "./internal/metrics:TestNew_ExportsEveryCatalogueMetricAtZero",
+              "failed": {
+                "at": "2026-11-21T16:00:24Z",
+                "tree": "a40c8c312f150646d7dda12b0d081d625a38742e"
+              },
+              "passed": {
+                "at": "2026-11-21T16:03:55Z",
+                "tree": "95ce653ede2eb7f9762bd764d7b244269debed8e"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.6",
+          "tests": [
+            {
+              "test": "./internal/cli:TestSCM_ReadsSendOneGetAndPrintTheAnswer",
+              "failed": {
+                "at": "2026-11-21T16:00:24Z",
+                "tree": "a40c8c312f150646d7dda12b0d081d625a38742e"
+              },
+              "passed": {
+                "at": "2026-11-21T16:03:55Z",
+                "tree": "95ce653ede2eb7f9762bd764d7b244269debed8e"
+              }
+            },
+            {
+              "test": "./internal/cli:TestMCPList_ServesTheStateOfTheCodeIndexAsAReadingTool",
+              "failed": {
+                "at": "2026-11-21T16:00:24Z",
+                "tree": "a40c8c312f150646d7dda12b0d081d625a38742e"
+              },
+              "passed": {
+                "at": "2026-11-21T16:03:55Z",
+                "tree": "95ce653ede2eb7f9762bd764d7b244269debed8e"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.7",
+          "no_red": "the builds are counted since task 2 and the bytes measured since task 4, whose tests failed first; this test asserts the three metrics together and fails once one of them is not reported",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestMetrics_CountsTheBuildsAndMeasuresTheDisk",
+              "passed": {
+                "at": "2026-11-21T16:03:55Z",
+                "tree": "95ce653ede2eb7f9762bd764d7b244269debed8e"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 6,

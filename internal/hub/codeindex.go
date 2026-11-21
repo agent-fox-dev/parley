@@ -44,6 +44,9 @@ func composeCodeIndex(c *Composition) {
 	comp := &codeindex.Component{}
 	c.codeIndex = comp
 	c.AddSchemaStep(codeindex.SchemaStep)
+	for _, r := range comp.Routes() {
+		c.AddRoute(r)
+	}
 	// A build is queued wherever the head of a default branch moves: an
 	// accepted write of refs (a land, a push, the source control API), a
 	// clone that made a workspace ready (the first one and a reclone), a
@@ -172,6 +175,9 @@ func codeIndexWorkspace(w workspace.Workspace, settings *workspace.SettingsRegis
 	ws := codeindex.Workspace{Slug: w.Slug, Repository: w.Kind == access.KindRepository}
 	if w.DefaultBranch != nil {
 		ws.DefaultBranch = *w.DefaultBranch
+	}
+	if w.ParentSlug != nil {
+		ws.Parent = *w.ParentSlug
 	}
 	ws.Indexed, _ = settings.EffectiveSettings(w.Settings, w.DefaultBranch)[codeindex.SettingName].(bool)
 	return ws
