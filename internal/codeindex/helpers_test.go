@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -236,4 +237,192 @@ func (w *world) entries(t *testing.T, slug string) []string {
 		names = append(names, e.Name())
 	}
 	return names
+}
+
+// record is the code index record of the workspace slug, the zero record
+// when it has none.
+func (w *world) record(t *testing.T, slug string) codeindex.Record {
+	t.Helper()
+	r, _, err := w.index.Record(context.Background(), slug)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+// queue queues a build of the workspace slug, as a move of its head does.
+func (w *world) queue(t *testing.T, slug string) {
+	t.Helper()
+	if err := w.index.Queue(context.Background(), slug); err != nil {
+		t.Fatalf("queue a build of %s: %v", slug, err)
+	}
+}
+
+// indexed queues a build of the workspace slug and waits until its index is
+// at the head of its main; it returns the record.
+func (w *world) indexed(t *testing.T, slug string) codeindex.Record {
+	t.Helper()
+	w.queue(t, slug)
+	return w.reaches(t, slug, w.head(t, slug))
+}
+
+// reaches waits until the index of the workspace slug holds the commit sha
+// and none of its builds is pending, and returns its record.
+func (w *world) reaches(t *testing.T, slug, sha string) codeindex.Record {
+	t.Helper()
+	eventually(t, "the index of "+slug+" to hold "+sha, func() bool {
+		return w.record(t, slug).IndexedSHA == sha && len(w.jobs(t, slug)) == 0
+	})
+	return w.record(t, slug)
+}
+
+// tree lists what the tree of the commit sha of the workspace slug holds:
+// each regular file with its content, each symbolic link as "-> target",
+// and each directory that holds nothing as "/".
+func (w *world) tree(t *testing.T, slug, sha string) map[string]string {
+	t.Helper()
+	root := w.index.TreeDir(slug, sha)
+	found := map[string]string{}
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || path == root {
+			return err
+		}
+		rel, _ := filepath.Rel(root, path)
+		rel = filepath.ToSlash(rel)
+		switch {
+		case d.Type()&os.ModeSymlink != 0:
+			target, err := os.Readlink(path)
+			found[rel] = "-> " + target
+			return err
+		case d.IsDir():
+			if entries, err := os.ReadDir(path); err != nil || len(entries) == 0 {
+				found[rel] = "/"
+				return err
+			}
+		default:
+			content, err := os.ReadFile(path)
+			found[rel] = string(content)
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("read the tree of %s at %s: %v", slug, sha, err)
+	}
+	return found
+}
+
+// seam stands between the component and its indexes: it can hold the
+// builds of a tree until they are let go, and make them fail or report a
+// partial index.
+type seam struct {
+	mu sync.Mutex
+	// held are the trees whose builds wait, by a part of their path, with
+	// what lets them go.
+	held map[string]chan struct{}
+	// fail, when not nil, is the error of the build of a tree, nil to let
+	// it build.
+	fail func(tree string) error
+	// partial makes every index report itself partial.
+	partial bool
+	// began receives the tree of every build that began; opened are the
+	// bounds every index was made with.
+	began  chan string
+	opened []codeindex.Bounds
+}
+
+func newSeam() *seam { return &seam{held: map[string]chan struct{}{}, began: make(chan string, 64)} }
+
+// hold makes the builds of the trees whose path holds part wait, and
+// returns what lets them go.
+func (s *seam) hold(part string) (release func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch := make(chan struct{})
+	s.held[part] = ch
+	return sync.OnceFunc(func() { close(ch) })
+}
+
+// failWith sets what the builds fail with.
+func (s *seam) failWith(fail func(tree string) error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fail = fail
+}
+
+// adjust puts the seam before the component's indexes.
+func (s *seam) adjust(d *codeindex.Deps) {
+	open := d.Open
+	if open == nil {
+		open = codeindex.OpenSearchIndex
+	}
+	d.Open = func(tree, store, scratch string, b codeindex.Bounds) (codeindex.Index, error) {
+		s.mu.Lock()
+		s.opened = append(s.opened, b)
+		s.mu.Unlock()
+		idx, err := open(tree, store, scratch, b)
+		if err != nil {
+			return nil, err
+		}
+		return seamIndex{Index: idx, seam: s, tree: tree}, nil
+	}
+}
+
+// waitBegan waits for a build of a tree whose path holds part to begin.
+func (s *seam) waitBegan(t *testing.T, part string) {
+	t.Helper()
+	deadline := time.After(20 * time.Second)
+	for {
+		select {
+		case tree := <-s.began:
+			if strings.Contains(tree, part) {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("waited 20 s for a build of %s to begin", part)
+		}
+	}
+}
+
+type seamIndex struct {
+	codeindex.Index
+	seam *seam
+	tree string
+}
+
+func (i seamIndex) Build(ctx context.Context) error {
+	s := i.seam
+	s.mu.Lock()
+	var wait chan struct{}
+	for part, ch := range s.held {
+		if strings.Contains(i.tree, part) {
+			wait = ch
+		}
+	}
+	fail := s.fail
+	s.mu.Unlock()
+	select {
+	case s.began <- i.tree:
+	default:
+	}
+	if wait != nil {
+		select {
+		case <-wait:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if fail != nil {
+		if err := fail(i.tree); err != nil {
+			return err
+		}
+	}
+	return i.Index.Build(ctx)
+}
+
+func (i seamIndex) State(ctx context.Context) (int, bool, error) {
+	files, partial, err := i.Index.State(ctx)
+	i.seam.mu.Lock()
+	defer i.seam.mu.Unlock()
+	return files, partial || i.seam.partial, err
 }

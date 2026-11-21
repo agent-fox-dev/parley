@@ -38,35 +38,38 @@ type Metric struct {
 
 // The names of the catalogue's metrics.
 const (
-	HTTPRequestsTotal          = "parley_http_requests_total"
-	HTTPRequestDurationSeconds = "parley_http_request_duration_seconds"
-	GitRequestsTotal           = "parley_git_requests_total"
-	SCMRequestsTotal           = "parley_scm_requests_total"
-	ChangesOpen                = "parley_changes_open"
-	LandsTotal                 = "parley_lands_total"
-	LandAttempts               = "parley_land_attempts"
-	LandDurationSeconds        = "parley_land_duration_seconds"
-	ForksActive                = "parley_forks_active"
-	EventsSeq                  = "parley_events_seq"
-	SSEConnections             = "parley_sse_connections"
-	WebhookDeliveriesTotal     = "parley_webhook_deliveries_total"
-	WebhookQueueDepth          = "parley_webhook_queue_depth"
-	AuditEventsTotal           = "parley_audit_events_total"
-	AgentSessionsActive        = "parley_agent_sessions_active"
-	AgentTokensTotal           = "parley_agent_tokens_total"
-	AuditRecords               = "parley_audit_records"
-	JobqueueDepth              = "parley_jobqueue_depth"
-	RetentionErrorsTotal       = "parley_retention_errors_total"
-	RetentionLastRunTimestamp  = "parley_retention_last_run_timestamp_seconds"
-	Sandboxes                  = "parley_sandboxes"
-	SandboxCreatesTotal        = "parley_sandbox_creates_total"
-	SandboxSeconds             = "parley_sandbox_seconds"
-	SandboxExecTotal           = "parley_sandbox_exec_total"
-	SandboxToolCallsTotal      = "parley_sandbox_tool_calls_total"
-	SandboxToolCallDuration    = "parley_sandbox_tool_call_duration_seconds"
-	SandboxDenialsTotal        = "parley_sandbox_denials_total"
-	SandboxCheckpointsTotal    = "parley_sandbox_checkpoints_total"
-	SandboxRuntimeUp           = "parley_sandbox_runtime_up"
+	HTTPRequestsTotal             = "parley_http_requests_total"
+	HTTPRequestDurationSeconds    = "parley_http_request_duration_seconds"
+	GitRequestsTotal              = "parley_git_requests_total"
+	SCMRequestsTotal              = "parley_scm_requests_total"
+	ChangesOpen                   = "parley_changes_open"
+	LandsTotal                    = "parley_lands_total"
+	LandAttempts                  = "parley_land_attempts"
+	LandDurationSeconds           = "parley_land_duration_seconds"
+	ForksActive                   = "parley_forks_active"
+	EventsSeq                     = "parley_events_seq"
+	SSEConnections                = "parley_sse_connections"
+	WebhookDeliveriesTotal        = "parley_webhook_deliveries_total"
+	WebhookQueueDepth             = "parley_webhook_queue_depth"
+	AuditEventsTotal              = "parley_audit_events_total"
+	AgentSessionsActive           = "parley_agent_sessions_active"
+	AgentTokensTotal              = "parley_agent_tokens_total"
+	AuditRecords                  = "parley_audit_records"
+	JobqueueDepth                 = "parley_jobqueue_depth"
+	RetentionErrorsTotal          = "parley_retention_errors_total"
+	RetentionLastRunTimestamp     = "parley_retention_last_run_timestamp_seconds"
+	Sandboxes                     = "parley_sandboxes"
+	SandboxCreatesTotal           = "parley_sandbox_creates_total"
+	SandboxSeconds                = "parley_sandbox_seconds"
+	SandboxExecTotal              = "parley_sandbox_exec_total"
+	SandboxToolCallsTotal         = "parley_sandbox_tool_calls_total"
+	SandboxToolCallDuration       = "parley_sandbox_tool_call_duration_seconds"
+	SandboxDenialsTotal           = "parley_sandbox_denials_total"
+	SandboxCheckpointsTotal       = "parley_sandbox_checkpoints_total"
+	SandboxRuntimeUp              = "parley_sandbox_runtime_up"
+	CodeIndexBuildsTotal          = "parley_code_index_builds_total"
+	CodeIndexBuildDurationSeconds = "parley_code_index_build_duration_seconds"
+	CodeIndexBytes                = "parley_code_index_bytes"
 )
 
 func closed(name string, values ...string) Label { return Label{Name: name, Values: values} }
@@ -156,4 +159,11 @@ var catalogue = []Metric{
 		Help:   "Sandbox checkpoints attempted.",
 		Labels: []Label{closed("result", "ok", "empty", "failed")}},
 	{Name: SandboxRuntimeUp, Type: Gauge, Help: "1 while the sandbox runtime is reachable."},
+	{Name: CodeIndexBuildsTotal, Type: Counter,
+		Help:   "Code index builds that ended, by outcome.",
+		Labels: []Label{closed("outcome", "ok", "partial", "failed")}},
+	{Name: CodeIndexBuildDurationSeconds, Type: Histogram,
+		Help:    "Time a code index build ran, in seconds.",
+		Buckets: []float64{0.1, 0.5, 1, 5, 10, 30, 60, 120, 300, 600}},
+	{Name: CodeIndexBytes, Type: Gauge, Help: "Bytes of the code index trees and indexes on disk."},
 }

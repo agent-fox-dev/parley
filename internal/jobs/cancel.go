@@ -75,3 +75,26 @@ func (q *Queue) Requeue(ctx context.Context, tx *sql.Tx, id string) (Job, error)
 	q.poke()
 	return j, nil
 }
+
+// Hasten makes the failed job of typ and the workspace slug due at once, in
+// tx: it is queued again with its retry count and error, as a pass does
+// when its next attempt is due, and the dispatcher is woken for it. It
+// reports whether there was such a job. It is for a job whose reason to
+// wait has gone: what it failed on has changed.
+func (q *Queue) Hasten(ctx context.Context, tx *sql.Tx, typ, slug string) (bool, error) {
+	d, err := q.deps()
+	if err != nil {
+		return false, err
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE jobs SET status = ?, next_attempt_at = NULL, updated_at = ?
+WHERE type = ? AND workspace_slug = ? AND status = ?`, StatusQueued, d.Clock.Now().UTC().UnixNano(), typ, slug, StatusFailed)
+	if err != nil {
+		return false, fmt.Errorf("hasten the %s job of %s: %w", typ, slug, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil || n == 0 {
+		return false, err
+	}
+	q.poke()
+	return true, nil
+}

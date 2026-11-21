@@ -3,7 +3,7 @@
   "spec_id": "59",
   "spec_name": "code_index_builds",
   "schema_version": 3,
-  "updated_at": "2026-11-21T06:36:48Z",
+  "updated_at": "2026-11-21T06:47:11Z",
   "tasks": [
     {
       "id": 1,
@@ -112,7 +112,105 @@
     },
     {
       "id": 2,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-3.1",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestBuild_WritesTheTreeOfTheHeadAndRecordsTheCommit",
+              "failed": {
+                "at": "2026-11-21T06:43:46Z",
+                "tree": "e51c8f79258a4ec32bdfdaf045be12cc08aecd02"
+              },
+              "passed": {
+                "at": "2026-11-21T06:47:08Z",
+                "tree": "a0e299697ac5487322003b3857348457180a17f0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.2",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestBuild_KeepsInTheTreeTheCommitsFilesAndNothingElse",
+              "failed": {
+                "at": "2026-11-21T06:43:46Z",
+                "tree": "e51c8f79258a4ec32bdfdaf045be12cc08aecd02"
+              },
+              "passed": {
+                "at": "2026-11-21T06:47:08Z",
+                "tree": "a0e299697ac5487322003b3857348457180a17f0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.3",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestBuild_KeepsAPartialIndexWhenABoundStopsIt",
+              "failed": {
+                "at": "2026-11-21T06:43:46Z",
+                "tree": "e51c8f79258a4ec32bdfdaf045be12cc08aecd02"
+              },
+              "passed": {
+                "at": "2026-11-21T06:47:08Z",
+                "tree": "a0e299697ac5487322003b3857348457180a17f0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.4",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestBuild_LeavesThePreviousIndexWhenItFailsAndTriesAgain",
+              "failed": {
+                "at": "2026-11-21T06:43:46Z",
+                "tree": "e51c8f79258a4ec32bdfdaf045be12cc08aecd02"
+              },
+              "passed": {
+                "at": "2026-11-21T06:47:08Z",
+                "tree": "a0e299697ac5487322003b3857348457180a17f0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.5",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestBuild_BuildsANewHeadWithoutWaitingForAFailedBuildsRetry",
+              "failed": {
+                "at": "2026-11-21T06:43:46Z",
+                "tree": "e51c8f79258a4ec32bdfdaf045be12cc08aecd02"
+              },
+              "passed": {
+                "at": "2026-11-21T06:47:08Z",
+                "tree": "a0e299697ac5487322003b3857348457180a17f0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.6",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestBuild_RunsAtMostTheConfiguredWorkersAtOnce",
+              "failed": {
+                "at": "2026-11-21T06:43:46Z",
+                "tree": "e51c8f79258a4ec32bdfdaf045be12cc08aecd02"
+              },
+              "passed": {
+                "at": "2026-11-21T06:47:08Z",
+                "tree": "a0e299697ac5487322003b3857348457180a17f0"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 3,

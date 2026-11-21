@@ -92,6 +92,9 @@ type Queue struct {
 	wake chan struct{}
 	// handlers are the registered handlers, by job type.
 	handlers map[string]Handler
+	// limits are the most attempts of a type that run at once, by job type
+	// (Limit); a type without one is bounded by MaxRunning alone.
+	limits map[string]int
 	// running are the attempts this queue has claimed and not yet seen
 	// end, by job id. Its size is what the limit of MaxRunning counts.
 	running map[string]*worker
@@ -106,6 +109,8 @@ type Queue struct {
 
 // worker is an attempt of a job the queue runs.
 type worker struct {
+	// typ is the type of the attempt's job.
+	typ string
 	// cancel cancels the context of the attempt.
 	cancel context.CancelFunc
 	// done is closed once the attempt has ended and its outcome is
@@ -232,6 +237,16 @@ func (q *Queue) pass(ctx context.Context, woken bool) error {
 	q.mu.Lock()
 	stopping, room := q.stopping, len(q.running) < MaxRunning
 	types := slices.Sorted(maps.Keys(q.handlers))
+	// A type at its limit has nothing a pass could claim, like a queue
+	// without room.
+	atLimit := map[string]int{}
+	for _, w := range q.running {
+		atLimit[w.typ]++
+	}
+	types = slices.DeleteFunc(types, func(typ string) bool {
+		limit := q.limits[typ]
+		return limit > 0 && atLimit[typ] >= limit
+	})
 	q.mu.Unlock()
 	if stopping {
 		return nil
@@ -317,8 +332,19 @@ func (q *Queue) reserve(base context.Context, j Job) (c claim, full bool) {
 	if _, runs := q.running[j.ID]; !ok || runs {
 		return claim{}, false
 	}
+	if limit := q.limits[j.Type]; limit > 0 {
+		n := 0
+		for _, w := range q.running {
+			if w.typ == j.Type {
+				n++
+			}
+		}
+		if n >= limit {
+			return claim{}, false
+		}
+	}
 	ctx, cancel := context.WithCancel(base)
-	w := &worker{cancel: cancel, done: make(chan struct{})}
+	w := &worker{typ: j.Type, cancel: cancel, done: make(chan struct{})}
 	if q.running == nil {
 		q.running = map[string]*worker{}
 	}

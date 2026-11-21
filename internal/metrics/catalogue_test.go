@@ -75,6 +75,9 @@ var documented = []struct {
 	{"parley_sandbox_denials_total", metrics.Counter, nil, nil},
 	{"parley_sandbox_checkpoints_total", metrics.Counter, []label{closed("result", "ok", "empty", "failed")}, nil},
 	{"parley_sandbox_runtime_up", metrics.Gauge, nil, nil},
+	{"parley_code_index_builds_total", metrics.Counter, []label{closed("outcome", "ok", "partial", "failed")}, nil},
+	{"parley_code_index_build_duration_seconds", metrics.Histogram, nil, []float64{0.1, 0.5, 1, 5, 10, 30, 60, 120, 300, 600}},
+	{"parley_code_index_bytes", metrics.Gauge, nil, nil},
 }
 
 // zeroSeries is what a fresh registry exports for a documented metric: one

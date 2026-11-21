@@ -7,17 +7,27 @@
 package codeindex
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/config"
+	"github.com/agent-fox-dev/parley/internal/jobs"
+	"github.com/agent-fox-dev/parley/internal/metrics"
+	"github.com/agent-fox-dev/parley/internal/store"
 )
 
 // Section is the configuration section that turns the code index on.
 const Section = "code_index"
+
+// SettingName is the workspace setting that turns one workspace's index
+// off.
+const SettingName = "code_index"
 
 // DirName is the directory under the hub's data directory that holds every
 // tree and index.
@@ -33,12 +43,33 @@ type Deps struct {
 	DataDir string
 	// Open makes an index; nil is OpenSearchIndex.
 	Open Opener
+	// Store holds the records, and Jobs runs the builds; both are required
+	// on a hub with the section.
+	Store *store.Store
+	Jobs  *jobs.Queue
+	// Workspace reads what the component needs of the workspace slug; found
+	// is false when there is none.
+	Workspace func(ctx context.Context, slug string) (ws Workspace, found bool, err error)
+	// Repos opens the repository of the workspace slug.
+	Repos func(ctx context.Context, slug string) (Repository, error)
+	// Metrics is told of every build that ended; nil tells no one.
+	Metrics metrics.Recorder
+	// Scrub removes what the hub keeps secret from a failure's text and
+	// bounds its length; nil keeps the text.
+	Scrub func(text string) string
+	// Now is the clock; nil is time.Now.
+	Now func() time.Time
 }
 
 // Component keeps the trees and indexes. Its zero value is ready to be
 // composed; it works once Bind has given it its dependencies.
 type Component struct {
 	deps Deps
+
+	mu sync.Mutex
+	// attempts are what the attempts of the build jobs did, by job id, from
+	// a run to its settlement.
+	attempts map[string]*attempt
 }
 
 // Bind gives the component its dependencies, the defaults in place of the
@@ -46,6 +77,15 @@ type Component struct {
 func (c *Component) Bind(d Deps) {
 	if d.Open == nil {
 		d.Open = OpenSearchIndex
+	}
+	if d.Metrics == nil {
+		d.Metrics = metrics.Discard
+	}
+	if d.Scrub == nil {
+		d.Scrub = func(text string) string { return text }
+	}
+	if d.Now == nil {
+		d.Now = time.Now
 	}
 	c.deps = d
 }
