@@ -1,6 +1,7 @@
 package codeindex
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/agentkit-go/codesearch"
+	"github.com/agent-fox-dev/agentkit-go/tools"
 	akworkspace "github.com/agent-fox-dev/agentkit-go/workspace"
 )
 
@@ -33,7 +35,34 @@ type Index interface {
 	// index cannot parse is a *QueryError; a search it did not finish in
 	// its own time is ErrSearchTimeout.
 	Search(ctx context.Context, query string, maxFiles int) (SearchResult, error)
+	// Symbols are the declarations that match q, from the outlines the
+	// build collected. answered is false when the index does not answer
+	// such a lookup: it is partial, or more declarations match than it
+	// answers.
+	Symbols(ctx context.Context, q SymbolQuery) (symbols []Symbol, answered bool, err error)
 	Close() error
+}
+
+// SymbolQuery is a lookup of declarations by name: the declarations whose
+// name starts with Name, ignoring case unless Name has an upper-case
+// letter, or is Name when Exact; of the kind Kind unless it is ""; in the
+// files under the directory Dir, slash-separated and relative to the tree,
+// unless it is "".
+type SymbolQuery struct {
+	Name, Kind, Dir string
+	Exact           bool
+}
+
+// Symbol is a declaration a lookup found.
+type Symbol struct {
+	Path      string `json:"path"`
+	Kind      string `json:"kind"`
+	Name      string `json:"name"`
+	Container string `json:"container"`
+	Signature string `json:"signature"`
+	Exported  bool   `json:"exported"`
+	StartLine int    `json:"start_line"`
+	EndLine   int    `json:"end_line"`
 }
 
 // SearchResult is the index's answer to a search.
@@ -160,6 +189,23 @@ func (s searchIndex) Search(ctx context.Context, query string, maxFiles int) (Se
 		res.Files = append(res.Files, file)
 	}
 	return res, nil
+}
+
+func (s searchIndex) Symbols(ctx context.Context, q SymbolQuery) ([]Symbol, bool, error) {
+	answer, answered, err := s.idx.Symbols(ctx, tools.SymbolQuery{Name: q.Name, Kind: q.Kind, Path: q.Dir, Exact: q.Exact})
+	if err != nil || !answered {
+		return nil, false, err
+	}
+	symbols := make([]Symbol, 0, len(answer.Matches))
+	for _, m := range answer.Matches {
+		symbols = append(symbols, Symbol{Path: m.Path, Kind: m.Kind, Name: m.Name, Container: m.Container,
+			Signature: m.Signature, Exported: m.Exported, StartLine: m.StartLine, EndLine: m.EndLine})
+	}
+	// The index walks its files in no order; a lookup answers in one.
+	slices.SortFunc(symbols, func(a, b Symbol) int {
+		return cmp.Or(strings.Compare(a.Path, b.Path), a.StartLine-b.StartLine, strings.Compare(a.Name, b.Name))
+	})
+	return symbols, true, nil
 }
 
 // search runs the index's own search tool with args and returns its data.

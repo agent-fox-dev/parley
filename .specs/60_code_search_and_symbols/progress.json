@@ -3,7 +3,7 @@
   "spec_id": "60",
   "spec_name": "code_search_and_symbols",
   "schema_version": 3,
-  "updated_at": "2026-11-21T16:43:23Z",
+  "updated_at": "2026-11-21T16:48:38Z",
   "tasks": [
     {
       "id": 1,
@@ -125,7 +125,142 @@
     },
     {
       "id": 2,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-2.1",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestSymbols_FindsTheDeclarationsWhoseNameStartsWithTheGivenOne",
+              "failed": {
+                "at": "2026-11-21T16:44:46Z",
+                "tree": "8d176cb1de7c4d5e11e80a41889455d70206052d"
+              },
+              "passed": {
+                "at": "2026-11-21T16:48:34Z",
+                "tree": "b02c1e451beae9f90d370267166888cb0546d6b9"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.2",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestSymbols_NarrowsTheLookupByExactKindPathAndLimit",
+              "failed": {
+                "at": "2026-11-21T16:44:46Z",
+                "tree": "8d176cb1de7c4d5e11e80a41889455d70206052d"
+              },
+              "passed": {
+                "at": "2026-11-21T16:48:34Z",
+                "tree": "b02c1e451beae9f90d370267166888cb0546d6b9"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.3",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestSymbols_RefusesAParameterItDoesNotTake",
+              "failed": {
+                "at": "2026-11-21T16:44:46Z",
+                "tree": "8d176cb1de7c4d5e11e80a41889455d70206052d"
+              },
+              "passed": {
+                "at": "2026-11-21T16:48:34Z",
+                "tree": "b02c1e451beae9f90d370267166888cb0546d6b9"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.4",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestSymbols_AreRefusedByAPartialIndexWhichCodeSearchAnswers",
+              "failed": {
+                "at": "2026-11-21T16:44:46Z",
+                "tree": "8d176cb1de7c4d5e11e80a41889455d70206052d"
+              },
+              "passed": {
+                "at": "2026-11-21T16:48:34Z",
+                "tree": "b02c1e451beae9f90d370267166888cb0546d6b9"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.5",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestSymbols_RefuseANameThatTooManyDeclarationsMatch",
+              "failed": {
+                "at": "2026-11-21T16:44:46Z",
+                "tree": "8d176cb1de7c4d5e11e80a41889455d70206052d"
+              },
+              "passed": {
+                "at": "2026-11-21T16:48:34Z",
+                "tree": "b02c1e451beae9f90d370267166888cb0546d6b9"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.3",
+          "no_red": "the checks the two routes share were delivered in task 1, whose tests failed first; this test asserts the setting's refusal on both routes and for a fork, and fails once either route answers with the setting off",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestQuery_IsRefusedWhileTheWorkspacesSettingIsOff",
+              "passed": {
+                "at": "2026-11-21T16:48:34Z",
+                "tree": "b02c1e451beae9f90d370267166888cb0546d6b9"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.4",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestQuery_AppliesTheAccessRuleOfTheSourceControlReads",
+              "failed": {
+                "at": "2026-11-21T16:44:46Z",
+                "tree": "8d176cb1de7c4d5e11e80a41889455d70206052d"
+              },
+              "passed": {
+                "at": "2026-11-21T16:48:34Z",
+                "tree": "b02c1e451beae9f90d370267166888cb0546d6b9"
+              }
+            },
+            {
+              "test": "./internal/metrics:TestNew_ExportsEveryCatalogueMetricAtZero",
+              "failed": {
+                "at": "2026-11-21T16:44:46Z",
+                "tree": "8d176cb1de7c4d5e11e80a41889455d70206052d"
+              },
+              "passed": {
+                "at": "2026-11-21T16:48:34Z",
+                "tree": "b02c1e451beae9f90d370267166888cb0546d6b9"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.5",
+          "no_red": "the head check of the two routes was delivered in task 1; this test compares both routes with the tree route for a repository without a commit and fails once they differ",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestQuery_AnswersAWorkspaceWithoutAHeadAsTheTreeRouteDoes",
+              "passed": {
+                "at": "2026-11-21T16:48:34Z",
+                "tree": "b02c1e451beae9f90d370267166888cb0546d6b9"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 3,

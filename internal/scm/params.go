@@ -51,16 +51,28 @@ func pathParam(q url.Values, required bool) (string, error) {
 		}
 		return "", nil
 	}
+	if err := CheckPath(path); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// CheckPath is nil for a legal path of a repository's tree, as every read
+// that takes one judges it, and the 400 invalid_request of any other: it is
+// relative, has no empty, "." or ".." segment, does not lie under .git and
+// holds no NUL. It is exported for the reads of the source control API
+// another package serves.
+func CheckPath(path string) error {
 	if strings.HasPrefix(path, "/") || strings.ContainsRune(path, 0) {
-		return "", server.InvalidRequest("path must be a relative path of the repository, such as docs/api.md")
+		return server.InvalidRequest("path must be a relative path of the repository, such as docs/api.md")
 	}
 	for seg := range strings.SplitSeq(path, "/") {
 		switch seg {
 		case "", ".", "..":
-			return "", server.InvalidRequest(fmt.Sprintf("path %q has an empty, . or .. segment", path))
+			return server.InvalidRequest(fmt.Sprintf("path %q has an empty, . or .. segment", path))
 		case ".git":
-			return "", server.InvalidRequest(fmt.Sprintf("path %q lies under .git", path))
+			return server.InvalidRequest(fmt.Sprintf("path %q lies under .git", path))
 		}
 	}
-	return path, nil
+	return nil
 }

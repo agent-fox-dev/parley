@@ -6,6 +6,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
+	pathpkg "path"
+	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -13,6 +17,7 @@ import (
 	"github.com/agent-fox-dev/agentkit-go/outline"
 
 	"github.com/agent-fox-dev/parley/internal/metrics"
+	"github.com/agent-fox-dev/parley/internal/scm"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
@@ -218,15 +223,98 @@ func (c *Component) getSearch(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// getSymbols answers GET …/scm/symbols.
+// The bounds of a symbol lookup: its name and its answer.
+const (
+	maxNameChars       = 200
+	defaultSymbolsSize = 20
+	maxSymbols         = 50
+)
+
+// symbolKinds are the kinds of declaration a lookup may ask for.
+var symbolKinds = []string{"func", "method", "type", "class", "interface", "enum", "trait", "const", "var", "module", "macro"}
+
+// symbolsAnswer is the answer of the symbols route.
+type symbolsAnswer struct {
+	Workspace  string   `json:"workspace"`
+	IndexedSHA string   `json:"indexed_sha"`
+	Partial    bool     `json:"partial"`
+	Truncated  bool     `json:"truncated"`
+	Symbols    []Symbol `json:"symbols"`
+}
+
+// getSymbols answers GET …/scm/symbols: the declarations of the default
+// branch whose name starts with name, ignoring case unless it has an
+// upper-case letter, or is name with exact; of the kind kind; in the file
+// or under the directory path. They are answered by path and line, cut to
+// limit. Only a complete index answers a lookup.
 func (c *Component) getSymbols(w http.ResponseWriter, r *http.Request) error {
-	t, err := c.prepare(w, r, func(url.Values) error { return nil })
+	var q SymbolQuery
+	var path string
+	limit := defaultSymbolsSize
+	t, err := c.prepare(w, r, func(v url.Values) (err error) {
+		q.Name = v.Get("name")
+		if q.Name == "" || utf8.RuneCountInString(q.Name) > maxNameChars {
+			return server.InvalidRequest("name is required: the start of a declaration's name, 1 to 200 characters")
+		}
+		switch v.Get("exact") {
+		case "", "false":
+		case "true":
+			q.Exact = true
+		default:
+			return server.InvalidRequest("exact must be true or false")
+		}
+		if q.Kind = strings.ToLower(v.Get("kind")); q.Kind != "" && !slices.Contains(symbolKinds, q.Kind) {
+			return server.InvalidRequest("kind must be one of " + strings.Join(symbolKinds, ", "))
+		}
+		if path = v.Get("path"); path != "" {
+			if err := scm.CheckPath(path); err != nil {
+				return err
+			}
+		}
+		limit, err = limitParam(v, defaultSymbolsSize, maxSymbols)
+		return err
+	})
 	if err != nil {
 		return err
 	}
-	server.WriteJSON(w, http.StatusOK, map[string]any{
-		"workspace": t.ws.Slug, "indexed_sha": t.rec.IndexedSHA, "partial": t.rec.Partial, "truncated": false, "symbols": []any{},
-	})
+	if t.rec.Partial {
+		return server.NewError("code_index_partial", http.StatusConflict,
+			fmt.Sprintf("the code index of %q is partial: symbols need a complete index; scm/code-search answers from a partial one", t.ws.Slug)).
+			With("indexed_sha", t.rec.IndexedSHA)
+	}
+	ctx := r.Context()
+	// The index looks under a directory; for a file it is asked for the
+	// file's directory and the file's declarations are kept.
+	q.Dir = path
+	file := ""
+	if path != "" {
+		if info, err := os.Lstat(filepath.Join(c.TreeDir(t.ws.Slug, t.rec.IndexedSHA), filepath.FromSlash(path))); err == nil && !info.IsDir() {
+			file = path
+			if q.Dir = pathpkg.Dir(path); q.Dir == "." {
+				q.Dir = ""
+			}
+		}
+	}
+	idx, err := c.loaded(ctx, t.ws.Slug)
+	if err != nil {
+		return err
+	}
+	found, answered, err := idx.Symbols(ctx, q)
+	if err != nil {
+		return err
+	}
+	if !answered {
+		return server.NewError("too_many_matches", http.StatusUnprocessableEntity,
+			"more than 1,000 declarations match: give a longer name, a kind or a path")
+	}
+	if file != "" {
+		found = slices.DeleteFunc(found, func(s Symbol) bool { return s.Path != file })
+	}
+	answer := symbolsAnswer{Workspace: t.ws.Slug, IndexedSHA: t.rec.IndexedSHA, Truncated: len(found) > limit, Symbols: found[:min(len(found), limit)]}
+	if answer.Symbols == nil {
+		answer.Symbols = []Symbol{}
+	}
+	server.WriteJSON(w, http.StatusOK, answer)
 	return nil
 }
 
