@@ -231,6 +231,7 @@ func (s *Service) update(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	slug := server.Param(r, "slug")
+	var before, after Workspace
 	err := s.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
 		cur, found, err := BySlug(ctx, tx, slug)
 		switch {
@@ -267,11 +268,13 @@ func (s *Service) update(w http.ResponseWriter, r *http.Request) error {
 		if _, err := s.deps.Events.Emit(ctx, tx, in); err != nil {
 			return fmt.Errorf("write the update event of workspace %q: %w", slug, err)
 		}
+		before, after = cur, next
 		return nil
 	})
 	if err != nil {
 		return err
 	}
+	s.notifyUpdate(ctx, before, after)
 	rec, found, err := BySlug(ctx, s.deps.Store.Main(), slug)
 	switch {
 	case err != nil:
@@ -431,4 +434,35 @@ func writeUpdate(ctx context.Context, tx *sql.Tx, w Workspace) error {
 		return fmt.Errorf("update workspace %q: %w", w.Slug, err)
 	}
 	return nil
+}
+
+// UpdateObserver is told of every update of a workspace once it is
+// committed, with the record as it was and as it is. It learns of a change
+// of the settings, which no event carries the values of. Its error is
+// logged and changes nothing: the update is made.
+type UpdateObserver func(ctx context.Context, before, after Workspace) error
+
+// RegisterUpdateObserver adds o to the observers of the workspace updates,
+// which are told in registration order; a nil o adds none. An observer
+// cannot be removed.
+func (s *Service) RegisterUpdateObserver(o UpdateObserver) {
+	if o == nil {
+		return
+	}
+	s.updatedMu.Lock()
+	defer s.updatedMu.Unlock()
+	s.updateObservers = append(s.updateObservers, o)
+}
+
+// notifyUpdate tells the update observers that the workspace before is
+// after now, outside any transaction.
+func (s *Service) notifyUpdate(ctx context.Context, before, after Workspace) {
+	s.updatedMu.RLock()
+	observers := slices.Clone(s.updateObservers)
+	s.updatedMu.RUnlock()
+	for _, o := range observers {
+		if err := o(ctx, before, after); err != nil {
+			s.deps.Logger.Error("workspace update observer failed", "slug", after.Slug, "error", err)
+		}
+	}
 }

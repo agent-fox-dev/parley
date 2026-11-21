@@ -196,6 +196,7 @@ var settingsTable = []settingSpec{
 	{name: "rebuild_fail_mode", kind: kindEnum, values: []string{"fail_fast", "continue"}, def: "fail_fast"},
 	{name: "rebuild_push_integration_branch", kind: kindBool, def: false},
 	{name: "squash_merge_detection", kind: kindEnum, values: []string{"ancestry_only", "content_based", "both"}, def: "both"},
+	{name: "code_index", kind: kindBool, def: true},
 }
 
 // RegisterSettingKeys registers every key of the settings table on r, in

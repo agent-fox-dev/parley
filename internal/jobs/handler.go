@@ -33,3 +33,22 @@ func (q *Queue) Register(typ string, h Handler) {
 	q.mu.Unlock()
 	q.poke()
 }
+
+// Limit makes the queue run at most n attempts of the type typ at once,
+// whatever else it runs: a job of the type that finds n running stays
+// queued, with no attempt counted, until one of them ends. An n of zero or
+// less takes the limit away. It is for a type whose attempts are costly
+// enough to be bounded apart from the queue's own MaxRunning.
+func (q *Queue) Limit(typ string, n int) {
+	q.mu.Lock()
+	if q.limits == nil {
+		q.limits = map[string]int{}
+	}
+	if n > 0 {
+		q.limits[typ] = n
+	} else {
+		delete(q.limits, typ)
+	}
+	q.mu.Unlock()
+	q.poke()
+}

@@ -52,6 +52,7 @@ type Config struct {
 	SCM       SCM
 	Changes   Changes
 	Land      Land
+	CodeIndex CodeIndex
 
 	values map[string]map[string]any
 	// sections holds the content of each section registered as a whole that
@@ -207,6 +208,10 @@ func (r *Registry) Load(env Env, workDir string) (*Config, error) {
 	c.SCM = scmFrom(values)
 	c.Changes = changesFrom(values)
 	c.Land = landFrom(values)
+	if table, present := sections[codeIndexSection]; present {
+		// The section's rules have accepted the table.
+		c.CodeIndex, _ = codeIndexFrom(table)
+	}
 	c.sections = sections
 	return c, nil
 }
@@ -257,8 +262,27 @@ func readTree(path string) (map[string]any, error) {
 // every registered key, the OAuth providers and the content of the sections
 // registered as a whole. It stops at the first key it refuses, in the order of
 // section and key names; the validators of whole sections run only once every
-// key is accepted.
+// key is accepted. The loader's own [code_index] is the exception: what it
+// refuses is reported with a key's refusal, so that one start names both.
 func (r *Registry) check(tree map[string]any) (map[string]map[string]any, []Provider, map[string]map[string]any, error) {
+	values, providers, sections, err := r.checkKeys(tree)
+	if err != nil {
+		if table, isTable := tree[codeIndexSection].(map[string]any); isTable {
+			_, sectionErr := codeIndexFrom(table)
+			err = errors.Join(err, sectionErr)
+		}
+		return nil, nil, nil, err
+	}
+	for _, section := range sortedKeys(sections) {
+		if err := r.sections[section](sections[section]); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	return values, providers, sections, nil
+}
+
+// checkKeys is check before the validators of the whole sections run.
+func (r *Registry) checkKeys(tree map[string]any) (map[string]map[string]any, []Provider, map[string]map[string]any, error) {
 	values := map[string]map[string]any{}
 	for section, keys := range r.keys {
 		values[section] = map[string]any{}
@@ -307,11 +331,6 @@ func (r *Registry) check(tree map[string]any) (map[string]map[string]any, []Prov
 				return nil, nil, nil, fmt.Errorf("%s: %w", k.id(), err)
 			}
 			values[section][name] = v
-		}
-	}
-	for _, section := range sortedKeys(sections) {
-		if err := r.sections[section](sections[section]); err != nil {
-			return nil, nil, nil, err
 		}
 	}
 	return values, providers, sections, nil

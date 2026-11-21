@@ -100,13 +100,16 @@ func TestRead_ShowsAForkTheEffectiveSettingsOfItsParent(t *testing.T) {
 		t.Errorf("the fork's settings = %v, want its parent's %v", fork, parent)
 	}
 	// The parent's settings change after the fork was made.
-	if a := w.patch(t, w.uKey, "demo", map[string]any{"settings": map[string]any{"land.strategy": "squash"}}); a.status != http.StatusOK {
+	if settings("demo--t1")["code_index"] != true {
+		t.Errorf("the fork's code_index = %v, want its parent's default, true", settings("demo--t1")["code_index"])
+	}
+	if a := w.patch(t, w.uKey, "demo", map[string]any{"settings": map[string]any{"land.strategy": "squash", "code_index": false}}); a.status != http.StatusOK {
 		t.Fatalf("PATCH the parent's settings = %d %s, want 200", a.status, a.body)
 	}
 	fork := settings("demo--t1")
-	if fork["land.strategy"] != "squash" || !reflect.DeepEqual(fork["protected_branches"], []any{"main"}) {
-		t.Errorf("after the parent changed, the fork's land.strategy = %v and protected_branches = %v, want squash and [main]",
-			fork["land.strategy"], fork["protected_branches"])
+	if fork["land.strategy"] != "squash" || fork["code_index"] != false || !reflect.DeepEqual(fork["protected_branches"], []any{"main"}) {
+		t.Errorf("after the parent changed, the fork's land.strategy = %v, code_index = %v and protected_branches = %v, want squash, false and [main]",
+			fork["land.strategy"], fork["code_index"], fork["protected_branches"])
 	}
 }
 

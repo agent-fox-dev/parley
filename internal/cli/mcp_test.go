@@ -240,6 +240,13 @@ func TestMCPList_ServesTheOutlineOfAFileAsAReadingTool(t *testing.T) {
 	}
 }
 
+func TestMCPList_ServesTheStateOfTheCodeIndexAsAReadingTool(t *testing.T) {
+	in := toolNamed(t, mcpList(t, defaultOptions(), "--no-code-mode", "--read-only"), "scm_code_index").InputSchema
+	if !slices.Equal(in.Required, []string{"slug"}) || in.Properties["slug"]["type"] != "string" {
+		t.Errorf("scm_code_index takes %v (required %v), want the one required string slug", in.Properties, in.Required)
+	}
+}
+
 func TestMCPList_ServesTheGroupsNamed(t *testing.T) {
 	cmds := helpCommands(t, defaultOptions())
 	in := func(groups ...string) func(string, commandHelp) bool {

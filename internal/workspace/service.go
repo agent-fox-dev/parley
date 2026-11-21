@@ -135,6 +135,10 @@ type Service struct {
 
 	clonedMu       sync.RWMutex
 	cloneObservers []CloneObserver
+	// updateObservers are told of every committed update of a workspace
+	// (RegisterUpdateObserver).
+	updatedMu       sync.RWMutex
+	updateObservers []UpdateObserver
 
 	moveMu        sync.RWMutex
 	moveObservers []BranchMoveObserver

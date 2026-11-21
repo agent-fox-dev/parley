@@ -96,6 +96,9 @@ func (r *rebuildRun) publish(ctx context.Context) *attemptOutcome {
 		return r.failed(ctx, fmt.Errorf("rebuild of %s: publish: %w", r.ws.Slug, err))
 	}
 	r.removed = removed
+	if told := r.c.d.AfterRebuildPublish; told != nil {
+		told(ctx, r.ws.Slug, r.payload.IntegrationBranch)
+	}
 	head := r.head
 	r.result.IntegrationHeadSHA = &head
 	r.result.PreviousIntegrationHeadSHA = nil

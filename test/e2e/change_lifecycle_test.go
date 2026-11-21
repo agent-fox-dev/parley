@@ -27,7 +27,13 @@ type lifecycleHub struct {
 
 func startLifecycleHub(t *testing.T) *lifecycleHub {
 	t.Helper()
-	h := &lifecycleHub{forkHub: startForkHubWith(t, nil, func(c *hub.Composition) {
+	return startLifecycleHubExtra(t, hubExtra{})
+}
+
+// startLifecycleHubExtra is startLifecycleHub with extra.
+func startLifecycleHubExtra(t *testing.T, extra hubExtra) *lifecycleHub {
+	t.Helper()
+	h := &lifecycleHub{forkHub: startForkHubExtra(t, nil, extra, func(c *hub.Composition) {
 		c.AdjustChange(func(d *change.Deps) { d.MergeableDebounce = 0 })
 	})}
 	owner := cloneAs(t, h.forkHub, h.key, "demo")

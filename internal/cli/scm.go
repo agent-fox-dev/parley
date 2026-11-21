@@ -161,6 +161,9 @@ func newSCMCommand() *cobra.Command {
 			query:   []queryFlag{refFlag("file is outlined")},
 		}.build(),
 		scmRead{
+			command: command{Name: "code-index", Description: "Show which commit a workspace's code index holds and what state it is in", Path: "/workspaces/:slug/scm/code-index", Args: slugOnly},
+		}.build(),
+		scmRead{
 			command: command{Name: "search", Description: "Search the file contents of a revision", Path: "/workspaces/:slug/scm/search", Args: []argSpec{slugArg, {Name: "query", Required: true}}},
 			params:  map[string]string{"query": "q"},
 			query: []queryFlag{

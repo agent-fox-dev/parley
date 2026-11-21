@@ -50,9 +50,15 @@ func startForkHubAt(t *testing.T, now func() time.Time, more ...string) *forkHub
 // hub's composition after the harness's own changes.
 func startForkHubWith(t *testing.T, now func() time.Time, compose func(*hub.Composition), more ...string) *forkHub {
 	t.Helper()
+	return startForkHubExtra(t, now, hubExtra{}, compose, more...)
+}
+
+// startForkHubExtra is startForkHubWith with extra.
+func startForkHubExtra(t *testing.T, now func() time.Time, extra hubExtra, compose func(*hub.Composition), more ...string) *forkHub {
+	t.Helper()
 	origin := newOrigin(t)
 	h := &forkHub{ticks: make(chan time.Time)}
-	h.workspaceHub = startWorkspaceHubAt(t, origin, "demo", now, func(c *hub.Composition) {
+	h.workspaceHub = startWorkspaceHubExtra(t, origin, "demo", now, extra, func(c *hub.Composition) {
 		h.comp = c
 		c.AdjustForks(func(d *fork.Deps) {
 			d.SweepTicks = func() (<-chan time.Time, func()) { return h.ticks, func() {} }

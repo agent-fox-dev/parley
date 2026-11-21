@@ -3,31 +3,588 @@
   "spec_id": "59",
   "spec_name": "code_index_builds",
   "schema_version": 3,
-  "updated_at": "",
+  "updated_at": "2026-11-21T16:08:03Z",
   "tasks": [
     {
       "id": 1,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-1.1",
+          "tests": [
+            {
+              "test": "./internal/config:TestLoad_ReadsTheCodeIndexBoundsOrTheirDefaults",
+              "failed": {
+                "at": "2026-11-21T06:33:25Z",
+                "tree": "97f663c7ccf61d69dfcf8e254b0fe6aa6bda068b"
+              },
+              "passed": {
+                "at": "2026-11-21T06:36:44Z",
+                "tree": "32675310d8e2c90db02c9322a30c51248aacc86c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.2",
+          "tests": [
+            {
+              "test": "./internal/config:TestLoad_RefusesACodeIndexSectionItCannotUse",
+              "failed": {
+                "at": "2026-11-21T06:33:25Z",
+                "tree": "97f663c7ccf61d69dfcf8e254b0fe6aa6bda068b"
+              },
+              "passed": {
+                "at": "2026-11-21T06:36:44Z",
+                "tree": "32675310d8e2c90db02c9322a30c51248aacc86c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.3",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestCheckPlatform_RefusesAPlatformTheIndexCannotRunOn",
+              "failed": {
+                "at": "2026-11-21T06:33:25Z",
+                "tree": "97f663c7ccf61d69dfcf8e254b0fe6aa6bda068b"
+              },
+              "passed": {
+                "at": "2026-11-21T06:36:44Z",
+                "tree": "32675310d8e2c90db02c9322a30c51248aacc86c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.4",
+          "no_red": "a hub without the section must do nothing, and a hub in which the component does not build yet does nothing either; the test fails once a build runs without [code_index]",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestFeatureOff_BuildsNothingAndUsesNoDisk",
+              "passed": {
+                "at": "2026-11-21T06:36:44Z",
+                "tree": "32675310d8e2c90db02c9322a30c51248aacc86c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.1",
+          "tests": [
+            {
+              "test": "./internal/workspace:TestSettings_ShowsEveryKeyWithItsStoredValueOrItsDefault",
+              "failed": {
+                "at": "2026-11-21T06:33:25Z",
+                "tree": "97f663c7ccf61d69dfcf8e254b0fe6aa6bda068b"
+              },
+              "passed": {
+                "at": "2026-11-21T06:36:44Z",
+                "tree": "32675310d8e2c90db02c9322a30c51248aacc86c"
+              }
+            },
+            {
+              "test": "./internal/workspace:TestSettings_StoresAValueItsKeyAcceptsAndRefusesAnyOther",
+              "failed": {
+                "at": "2026-11-21T06:33:25Z",
+                "tree": "97f663c7ccf61d69dfcf8e254b0fe6aa6bda068b"
+              },
+              "passed": {
+                "at": "2026-11-21T06:36:44Z",
+                "tree": "32675310d8e2c90db02c9322a30c51248aacc86c"
+              }
+            },
+            {
+              "test": "./internal/workspace:TestRead_ShowsAForkTheEffectiveSettingsOfItsParent",
+              "failed": {
+                "at": "2026-11-21T06:33:25Z",
+                "tree": "97f663c7ccf61d69dfcf8e254b0fe6aa6bda068b"
+              },
+              "passed": {
+                "at": "2026-11-21T06:36:44Z",
+                "tree": "32675310d8e2c90db02c9322a30c51248aacc86c"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 2,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-3.1",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestBuild_WritesTheTreeOfTheHeadAndRecordsTheCommit",
+              "failed": {
+                "at": "2026-11-21T06:43:46Z",
+                "tree": "e51c8f79258a4ec32bdfdaf045be12cc08aecd02"
+              },
+              "passed": {
+                "at": "2026-11-21T06:47:08Z",
+                "tree": "a0e299697ac5487322003b3857348457180a17f0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.2",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestBuild_KeepsInTheTreeTheCommitsFilesAndNothingElse",
+              "failed": {
+                "at": "2026-11-21T06:43:46Z",
+                "tree": "e51c8f79258a4ec32bdfdaf045be12cc08aecd02"
+              },
+              "passed": {
+                "at": "2026-11-21T06:47:08Z",
+                "tree": "a0e299697ac5487322003b3857348457180a17f0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.3",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestBuild_KeepsAPartialIndexWhenABoundStopsIt",
+              "failed": {
+                "at": "2026-11-21T06:43:46Z",
+                "tree": "e51c8f79258a4ec32bdfdaf045be12cc08aecd02"
+              },
+              "passed": {
+                "at": "2026-11-21T06:47:08Z",
+                "tree": "a0e299697ac5487322003b3857348457180a17f0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.4",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestBuild_LeavesThePreviousIndexWhenItFailsAndTriesAgain",
+              "failed": {
+                "at": "2026-11-21T06:43:46Z",
+                "tree": "e51c8f79258a4ec32bdfdaf045be12cc08aecd02"
+              },
+              "passed": {
+                "at": "2026-11-21T06:47:08Z",
+                "tree": "a0e299697ac5487322003b3857348457180a17f0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.5",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestBuild_BuildsANewHeadWithoutWaitingForAFailedBuildsRetry",
+              "failed": {
+                "at": "2026-11-21T06:43:46Z",
+                "tree": "e51c8f79258a4ec32bdfdaf045be12cc08aecd02"
+              },
+              "passed": {
+                "at": "2026-11-21T06:47:08Z",
+                "tree": "a0e299697ac5487322003b3857348457180a17f0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.6",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestBuild_RunsAtMostTheConfiguredWorkersAtOnce",
+              "failed": {
+                "at": "2026-11-21T06:43:46Z",
+                "tree": "e51c8f79258a4ec32bdfdaf045be12cc08aecd02"
+              },
+              "passed": {
+                "at": "2026-11-21T06:47:08Z",
+                "tree": "a0e299697ac5487322003b3857348457180a17f0"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 3,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-4.1",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestFollow_BuildsAWorkspaceOnceItHasItsRepository",
+              "failed": {
+                "at": "2026-11-21T07:10:19Z",
+                "tree": "9bab6f3b7e2dfdafd2f9b6c970ef8599f8183cba"
+              },
+              "passed": {
+                "at": "2026-11-21T15:52:23Z",
+                "tree": "2b8fc434e82e93394b60bd185491dcddf5246364"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.2",
+          "tests": [
+            {
+              "test": "./test/e2e:TestCodeIndex_FollowsTheHeadWhateverMovesIt",
+              "failed": {
+                "at": "2026-11-21T07:10:19Z",
+                "tree": "9bab6f3b7e2dfdafd2f9b6c970ef8599f8183cba"
+              },
+              "passed": {
+                "at": "2026-11-21T15:52:23Z",
+                "tree": "2b8fc434e82e93394b60bd185491dcddf5246364"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.3",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestFollow_KeepsOnePendingBuildBesideTheRunningOne",
+              "failed": {
+                "at": "2026-11-21T07:10:19Z",
+                "tree": "9bab6f3b7e2dfdafd2f9b6c970ef8599f8183cba"
+              },
+              "passed": {
+                "at": "2026-11-21T15:52:23Z",
+                "tree": "2b8fc434e82e93394b60bd185491dcddf5246364"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.4",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestFollow_BuildsAtStartWhatMovedWhileTheHubWasDown",
+              "failed": {
+                "at": "2026-11-21T07:10:19Z",
+                "tree": "9bab6f3b7e2dfdafd2f9b6c970ef8599f8183cba"
+              },
+              "passed": {
+                "at": "2026-11-21T15:52:23Z",
+                "tree": "2b8fc434e82e93394b60bd185491dcddf5246364"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.3",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestFollow_BuildsAWorkspaceWhoseSettingIsTurnedOn",
+              "failed": {
+                "at": "2026-11-21T07:10:19Z",
+                "tree": "9bab6f3b7e2dfdafd2f9b6c970ef8599f8183cba"
+              },
+              "passed": {
+                "at": "2026-11-21T15:52:23Z",
+                "tree": "2b8fc434e82e93394b60bd185491dcddf5246364"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.4",
+          "no_red": "a fork must get no build, and a hub that queues no build on any notice yet gives it none; the test fails once a notice of a fork's branch queues one",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestFollow_KeepsNothingOfAFork",
+              "passed": {
+                "at": "2026-11-21T15:52:23Z",
+                "tree": "2b8fc434e82e93394b60bd185491dcddf5246364"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.5",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestMaintenance_QueuesWhatIsBehindAndRemovesWhatIsStray",
+              "failed": {
+                "at": "2026-11-21T07:09:28Z",
+                "tree": "a11e2840513af2fb7d45e13e31e155593d76121d"
+              },
+              "passed": {
+                "at": "2026-11-21T15:52:23Z",
+                "tree": "2b8fc434e82e93394b60bd185491dcddf5246364"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 4,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-5.1",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestKeep_HasTheIndexAfterARestartWithoutBuildingIt",
+              "failed": {
+                "at": "2026-11-21T15:54:23Z",
+                "tree": "6d6d822b146f38bc0ae0e2475afe186e322206f8"
+              },
+              "passed": {
+                "at": "2026-11-21T15:58:56Z",
+                "tree": "cd82f711af45d74bae61dafb709fbd91550ad47c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.2",
+          "no_red": "an archive must change nothing of the index, and nothing the hub does on an archive touches it yet; the test fails once an archive, or the maintenance pass after it, removes the tree or the record",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestKeep_KeepsTheIndexOfAnArchivedWorkspace",
+              "passed": {
+                "at": "2026-11-21T15:58:56Z",
+                "tree": "cd82f711af45d74bae61dafb709fbd91550ad47c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.3",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestKeep_RemovesEverythingOfADeletedWorkspace",
+              "failed": {
+                "at": "2026-11-21T15:54:23Z",
+                "tree": "6d6d822b146f38bc0ae0e2475afe186e322206f8"
+              },
+              "passed": {
+                "at": "2026-11-21T15:58:56Z",
+                "tree": "cd82f711af45d74bae61dafb709fbd91550ad47c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.2",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestKeep_RemovesTheIndexOfAWorkspaceWhoseSettingIsTurnedOff",
+              "failed": {
+                "at": "2026-11-21T15:54:23Z",
+                "tree": "6d6d822b146f38bc0ae0e2475afe186e322206f8"
+              },
+              "passed": {
+                "at": "2026-11-21T15:58:56Z",
+                "tree": "cd82f711af45d74bae61dafb709fbd91550ad47c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.5",
+          "no_red": "the maintenance pass was delivered and seen failing first in task 3, which owns the criterion too",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestMaintenance_QueuesWhatIsBehindAndRemovesWhatIsStray",
+              "passed": {
+                "at": "2026-11-21T15:58:56Z",
+                "tree": "cd82f711af45d74bae61dafb709fbd91550ad47c"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 5,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-6.1",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestStatus_AnswersTheStateOfTheIndex",
+              "failed": {
+                "at": "2026-11-21T16:00:24Z",
+                "tree": "a40c8c312f150646d7dda12b0d081d625a38742e"
+              },
+              "passed": {
+                "at": "2026-11-21T16:03:55Z",
+                "tree": "95ce653ede2eb7f9762bd764d7b244269debed8e"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.2",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestStatus_AnswersOffWhereNoIndexIsKept",
+              "failed": {
+                "at": "2026-11-21T16:00:24Z",
+                "tree": "a40c8c312f150646d7dda12b0d081d625a38742e"
+              },
+              "passed": {
+                "at": "2026-11-21T16:03:55Z",
+                "tree": "95ce653ede2eb7f9762bd764d7b244269debed8e"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.3",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestStatus_AnswersForTheParentOfAFork",
+              "failed": {
+                "at": "2026-11-21T16:00:24Z",
+                "tree": "a40c8c312f150646d7dda12b0d081d625a38742e"
+              },
+              "passed": {
+                "at": "2026-11-21T16:03:55Z",
+                "tree": "95ce653ede2eb7f9762bd764d7b244269debed8e"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.4",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestStatus_ShowsAFailureScrubbedAndCut",
+              "failed": {
+                "at": "2026-11-21T16:00:24Z",
+                "tree": "a40c8c312f150646d7dda12b0d081d625a38742e"
+              },
+              "passed": {
+                "at": "2026-11-21T16:03:55Z",
+                "tree": "95ce653ede2eb7f9762bd764d7b244269debed8e"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.5",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestStatus_AppliesTheAccessRuleOfTheSourceControlReads",
+              "failed": {
+                "at": "2026-11-21T16:00:24Z",
+                "tree": "a40c8c312f150646d7dda12b0d081d625a38742e"
+              },
+              "passed": {
+                "at": "2026-11-21T16:03:55Z",
+                "tree": "95ce653ede2eb7f9762bd764d7b244269debed8e"
+              }
+            },
+            {
+              "test": "./internal/metrics:TestNew_ExportsEveryCatalogueMetricAtZero",
+              "failed": {
+                "at": "2026-11-21T16:00:24Z",
+                "tree": "a40c8c312f150646d7dda12b0d081d625a38742e"
+              },
+              "passed": {
+                "at": "2026-11-21T16:03:55Z",
+                "tree": "95ce653ede2eb7f9762bd764d7b244269debed8e"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.6",
+          "tests": [
+            {
+              "test": "./internal/cli:TestSCM_ReadsSendOneGetAndPrintTheAnswer",
+              "failed": {
+                "at": "2026-11-21T16:00:24Z",
+                "tree": "a40c8c312f150646d7dda12b0d081d625a38742e"
+              },
+              "passed": {
+                "at": "2026-11-21T16:03:55Z",
+                "tree": "95ce653ede2eb7f9762bd764d7b244269debed8e"
+              }
+            },
+            {
+              "test": "./internal/cli:TestMCPList_ServesTheStateOfTheCodeIndexAsAReadingTool",
+              "failed": {
+                "at": "2026-11-21T16:00:24Z",
+                "tree": "a40c8c312f150646d7dda12b0d081d625a38742e"
+              },
+              "passed": {
+                "at": "2026-11-21T16:03:55Z",
+                "tree": "95ce653ede2eb7f9762bd764d7b244269debed8e"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.7",
+          "no_red": "the builds are counted since task 2 and the bytes measured since task 4, whose tests failed first; this test asserts the three metrics together and fails once one of them is not reported",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestMetrics_CountsTheBuildsAndMeasuresTheDisk",
+              "passed": {
+                "at": "2026-11-21T16:03:55Z",
+                "tree": "95ce653ede2eb7f9762bd764d7b244269debed8e"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 6,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "PATH-1",
+          "tests": [
+            {
+              "test": "./test/e2e:TestCodeIndex_FollowsALandSurvivesARestartAndGoesWithItsSetting",
+              "passed": {
+                "at": "2026-11-21T16:07:59Z",
+                "tree": "bc210c9666f7e48d786e1b1d2a82bb92a61a6a23"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "PATH-2",
+          "tests": [
+            {
+              "test": "./test/e2e:TestCodeIndex_FollowsALandSurvivesARestartAndGoesWithItsSetting",
+              "passed": {
+                "at": "2026-11-21T16:07:59Z",
+                "tree": "bc210c9666f7e48d786e1b1d2a82bb92a61a6a23"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "PATH-3",
+          "tests": [
+            {
+              "test": "./test/e2e:TestCodeIndex_GivesAnOversizedRepositoryAPartialIndex",
+              "passed": {
+                "at": "2026-11-21T16:07:59Z",
+                "tree": "bc210c9666f7e48d786e1b1d2a82bb92a61a6a23"
+              }
+            }
+          ]
+        }
+      ]
     }
   ]
 }

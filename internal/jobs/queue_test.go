@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -521,5 +522,122 @@ func TestHasWork_FindsOnlyWhatAPassWouldDo(t *testing.T) {
 				t.Errorf("hasWork = %v, %v; want %v", got, err, tc.want)
 			}
 		})
+	}
+}
+
+func TestPass_RunsNoMoreJobsOfATypeThanItsLimit(t *testing.T) {
+	t.Parallel()
+	q := newTestQueue(t)
+	h, other := newScriptedHandler(true), newScriptedHandler(true)
+	q.Register("probe", h)
+	q.Register("other", other)
+	q.Limit("probe", 2)
+	var ids []string
+	for i := 1; i <= 3; i++ {
+		ids = append(ids, q.enqueue(t, "probe", fmt.Sprintf("w%d", i), json.RawMessage(`{}`)).ID)
+		q.clock.Advance(time.Second)
+	}
+	unlimited := q.enqueue(t, "other", "w1", json.RawMessage(`{}`))
+
+	q.pass(t)
+	h.Enter(t)
+	h.Enter(t)
+	other.Enter(t)
+	q.pass(t)
+	h.Idle(t)
+	if got := q.get(t, ids[2]); got.Status != StatusQueued || got.RetryCount != 0 {
+		t.Errorf("the third job of the limited type = %s with retry count %d while two run, want queued and 0", got.Status, got.RetryCount)
+	}
+	if got := q.status(t, unlimited.ID); got != StatusRunning {
+		t.Errorf("the job of another type = %q, want running: the limit is its type's alone", got)
+	}
+
+	q.finish(t, h, ids[0], nil)
+	q.pass(t)
+	if got := h.Enter(t); got.ID != ids[2] || got.RetryCount != 0 {
+		t.Errorf("after one ended, the queue claimed %s with retry count %d, want the third job %s and 0", got.ID, got.RetryCount, ids[2])
+	}
+	if got := h.MaxActive(); got != 2 {
+		t.Errorf("most attempts of the limited type running at once = %d, want 2", got)
+	}
+}
+
+func TestHasten_MakesAFailedJobDueAtOnce(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	q := newTestQueue(t)
+	h := newScriptedHandler(true)
+	q.Register("probe", h)
+	j := q.enqueue(t, "probe", "w", json.RawMessage(`{}`))
+	hasten := func(slug string) (hastened bool) {
+		t.Helper()
+		if err := q.st.Tx(ctx, func(tx *sql.Tx) (err error) {
+			hastened, err = q.Hasten(ctx, tx, "probe", slug)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return hastened
+	}
+	if hasten("w") {
+		t.Error("Hasten of a queued job = true, want false: it waits for nothing")
+	}
+	q.pass(t)
+	h.Enter(t)
+	q.finish(t, h, j.ID, errors.New("upstream unreachable"))
+	if hasten("another") {
+		t.Error("Hasten of a workspace without a job = true, want false")
+	}
+
+	if !hasten("w") {
+		t.Fatal("Hasten of the failed job = false, want true")
+	}
+	if got := q.get(t, j.ID); got.Status != StatusQueued || got.NextAttemptAt != nil || got.RetryCount != 1 {
+		t.Errorf("the hastened job = %+v, want queued, no next attempt and its retry count 1", got)
+	}
+	// The clock has not moved: the attempt runs before its delay is over.
+	q.pass(t)
+	if got := h.Enter(t); got.ID != j.ID {
+		t.Errorf("the queue claimed %s, want the hastened job %s", got.ID, j.ID)
+	}
+}
+
+func TestCancelPending_CancelsTheWaitingJobsOfATypeAndWorkspaceAndInterruptEndsTheRunningOne(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	q := newTestQueue(t)
+	h := newScriptedHandler(true)
+	q.Register("probe", h)
+	running := q.enqueue(t, "probe", "w", json.RawMessage(`{}`))
+	other := q.enqueue(t, "probe", "other", json.RawMessage(`{}`))
+	q.pass(t)
+	h.Enter(t)
+	h.Enter(t)
+	var follow Job
+	if err := q.st.Tx(ctx, func(tx *sql.Tx) (err error) {
+		follow, err = q.EnqueueFollowUp(ctx, tx, "probe", "w", running.ID, json.RawMessage(`{}`))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var cancelled int
+	if err := q.st.Tx(ctx, func(tx *sql.Tx) (err error) {
+		cancelled, err = q.CancelPending(ctx, tx, "probe", "w")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	q.Interrupt("probe", "w")
+	if got := q.status(t, follow.ID); cancelled != 1 || got != StatusCancelled {
+		t.Errorf("CancelPending cancelled %d jobs and the waiting one is %q, want 1 and cancelled", cancelled, got)
+	}
+	// The running attempt saw its context end and returned its error.
+	waitClosed(t, q.doneOf(running.ID), "the interrupted attempt")
+	if got := q.get(t, running.ID); got.Status != StatusFailed || got.Error == nil || !strings.Contains(*got.Error, "context canceled") {
+		t.Errorf("the interrupted job = %+v, want failed with the end of its context", got)
+	}
+	if got := q.status(t, other.ID); got != StatusRunning {
+		t.Errorf("the job of another workspace = %q, want running", got)
 	}
 }

@@ -75,3 +75,60 @@ func (q *Queue) Requeue(ctx context.Context, tx *sql.Tx, id string) (Job, error)
 	q.poke()
 	return j, nil
 }
+
+// Hasten makes the failed job of typ and the workspace slug due at once, in
+// tx: it is queued again with its retry count and error, as a pass does
+// when its next attempt is due, and the dispatcher is woken for it. It
+// reports whether there was such a job. It is for a job whose reason to
+// wait has gone: what it failed on has changed.
+func (q *Queue) Hasten(ctx context.Context, tx *sql.Tx, typ, slug string) (bool, error) {
+	d, err := q.deps()
+	if err != nil {
+		return false, err
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE jobs SET status = ?, next_attempt_at = NULL, updated_at = ?
+WHERE type = ? AND workspace_slug = ? AND status = ?`, StatusQueued, d.Clock.Now().UTC().UnixNano(), typ, slug, StatusFailed)
+	if err != nil {
+		return false, fmt.Errorf("hasten the %s job of %s: %w", typ, slug, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil || n == 0 {
+		return false, err
+	}
+	q.poke()
+	return true, nil
+}
+
+// CancelPending cancels, in tx, the jobs of typ and the workspace slug that
+// wait: the queued ones and the failed ones waiting for their next attempt.
+// It returns how many there were. A running job is not touched; Interrupt
+// ends its attempt. It is for a type whose jobs have lost their purpose for
+// one workspace, which stays.
+func (q *Queue) CancelPending(ctx context.Context, tx *sql.Tx, typ, slug string) (int, error) {
+	d, err := q.deps()
+	if err != nil {
+		return 0, err
+	}
+	now := d.Clock.Now().UTC().UnixNano()
+	res, err := tx.ExecContext(ctx, `UPDATE jobs SET status = ?, next_attempt_at = NULL, completed_at = ?, updated_at = ?
+WHERE type = ? AND workspace_slug = ? AND status IN (?, ?)`, StatusCancelled, now, now, typ, slug, StatusQueued, StatusFailed)
+	if err != nil {
+		return 0, fmt.Errorf("cancel the pending %s jobs of %s: %w", typ, slug, err)
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
+}
+
+// Interrupt ends the running attempts of the jobs of typ and the workspace
+// slug by cancelling their contexts. Each attempt is settled as what its
+// handler then returns: an error is a retryable failure like any other, so
+// a handler that is interrupted on purpose returns nil.
+func (q *Queue) Interrupt(typ, slug string) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for _, w := range q.running {
+		if w.typ == typ && w.slug == slug {
+			w.cancel()
+		}
+	}
+}
