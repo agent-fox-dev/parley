@@ -3,7 +3,7 @@
   "spec_id": "60",
   "spec_name": "code_search_and_symbols",
   "schema_version": 3,
-  "updated_at": "2026-11-21T17:17:29Z",
+  "updated_at": "2026-11-21T17:21:59Z",
   "tasks": [
     {
       "id": 1,
@@ -506,7 +506,33 @@
     },
     {
       "id": 6,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "PATH-1",
+          "tests": [
+            {
+              "test": "./test/e2e:TestCodeIndex_AnAgentOrientsItselfWithoutAClone",
+              "passed": {
+                "at": "2026-11-21T17:21:56Z",
+                "tree": "4af983ca7f8c22c5aab91f7373a8ed73a2761253"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "PATH-2",
+          "tests": [
+            {
+              "test": "./test/e2e:TestCodeIndex_ASearchRightAfterALandFindsWhatLanded",
+              "passed": {
+                "at": "2026-11-21T17:21:56Z",
+                "tree": "4af983ca7f8c22c5aab91f7373a8ed73a2761253"
+              }
+            }
+          ]
+        }
+      ]
     }
   ]
 }

@@ -18,6 +18,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
+	"github.com/agent-fox-dev/parley/internal/identity"
 )
 
 // codeIndexOn is the configuration of a hub that keeps code indexes.
@@ -289,4 +290,156 @@ func TestCodeIndex_GivesAnOversizedRepositoryAPartialIndex(t *testing.T) {
 	if n := codeIndexBuilds(t, h.Hub); n["partial"] != 1 || n["ok"] != 0 || n["failed"] != 0 {
 		t.Errorf("builds by outcome = %v, want one partial", n)
 	}
+}
+
+// printed decodes what a command printed into v; the command must have
+// exited 0.
+func printed(t *testing.T, r ran, what string, v any) {
+	t.Helper()
+	if err := json.Unmarshal([]byte(r.stdout), v); r.code != 0 || err != nil {
+		t.Fatalf("%s exited %d and printed %q (stderr %s), want 0 and one JSON document", what, r.code, r.stdout, r.stderr)
+	}
+}
+
+// codeSearchPrinted is what parley scm code-search prints.
+type codeSearchPrinted struct {
+	Workspace  string `json:"workspace"`
+	IndexedSHA string `json:"indexed_sha"`
+	Partial    bool   `json:"partial"`
+	Files      []struct {
+		Path string `json:"path"`
+	} `json:"files"`
+}
+
+// holds reports whether the answer's files hold path.
+func (p codeSearchPrinted) holds(path string) bool {
+	for _, f := range p.Files {
+		if f.Path == path {
+			return true
+		}
+	}
+	return false
+}
+
+// An agent finds its way around demo without a clone: a ranked search, a
+// symbol, the outline of the file it names, and a search of its new fork,
+// which answers from demo's index.
+func TestCodeIndex_AnAgentOrientsItselfWithoutAClone(t *testing.T) {
+	parallel(t)
+	h := startForkHubExtra(t, nil, hubExtra{TOML: codeIndexOn}, nil)
+	const router = "package api\n\n// Handler serves a route.\ntype Handler func()\n\nfunc NewRouter() *Router { return &Router{} }\n\ntype Router struct{}\n"
+	put := func(path, content string) map[string]any {
+		return map[string]any{"op": "put", "path": path, "content_base64": base64.StdEncoding.EncodeToString([]byte(content))}
+	}
+	head := refHead(t, h.workspaceHub, "demo", "main", h.key)
+	a := scmWrite(t, h.workspaceHub, http.MethodPost, "/api/v1/workspaces/demo/scm/commits", h.key, map[string]any{
+		"branch": "main", "expected_head_sha": head, "message": "api",
+		"operations": []map[string]any{put("internal/api/router.go", router), put("greet.go", "package main\n\nfunc greet() string { return \"hello\" }\n")}})
+	if a.status != http.StatusCreated {
+		t.Fatalf("POST scm/commits = %d %s, want 201", a.status, a.body)
+	}
+	head = refHead(t, h.workspaceHub, "demo", "main", h.key)
+	agent := h.IssuePAT(t, identity.PATSpec{UserID: h.user, Permissions: []string{"git:read"}, CreatedAt: time.Now()})
+
+	var found codeSearchPrinted
+	printed(t, h.runAs(t, agent, "scm", "code-search", "demo", "sym:Handler lang:go"), "scm code-search", &found)
+	if found.Workspace != "demo" || found.IndexedSHA != head || !found.holds("internal/api/router.go") {
+		t.Errorf("scm code-search demo 'sym:Handler lang:go' printed %+v, want workspace demo, indexed_sha %s and internal/api/router.go", found, head)
+	}
+
+	var syms struct {
+		Symbols []struct {
+			Path      string `json:"path"`
+			Kind      string `json:"kind"`
+			Name      string `json:"name"`
+			StartLine int    `json:"start_line"`
+		} `json:"symbols"`
+	}
+	printed(t, h.runAs(t, agent, "scm", "symbols", "demo", "NewRouter"), "scm symbols", &syms)
+	if len(syms.Symbols) != 1 || syms.Symbols[0].Path != "internal/api/router.go" || syms.Symbols[0].Kind != "func" || syms.Symbols[0].Name != "NewRouter" || syms.Symbols[0].StartLine != 6 {
+		t.Fatalf("scm symbols demo NewRouter printed %+v, want the func NewRouter of internal/api/router.go on line 6", syms.Symbols)
+	}
+
+	var outline struct {
+		Declarations []struct {
+			Name      string `json:"name"`
+			StartLine int    `json:"start_line"`
+		} `json:"declarations"`
+	}
+	printed(t, h.runAs(t, agent, "scm", "outline", "demo", syms.Symbols[0].Path), "scm outline", &outline)
+	line := 0
+	for _, d := range outline.Declarations {
+		if d.Name == "NewRouter" {
+			line = d.StartLine
+		}
+	}
+	if line != syms.Symbols[0].StartLine {
+		t.Errorf("scm outline has NewRouter on line %d, want the line the symbol lookup named, %d", line, syms.Symbols[0].StartLine)
+	}
+
+	if status, body := h.Call(t, http.MethodPost, "/api/v1/workspaces/demo/forks", h.key, map[string]any{"name": "greeting", "auto_change": false}); status != http.StatusCreated {
+		t.Fatalf("create demo--greeting = %d %s, want 201", status, body)
+	}
+	var inFork codeSearchPrinted
+	printed(t, h.runAs(t, agent, "scm", "code-search", "demo--greeting", "greet"), "scm code-search of the fork", &inFork)
+	if inFork.Workspace != "demo" || inFork.IndexedSHA != head || !inFork.holds("greet.go") {
+		t.Errorf("scm code-search demo--greeting greet printed %+v, want demo's answer: workspace demo, indexed_sha %s and greet.go", inFork, head)
+	}
+}
+
+// waitedReady is how many queries the hub has answered once the index was
+// ready.
+func waitedReady(t *testing.T, h *hubtest.Hub) float64 {
+	t.Helper()
+	resp, err := http.Get(h.URL("/metrics"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	_, samples := parseExposition(t, resp.Body)
+	return samples[`parley_code_index_wait_seconds_count{outcome="ready"}`]
+}
+
+// A change lands, and a search sent at once waits for the build of the
+// landed commit and finds what landed; a repository over the index's bound
+// is searched from its partial index, which says so.
+func TestCodeIndex_ASearchRightAfterALandFindsWhatLanded(t *testing.T) {
+	parallel(t)
+	h := startLifecycleHubExtra(t, hubExtra{TOML: codeIndexOn})
+	agent := cloneAs(t, h.forkHub, h.agent, "demo--t1")
+	agent("checkout", "--quiet", "-b", "feat")
+	commitFile(t, agent, "landed.go", "package landed\n\nfunc landedHere() {}\n", "Add landed.go")
+	agent("push", "--quiet", "origin", "feat")
+	n := h.open(t, h.agent, "demo--t1", "feat", map[string]any{"intent": "why"})
+	before := waitedReady(t, h.Hub)
+	if code, body := h.land(t, h.key, n, "?wait=30"); code != http.StatusOK || body["status"] != "landed" {
+		t.Fatalf("land the change = %d %v, want it landed", code, body)
+	}
+
+	// At once: the build of the landed commit has not ended, or not begun.
+	var found codeSearchPrinted
+	printed(t, h.runAs(t, h.key, "scm", "code-search", "demo", "landedHere"), "scm code-search", &found)
+	landed := gitrepotest.Refs(t, h.repo("demo"), "refs/heads/")["main"]
+	if found.IndexedSHA != landed || !found.holds("landed.go") {
+		t.Errorf("scm code-search demo landedHere printed %+v, want landed.go from the index of the landed commit %s", found, landed)
+	}
+	if after := waitedReady(t, h.Hub); after != before+1 {
+		t.Errorf("parley_code_index_wait_seconds counts %v ready requests after %v before, want one more", after, before)
+	}
+
+	t.Run("a repository over max_files", func(t *testing.T) {
+		origin := gitrepotest.SmartOrigin(t, gitrepotest.WithBasicAuth("x-token-auth", syncToken))
+		files := map[string]string{}
+		for i := range 10 {
+			files[fmt.Sprintf("f%d.go", i)] = fmt.Sprintf("package big\n\n// needle\nfunc F%d() {}\n", i)
+		}
+		origin.Branch("main", gitrepotest.Commit(t, origin.Dir(), "ten files", files))
+		big := startWorkspaceHubExtra(t, origin, "big", nil, hubExtra{TOML: "[code_index]\nmax_files = 3\n"})
+		big.createReady(t, "big", origin.URL())
+		var partial codeSearchPrinted
+		printed(t, big.run(t, "scm", "code-search", "big", "needle"), "scm code-search", &partial)
+		if !partial.Partial || len(partial.Files) == 0 || len(partial.Files) > 3 {
+			t.Errorf("scm code-search big needle printed %+v, want partial true with the files the index holds, at most 3", partial)
+		}
+	})
 }
