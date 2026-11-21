@@ -3,11 +3,125 @@
   "spec_id": "60",
   "spec_name": "code_search_and_symbols",
   "schema_version": 3,
-  "updated_at": "",
+  "updated_at": "2026-11-21T16:43:23Z",
   "tasks": [
     {
       "id": 1,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-1.1",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestSearch_AnswersTheFilesThatMatchBestFirstWithTheirLines",
+              "failed": {
+                "at": "2026-11-21T16:35:21Z",
+                "tree": "5b7736932e524e2e7cef116329005bc66c81d516"
+              },
+              "passed": {
+                "at": "2026-11-21T16:43:21Z",
+                "tree": "8f96f5f4fbe77afc93640033bca0747d90b5d5a3"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.2",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestSearch_BoundsTheFilesTheMatchesAndTheirText",
+              "failed": {
+                "at": "2026-11-21T16:35:21Z",
+                "tree": "5b7736932e524e2e7cef116329005bc66c81d516"
+              },
+              "passed": {
+                "at": "2026-11-21T16:43:21Z",
+                "tree": "8f96f5f4fbe77afc93640033bca0747d90b5d5a3"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.3",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestSearch_RefusesAQueryOrALimitItDoesNotTake",
+              "failed": {
+                "at": "2026-11-21T16:35:21Z",
+                "tree": "5b7736932e524e2e7cef116329005bc66c81d516"
+              },
+              "passed": {
+                "at": "2026-11-21T16:43:21Z",
+                "tree": "8f96f5f4fbe77afc93640033bca0747d90b5d5a3"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.4",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestSearch_RefusesAQueryTheIndexCannotParseWithItsParsersMessage",
+              "failed": {
+                "at": "2026-11-21T16:35:21Z",
+                "tree": "5b7736932e524e2e7cef116329005bc66c81d516"
+              },
+              "passed": {
+                "at": "2026-11-21T16:43:21Z",
+                "tree": "8f96f5f4fbe77afc93640033bca0747d90b5d5a3"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.5",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestSearch_AnswersATimeoutWhenTheIndexDoesNotFinish",
+              "failed": {
+                "at": "2026-11-21T16:35:21Z",
+                "tree": "5b7736932e524e2e7cef116329005bc66c81d516"
+              },
+              "passed": {
+                "at": "2026-11-21T16:43:21Z",
+                "tree": "8f96f5f4fbe77afc93640033bca0747d90b5d5a3"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.6",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestSearch_AnswersFromAPartialIndexAndSaysSo",
+              "failed": {
+                "at": "2026-11-21T16:35:21Z",
+                "tree": "5b7736932e524e2e7cef116329005bc66c81d516"
+              },
+              "passed": {
+                "at": "2026-11-21T16:43:21Z",
+                "tree": "8f96f5f4fbe77afc93640033bca0747d90b5d5a3"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.2",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestSearch_IsRefusedOnAHubThatKeepsNoCodeIndex",
+              "failed": {
+                "at": "2026-11-21T16:35:21Z",
+                "tree": "5b7736932e524e2e7cef116329005bc66c81d516"
+              },
+              "passed": {
+                "at": "2026-11-21T16:43:21Z",
+                "tree": "8f96f5f4fbe77afc93640033bca0747d90b5d5a3"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 2,

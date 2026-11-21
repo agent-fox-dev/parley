@@ -483,8 +483,19 @@ func (c *Component) Files(ctx context.Context, slug, query string) ([]string, er
 	if err != nil {
 		return nil, err
 	}
-	return idx.Files(ctx, query)
+	res, err := idx.Search(ctx, query, maxSearchFiles)
+	if err != nil {
+		return nil, err
+	}
+	paths := []string{}
+	for _, f := range res.Files {
+		paths = append(paths, f.Path)
+	}
+	return paths, nil
 }
+
+// maxSearchFiles is the most files the index answers a search with.
+const maxSearchFiles = 25
 
 // ErrNoIndex is the error of a use of the index of a workspace that has
 // none.

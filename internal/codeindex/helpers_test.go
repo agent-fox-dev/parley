@@ -337,6 +337,10 @@ type seam struct {
 	// every index was made with.
 	began, ended chan string
 	opened       []codeindex.Bounds
+	// searchErr, when not nil, is what every search of an index answers;
+	// searches counts the searches that reached an index.
+	searchErr error
+	searches  int
 }
 
 func newSeam() *seam {
@@ -449,6 +453,17 @@ func (i seamIndex) Build(ctx context.Context) error {
 		}
 	}
 	return i.Index.Build(ctx)
+}
+
+func (i seamIndex) Search(ctx context.Context, query string, maxFiles int) (codeindex.SearchResult, error) {
+	i.seam.mu.Lock()
+	i.seam.searches++
+	err := i.seam.searchErr
+	i.seam.mu.Unlock()
+	if err != nil {
+		return codeindex.SearchResult{}, err
+	}
+	return i.Index.Search(ctx, query, maxFiles)
 }
 
 func (i seamIndex) State(ctx context.Context) (int, bool, error) {

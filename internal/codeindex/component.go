@@ -59,6 +59,9 @@ type Deps struct {
 	// Scrub removes what the hub keeps secret from a failure's text and
 	// bounds its length; nil keeps the text.
 	Scrub func(text string) string
+	// ReadTimeout is how long a search or a symbol lookup may take, the
+	// read timeout of the source control reads; zero or less is 30 s.
+	ReadTimeout time.Duration
 	// Now is the clock; nil is time.Now.
 	Now func() time.Time
 }
@@ -93,6 +96,9 @@ func (c *Component) Bind(d Deps) {
 	}
 	if d.Now == nil {
 		d.Now = time.Now
+	}
+	if d.ReadTimeout <= 0 {
+		d.ReadTimeout = 30 * time.Second
 	}
 	c.deps = d
 }

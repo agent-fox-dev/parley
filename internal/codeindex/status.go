@@ -51,15 +51,20 @@ type Status struct {
 	Error *string `json:"error"`
 }
 
-// Routes are the component's routes: the status of a workspace's index, a
-// read of the source control API by its scope, its access rule and the
-// metric its requests are counted in.
+// Routes are the component's routes: the status of a workspace's index, the
+// code search and the symbol lookup over it, each a read of the source
+// control API by its scope, its access rule and the metric its requests are
+// counted in.
 func (c *Component) Routes() []server.Route {
-	return []server.Route{{
-		Method: http.MethodGet, Pattern: "/workspaces/:slug/scm/code-index", Scope: scopeRead,
-		Marks:   map[string]string{access.MarkNeed: string(access.NeedRead)},
-		Handler: c.getStatus,
-	}}
+	read := func(pattern string, h server.HandlerFunc) server.Route {
+		return server.Route{Method: http.MethodGet, Pattern: "/workspaces/:slug/scm" + pattern, Scope: scopeRead,
+			Marks: map[string]string{access.MarkNeed: string(access.NeedRead)}, Handler: h}
+	}
+	return []server.Route{
+		read("/code-index", c.getStatus),
+		read("/code-search", c.query(opSearch, c.getSearch)),
+		read("/symbols", c.query(opSymbols, c.getSymbols)),
+	}
 }
 
 // getStatus answers GET …/scm/code-index. A fork has no index of its own:
