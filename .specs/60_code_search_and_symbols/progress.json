@@ -3,31 +3,536 @@
   "spec_id": "60",
   "spec_name": "code_search_and_symbols",
   "schema_version": 3,
-  "updated_at": "",
+  "updated_at": "2026-11-21T17:21:59Z",
   "tasks": [
     {
       "id": 1,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-1.1",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestSearch_AnswersTheFilesThatMatchBestFirstWithTheirLines",
+              "failed": {
+                "at": "2026-11-21T16:35:21Z",
+                "tree": "5b7736932e524e2e7cef116329005bc66c81d516"
+              },
+              "passed": {
+                "at": "2026-11-21T16:43:21Z",
+                "tree": "8f96f5f4fbe77afc93640033bca0747d90b5d5a3"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.2",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestSearch_BoundsTheFilesTheMatchesAndTheirText",
+              "failed": {
+                "at": "2026-11-21T16:35:21Z",
+                "tree": "5b7736932e524e2e7cef116329005bc66c81d516"
+              },
+              "passed": {
+                "at": "2026-11-21T16:43:21Z",
+                "tree": "8f96f5f4fbe77afc93640033bca0747d90b5d5a3"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.3",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestSearch_RefusesAQueryOrALimitItDoesNotTake",
+              "failed": {
+                "at": "2026-11-21T16:35:21Z",
+                "tree": "5b7736932e524e2e7cef116329005bc66c81d516"
+              },
+              "passed": {
+                "at": "2026-11-21T16:43:21Z",
+                "tree": "8f96f5f4fbe77afc93640033bca0747d90b5d5a3"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.4",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestSearch_RefusesAQueryTheIndexCannotParseWithItsParsersMessage",
+              "failed": {
+                "at": "2026-11-21T16:35:21Z",
+                "tree": "5b7736932e524e2e7cef116329005bc66c81d516"
+              },
+              "passed": {
+                "at": "2026-11-21T16:43:21Z",
+                "tree": "8f96f5f4fbe77afc93640033bca0747d90b5d5a3"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.5",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestSearch_AnswersATimeoutWhenTheIndexDoesNotFinish",
+              "failed": {
+                "at": "2026-11-21T16:35:21Z",
+                "tree": "5b7736932e524e2e7cef116329005bc66c81d516"
+              },
+              "passed": {
+                "at": "2026-11-21T16:43:21Z",
+                "tree": "8f96f5f4fbe77afc93640033bca0747d90b5d5a3"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.6",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestSearch_AnswersFromAPartialIndexAndSaysSo",
+              "failed": {
+                "at": "2026-11-21T16:35:21Z",
+                "tree": "5b7736932e524e2e7cef116329005bc66c81d516"
+              },
+              "passed": {
+                "at": "2026-11-21T16:43:21Z",
+                "tree": "8f96f5f4fbe77afc93640033bca0747d90b5d5a3"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.2",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestSearch_IsRefusedOnAHubThatKeepsNoCodeIndex",
+              "failed": {
+                "at": "2026-11-21T16:35:21Z",
+                "tree": "5b7736932e524e2e7cef116329005bc66c81d516"
+              },
+              "passed": {
+                "at": "2026-11-21T16:43:21Z",
+                "tree": "8f96f5f4fbe77afc93640033bca0747d90b5d5a3"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 2,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-2.1",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestSymbols_FindsTheDeclarationsWhoseNameStartsWithTheGivenOne",
+              "failed": {
+                "at": "2026-11-21T16:44:46Z",
+                "tree": "8d176cb1de7c4d5e11e80a41889455d70206052d"
+              },
+              "passed": {
+                "at": "2026-11-21T16:48:34Z",
+                "tree": "b02c1e451beae9f90d370267166888cb0546d6b9"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.2",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestSymbols_NarrowsTheLookupByExactKindPathAndLimit",
+              "failed": {
+                "at": "2026-11-21T16:44:46Z",
+                "tree": "8d176cb1de7c4d5e11e80a41889455d70206052d"
+              },
+              "passed": {
+                "at": "2026-11-21T16:48:34Z",
+                "tree": "b02c1e451beae9f90d370267166888cb0546d6b9"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.3",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestSymbols_RefusesAParameterItDoesNotTake",
+              "failed": {
+                "at": "2026-11-21T16:44:46Z",
+                "tree": "8d176cb1de7c4d5e11e80a41889455d70206052d"
+              },
+              "passed": {
+                "at": "2026-11-21T16:48:34Z",
+                "tree": "b02c1e451beae9f90d370267166888cb0546d6b9"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.4",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestSymbols_AreRefusedByAPartialIndexWhichCodeSearchAnswers",
+              "failed": {
+                "at": "2026-11-21T16:44:46Z",
+                "tree": "8d176cb1de7c4d5e11e80a41889455d70206052d"
+              },
+              "passed": {
+                "at": "2026-11-21T16:48:34Z",
+                "tree": "b02c1e451beae9f90d370267166888cb0546d6b9"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.5",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestSymbols_RefuseANameThatTooManyDeclarationsMatch",
+              "failed": {
+                "at": "2026-11-21T16:44:46Z",
+                "tree": "8d176cb1de7c4d5e11e80a41889455d70206052d"
+              },
+              "passed": {
+                "at": "2026-11-21T16:48:34Z",
+                "tree": "b02c1e451beae9f90d370267166888cb0546d6b9"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.3",
+          "no_red": "the checks the two routes share were delivered in task 1, whose tests failed first; this test asserts the setting's refusal on both routes and for a fork, and fails once either route answers with the setting off",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestQuery_IsRefusedWhileTheWorkspacesSettingIsOff",
+              "passed": {
+                "at": "2026-11-21T16:48:34Z",
+                "tree": "b02c1e451beae9f90d370267166888cb0546d6b9"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.4",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestQuery_AppliesTheAccessRuleOfTheSourceControlReads",
+              "failed": {
+                "at": "2026-11-21T16:44:46Z",
+                "tree": "8d176cb1de7c4d5e11e80a41889455d70206052d"
+              },
+              "passed": {
+                "at": "2026-11-21T16:48:34Z",
+                "tree": "b02c1e451beae9f90d370267166888cb0546d6b9"
+              }
+            },
+            {
+              "test": "./internal/metrics:TestNew_ExportsEveryCatalogueMetricAtZero",
+              "failed": {
+                "at": "2026-11-21T16:44:46Z",
+                "tree": "8d176cb1de7c4d5e11e80a41889455d70206052d"
+              },
+              "passed": {
+                "at": "2026-11-21T16:48:34Z",
+                "tree": "b02c1e451beae9f90d370267166888cb0546d6b9"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.5",
+          "no_red": "the head check of the two routes was delivered in task 1; this test compares both routes with the tree route for a repository without a commit and fails once they differ",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestQuery_AnswersAWorkspaceWithoutAHeadAsTheTreeRouteDoes",
+              "passed": {
+                "at": "2026-11-21T16:48:34Z",
+                "tree": "b02c1e451beae9f90d370267166888cb0546d6b9"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 3,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-3.1",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestWait_AnswersOnceTheIndexHoldsTheHeadTheRequestArrivedAt",
+              "failed": {
+                "at": "2026-11-21T16:50:14Z",
+                "tree": "5765a0aa9c672df0cc765d34cbfe6368c0ff32c9"
+              },
+              "passed": {
+                "at": "2026-11-21T16:59:14Z",
+                "tree": "a91973ad1e68c5ee595aa5e1e95453bf668cb3b4"
+              }
+            },
+            {
+              "test": "./internal/codeindex:TestWait_AnswersFromALaterHeadThanTheOneTheRequestArrivedAt",
+              "failed": {
+                "at": "2026-11-21T16:50:14Z",
+                "tree": "5765a0aa9c672df0cc765d34cbfe6368c0ff32c9"
+              },
+              "passed": {
+                "at": "2026-11-21T16:59:14Z",
+                "tree": "a91973ad1e68c5ee595aa5e1e95453bf668cb3b4"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.2",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestWait_NeverAnswersFromACommitOlderThanTheHeadAtArrival",
+              "failed": {
+                "at": "2026-11-21T16:50:14Z",
+                "tree": "5765a0aa9c672df0cc765d34cbfe6368c0ff32c9"
+              },
+              "passed": {
+                "at": "2026-11-21T16:59:14Z",
+                "tree": "a91973ad1e68c5ee595aa5e1e95453bf668cb3b4"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.3",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestWait_QueuesTheBuildNoOneElseDid",
+              "failed": {
+                "at": "2026-11-21T16:50:14Z",
+                "tree": "5765a0aa9c672df0cc765d34cbfe6368c0ff32c9"
+              },
+              "passed": {
+                "at": "2026-11-21T16:59:14Z",
+                "tree": "a91973ad1e68c5ee595aa5e1e95453bf668cb3b4"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.4",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestWait_GivesUpAtTheReadTimeoutAndSaysWhereTheIndexIs",
+              "failed": {
+                "at": "2026-11-21T16:50:14Z",
+                "tree": "5765a0aa9c672df0cc765d34cbfe6368c0ff32c9"
+              },
+              "passed": {
+                "at": "2026-11-21T16:59:14Z",
+                "tree": "a91973ad1e68c5ee595aa5e1e95453bf668cb3b4"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.5",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestWait_RefusesAtOnceWhenTheBuildOfTheHeadFailed",
+              "failed": {
+                "at": "2026-11-21T16:50:14Z",
+                "tree": "5765a0aa9c672df0cc765d34cbfe6368c0ff32c9"
+              },
+              "passed": {
+                "at": "2026-11-21T16:59:14Z",
+                "tree": "a91973ad1e68c5ee595aa5e1e95453bf668cb3b4"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.6",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestWait_ObservesHowLongEachRequestWaited",
+              "failed": {
+                "at": "2026-11-21T16:50:14Z",
+                "tree": "5765a0aa9c672df0cc765d34cbfe6368c0ff32c9"
+              },
+              "passed": {
+                "at": "2026-11-21T16:59:14Z",
+                "tree": "a91973ad1e68c5ee595aa5e1e95453bf668cb3b4"
+              }
+            },
+            {
+              "test": "./internal/metrics:TestNew_ExportsEveryCatalogueMetricAtZero",
+              "failed": {
+                "at": "2026-11-21T16:50:14Z",
+                "tree": "5765a0aa9c672df0cc765d34cbfe6368c0ff32c9"
+              },
+              "passed": {
+                "at": "2026-11-21T16:59:14Z",
+                "tree": "a91973ad1e68c5ee595aa5e1e95453bf668cb3b4"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 4,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-4.1",
+          "no_red": "the checks the two routes share take a fork's parent since task 1 and the waiting rule is the parent's since task 3, whose tests failed first; this test asserts the fork's answers, a token bound to the fork and the wait for the parent's build, and fails once any of them is the fork's own",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestQuery_AnswersAForkFromItsParentsIndexAndSaysSo",
+              "passed": {
+                "at": "2026-11-21T17:04:21Z",
+                "tree": "11ac636e7a129683dda9e2f75cee8d1c574959cf"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.1",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestQuery_TagsAnAnswerByTheIndexedCommitAndTheQuery",
+              "failed": {
+                "at": "2026-11-21T17:00:20Z",
+                "tree": "fe41882a7e33c3f75e5fd82dcb7b93ee5a54f5a8"
+              },
+              "passed": {
+                "at": "2026-11-21T17:04:21Z",
+                "tree": "11ac636e7a129683dda9e2f75cee8d1c574959cf"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.2",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestQuery_AnswersNotModifiedWithoutAskingTheIndex",
+              "failed": {
+                "at": "2026-11-21T17:00:20Z",
+                "tree": "fe41882a7e33c3f75e5fd82dcb7b93ee5a54f5a8"
+              },
+              "passed": {
+                "at": "2026-11-21T17:04:21Z",
+                "tree": "11ac636e7a129683dda9e2f75cee8d1c574959cf"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.3",
+          "no_red": "before an answer carries a tag no refusal can keep one; the test fails once a refusal after the tag was set, such as a query the index cannot parse, still carries it",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestQuery_LeavesARefusalWithoutATagAndUncached",
+              "passed": {
+                "at": "2026-11-21T17:04:21Z",
+                "tree": "11ac636e7a129683dda9e2f75cee8d1c574959cf"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 5,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-6.1",
+          "tests": [
+            {
+              "test": "./internal/cli:TestSCM_ReadsSendOneGetAndPrintTheAnswer",
+              "failed": {
+                "at": "2026-11-21T17:04:24Z",
+                "tree": "afc0806cf64858f314090f09d34cea90214dd134"
+              },
+              "passed": {
+                "at": "2026-11-21T17:17:28Z",
+                "tree": "3c40a0920b29c93650e54b31f2c8ee9a07eabd8e"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.2",
+          "tests": [
+            {
+              "test": "./internal/cli:TestSCM_ReadsSendOneGetAndPrintTheAnswer",
+              "failed": {
+                "at": "2026-11-21T17:04:24Z",
+                "tree": "afc0806cf64858f314090f09d34cea90214dd134"
+              },
+              "passed": {
+                "at": "2026-11-21T17:17:28Z",
+                "tree": "3c40a0920b29c93650e54b31f2c8ee9a07eabd8e"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.3",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCPList_ServesCodeSearchAndSymbolsAsReadingTools",
+              "failed": {
+                "at": "2026-11-21T17:04:24Z",
+                "tree": "afc0806cf64858f314090f09d34cea90214dd134"
+              },
+              "passed": {
+                "at": "2026-11-21T17:17:28Z",
+                "tree": "3c40a0920b29c93650e54b31f2c8ee9a07eabd8e"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 6,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "PATH-1",
+          "tests": [
+            {
+              "test": "./test/e2e:TestCodeIndex_AnAgentOrientsItselfWithoutAClone",
+              "passed": {
+                "at": "2026-11-21T17:21:56Z",
+                "tree": "4af983ca7f8c22c5aab91f7373a8ed73a2761253"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "PATH-2",
+          "tests": [
+            {
+              "test": "./test/e2e:TestCodeIndex_ASearchRightAfterALandFindsWhatLanded",
+              "passed": {
+                "at": "2026-11-21T17:21:56Z",
+                "tree": "4af983ca7f8c22c5aab91f7373a8ed73a2761253"
+              }
+            }
+          ]
+        }
+      ]
     }
   ]
 }

@@ -59,6 +59,9 @@ type Deps struct {
 	// Scrub removes what the hub keeps secret from a failure's text and
 	// bounds its length; nil keeps the text.
 	Scrub func(text string) string
+	// ReadTimeout is how long a search or a symbol lookup may take, the
+	// read timeout of the source control reads; zero or less is 30 s.
+	ReadTimeout time.Duration
 	// Now is the clock; nil is time.Now.
 	Now func() time.Time
 }
@@ -77,6 +80,17 @@ type Component struct {
 	building map[string]string
 	// open are the indexes loaded for use, by slug.
 	open map[string]*openIndex
+	// pins counts the queries that load or read the index of a build, by
+	// slug/commit, and removing holds the builds whose directory the sweep
+	// is taking: a pinned build's directory stays, and one being removed
+	// is not pinned.
+	pins     map[string]int
+	removing map[string]bool
+	// loads are the loads of an index under way, by slug/commit.
+	loads map[string]*load
+	// changed is closed, and replaced, whenever the settlement of a build
+	// has committed: what a query that waits for the index waits on.
+	changed chan struct{}
 }
 
 // Bind gives the component its dependencies, the defaults in place of the
@@ -93,6 +107,9 @@ func (c *Component) Bind(d Deps) {
 	}
 	if d.Now == nil {
 		d.Now = time.Now
+	}
+	if d.ReadTimeout <= 0 {
+		d.ReadTimeout = 30 * time.Second
 	}
 	c.deps = d
 }

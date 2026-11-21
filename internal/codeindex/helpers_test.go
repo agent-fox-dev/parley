@@ -337,6 +337,10 @@ type seam struct {
 	// every index was made with.
 	began, ended chan string
 	opened       []codeindex.Bounds
+	// searchErr, when not nil, is what every search of an index answers;
+	// searches counts the searches that reached an index.
+	searchErr error
+	searches  int
 }
 
 func newSeam() *seam {
@@ -360,9 +364,28 @@ func (s *seam) waitEnded(t *testing.T, part string) {
 	}
 }
 
-// hold makes the builds of the trees whose path holds part wait, and
-// returns what lets them go.
+// hold makes the builds of the trees whose path holds part wait from now
+// on, and returns what lets them go.
 func (s *seam) hold(part string) (release func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// The builds that began before are not the ones held: forgotten, so
+	// that waitBegan waits for one that began under this hold.
+	for drained := false; !drained; {
+		select {
+		case <-s.began:
+		default:
+			drained = true
+		}
+	}
+	ch := make(chan struct{})
+	s.held[part] = ch
+	return sync.OnceFunc(func() { close(ch) })
+}
+
+// holdOnly is hold without forgetting the builds that began before: for a
+// second hold while the first still holds a build.
+func (s *seam) holdOnly(part string) (release func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ch := make(chan struct{})
@@ -420,21 +443,20 @@ type seamIndex struct {
 func (i seamIndex) Build(ctx context.Context) error {
 	s := i.seam
 	s.mu.Lock()
-	var wait chan struct{}
+	var wait []chan struct{}
 	for part, ch := range s.held {
 		if strings.Contains(i.tree, part) {
-			wait = ch
+			wait = append(wait, ch)
 		}
 	}
-	fail := s.fail
 	s.mu.Unlock()
 	select {
 	case s.began <- i.tree:
 	default:
 	}
-	if wait != nil {
+	for _, held := range wait {
 		select {
-		case <-wait:
+		case <-held:
 		case <-ctx.Done():
 			select {
 			case s.ended <- i.tree:
@@ -443,12 +465,28 @@ func (i seamIndex) Build(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
+	// What a build fails with is asked once it is let go, so that a test
+	// can decide it while the build is held.
+	s.mu.Lock()
+	fail := s.fail
+	s.mu.Unlock()
 	if fail != nil {
 		if err := fail(i.tree); err != nil {
 			return err
 		}
 	}
 	return i.Index.Build(ctx)
+}
+
+func (i seamIndex) Search(ctx context.Context, query string, maxFiles int) (codeindex.SearchResult, error) {
+	i.seam.mu.Lock()
+	i.seam.searches++
+	err := i.seam.searchErr
+	i.seam.mu.Unlock()
+	if err != nil {
+		return codeindex.SearchResult{}, err
+	}
+	return i.Index.Search(ctx, query, maxFiles)
 }
 
 func (i seamIndex) State(ctx context.Context) (int, bool, error) {

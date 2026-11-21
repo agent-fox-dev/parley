@@ -88,8 +88,7 @@ func TestStatus_AnswersTheStateOfTheIndex(t *testing.T) {
 		head := w.addWorkspace(t, "demo", map[string]string{"a.go": "package a\n"})
 		w.queue(t, "demo")
 		w.run(t, "demo")
-		next := w.commit(t, "demo", "main", map[string]string{"b.go": "package a\n"})
-		eventually(t, "the build of the new head to be queued", func() bool { return len(w.jobs(t, "demo")) == 1 })
+		next := w.noticed(t, "demo", map[string]string{"b.go": "package a\n"})
 		got := w.statusOf(t, "demo")
 		if got.State != "queued" || str(got.HeadSHA) != next || str(got.IndexedSHA) != head || got.Error != nil {
 			t.Errorf("before the build is claimed the status = %+v, want queued, the head %s and the index of %s", got, next, head)

@@ -164,6 +164,23 @@ func newSCMCommand() *cobra.Command {
 			command: command{Name: "code-index", Description: "Show which commit a workspace's code index holds and what state it is in", Path: "/workspaces/:slug/scm/code-index", Args: slugOnly},
 		}.build(),
 		scmRead{
+			command: command{Name: "code-search", Description: "Search the code of a workspace's default branch, ranked, from its code index", Path: "/workspaces/:slug/scm/code-search", Args: []argSpec{slugArg, {Name: "query", Required: true}}},
+			params:  map[string]string{"query": "q"},
+			query: []queryFlag{
+				{name: "limit", param: "limit", kind: intFlag, usage: "the most files answered, 1 to 25 (default: 20)"},
+			},
+		}.build(),
+		scmRead{
+			command: command{Name: "symbols", Description: "Find the declarations of a workspace's default branch whose name starts with a name", Path: "/workspaces/:slug/scm/symbols", Args: []argSpec{slugArg, {Name: "name", Required: true}}},
+			params:  map[string]string{"name": "name"},
+			query: []queryFlag{
+				{name: "exact", param: "exact", kind: switchFlag, sends: "true", usage: "only the declarations of exactly that name"},
+				{name: "kind", param: "kind", usage: "only the declarations of this kind, such as func, method or type"},
+				{name: "path", param: "path", usage: "only the declarations in this file or under this directory"},
+				{name: "limit", param: "limit", kind: intFlag, usage: "the most declarations answered, 1 to 50 (default: 20)"},
+			},
+		}.build(),
+		scmRead{
 			command: command{Name: "search", Description: "Search the file contents of a revision", Path: "/workspaces/:slug/scm/search", Args: []argSpec{slugArg, {Name: "query", Required: true}}},
 			params:  map[string]string{"query": "q"},
 			query: []queryFlag{

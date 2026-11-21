@@ -1003,7 +1003,7 @@ name; a page is never refused for it.
 | `parley_http_requests_total` | counter | `method`, `path`, `status` | every HTTP request the hub answered, REST, git, the forge webhook ingress, `/healthz`, `/readyz`, `/version` and `/metrics` itself included. `method` is the request's method in upper case, `OTHER` for any method but `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, `CONNECT` and `TRACE`; `path` is the route that matched, as a template (`/api/v1/workspaces/{slug}/sync`, `/git/{org}/{repo}/info/refs`, `/healthz`), never the request's own path, and `unmatched` when no route matched (an unknown path, a method no route of the path has); `status` the three digits sent, `101` for a request whose connection the hub took over (a sandbox's attach) |
 | `parley_http_request_duration_seconds` | histogram | `method`, `path` | the time to answer, by the same `method` and `path`. Buckets `0.005`, `0.01`, `0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10` |
 | `parley_git_requests_total` | counter | `service` (`info-refs`, `upload-pack`, `receive-pack`), `result` (`ok`, `refused`, `error`) | git protocol requests, as in [Git over HTTP](#git-over-http) |
-| `parley_scm_requests_total` | counter | `op` (`refs`, `commits`, `tree`, `file`, `diff`, `compare`, `blame`, `search`, `outline`, `code_index`, `commit`, `ref_create`, `ref_move`, `ref_delete`, `rebase`), `result` (`ok`, `ref_moved`, `refused`, `error`) | source control API requests, reads and writes |
+| `parley_scm_requests_total` | counter | `op` (`refs`, `commits`, `tree`, `file`, `diff`, `compare`, `blame`, `search`, `outline`, `code_index`, `code_search`, `symbols`, `commit`, `ref_create`, `ref_move`, `ref_delete`, `rebase`), `result` (`ok`, `ref_moved`, `refused`, `error`) | source control API requests, reads and writes |
 | `parley_changes_open` | gauge | `workspace` | changes in state `draft` or `open` |
 | `parley_lands_total` | counter | `result` (`landed`, `conflict`, `blocked`, `failed`) | land attempts by final status |
 | `parley_land_attempts` | histogram | none | compare-and-swap tries per land attempt. Buckets `1`, `2`, `3`, `5`, `8`, `13` |
@@ -1032,6 +1032,7 @@ name; a page is never refused for it.
 | `parley_code_index_builds_total` | counter | `outcome` (`ok`, `partial`, `failed`) | code index builds that ended; a build stopped by a bound is `partial`, and one ended from outside (the hub's stop, the workspace's delete, its setting turned off) is counted under none |
 | `parley_code_index_build_duration_seconds` | histogram | none | time a counted build ran, in seconds; buckets 0.1, 0.5, 1, 5, 10, 30, 60, 120, 300, 600 |
 | `parley_code_index_bytes` | gauge | none | bytes of the trees and indexes under the hub's code index directory, measured at start, after every build that ended, complete, partial or failed, and after every maintenance pass, not at every scrape |
+| `parley_code_index_wait_seconds` | histogram | `outcome` (`ready`, `timeout`, `failed`) | how long a code search or symbol lookup waited for the index of the head, in seconds: observed once per request that reached the waiting rule, `0` for one answered at once; `timeout` for one refused at the read timeout and `failed` for one refused because the build of the head failed; buckets 0.01, 0.05, 0.1, 0.5, 1, 2.5, 5, 10, 30, 60 |
 
 The sandbox metrics stay at `0` while sandboxes are off. Counters start
 from zero when `parleyd` starts.
@@ -4527,6 +4528,125 @@ after one failed, they are those of the index built before.
 
 ```json
 {"workspace":"demo","enabled":true,"state":"ready","head_sha":"3d0c5a1f0b6e2d5c8a7f4e9b1c2d3e4f5a6b7c8d","indexed_sha":"3d0c5a1f0b6e2d5c8a7f4e9b1c2d3e4f5a6b7c8d","partial":false,"files_indexed":412,"built_at":"2026-11-21T16:05:12Z","error":null}
+```
+
+
+## Code search and symbols
+
+`GET …/scm/code-search` and `GET …/scm/symbols` answer from the code index
+of a workspace's default branch (see
+[`GET …/scm/code-index`](#get-apiv1workspacesslugscmcode-index)). They are
+reads of the source control API: each takes the admin token, an API key or
+a PAT, declares the scope `git:read` for a PAT, needs read access to the
+workspace, is bounded by `[scm].read_timeout`, and is counted in
+`parley_scm_requests_total` under the op `code_search` or `symbols`. The
+exact search at any ref, [`GET …/scm/search`](#get-apiv1workspacesslugscmsearch),
+is another route and needs no index.
+
+**The waiting rule.** An answer never comes from a commit older than the
+head of the default branch at the time the request arrived. When the index
+holds that head, the branch's head as it is now, or a commit that has the
+arrival head in its history, the answer is immediate. Otherwise the request waits for the build, which it queues when
+none is on its way, for at most the read timeout:
+
+- when the wait runs out: `503` `code_index_not_ready` with `Retry-After: 5`
+  and, in the error object, `state` `building`, `head_sha` and
+  `indexed_sha` (`null` when there is no index);
+- when the last build of the head failed and waits for its next attempt:
+  the same refusal at once, with `state` `failed` and `Retry-After` the
+  seconds until that attempt, at least 1.
+
+**A fork** has no index. A request addressed to a task fork is answered
+from its parent's index, under the waiting rule applied to the parent's
+default branch, and says so: `workspace` is the parent's slug. Read access
+to the fork is what is needed. What the fork's own branches hold is not in
+the answer.
+
+**The checks** run in this order, and the first that fails answers: the
+credential and access (`401`, `403` `insufficient_scope`, `404`
+`not_found`); the feature (`404` `code_index_disabled` on a hub without
+`[code_index]`); the parameters (`400` `invalid_request`); the workspace's
+setting, for a fork its parent's (`409` `code_index_off`); the head (`404`
+`ref_not_found` for a workspace whose repository is not there yet or holds
+no commit, as the tree route answers it); the waiting rule (`503`); the
+entity tag (`304`); the query.
+
+**Caching.** A `200` carries an `ETag` digested from the request's path and
+query and `indexed_sha`, and `Cache-Control: private, no-cache`. A request
+whose `If-None-Match` holds the tag is answered `304` once the waiting rule
+is satisfied and before the index is asked, so after a commit the same
+request waits for the new build and is answered anew. A refusal carries no
+`ETag` and `Cache-Control: no-store`.
+
+## `GET /api/v1/workspaces/{slug}/scm/code-search`
+
+Answers the files of the default branch that match a query, best first.
+
+| Parameter | Meaning |
+|---|---|
+| `q` | the query, required: 1 to 500 characters, at most 1,024 bytes and not blank, in zoekt's query syntax (`NewRouter`, `sym:Handler lang:go`, `needle file:internal/`, `"exact phrase"`, a regular expression between slashes) |
+| `limit` | the most files answered, 1 to 25; default 20 |
+
+| Member | Value |
+|---|---|
+| `workspace` | the workspace whose index answered: `{slug}`, or its parent for a fork |
+| `indexed_sha` | the commit the index that answered was built from |
+| `partial` | `true` when a bound stopped the build of that index, which then holds some of the files |
+| `truncated` | `true` when more files matched than `limit`, and when the index cut an answer of more than 50 KB of matching text, which then holds fewer files than matched |
+| `files` | the files that match, in rank order; `[]` when none does |
+
+A file has `path`, `language` (the outline route's name for the path's
+extension, `""` for a file of no known language) and `matches`, the lines
+that match in line order, each with `line` (1-based) and `text`, the line
+cut to 500 characters. At most 20 matches are answered for a file, taken
+from the up to three places of the file the index ranks best. A file that
+matches by its name alone has one match: line 1 with its path as `text`.
+
+| Status | When |
+|---|---|
+| `200 OK` | the files |
+| `304 Not Modified` | the caller's copy is current |
+| `400` `invalid_request` | no `q`, a blank one, one over 500 characters or 1,024 bytes (`q must be at most 500 characters and 1,024 bytes`); a `limit` that is no integer from 1 to 25 |
+| `400` `invalid_query` | a query the index cannot parse; the message is its parser's |
+| `404` `code_index_disabled`, `409` `code_index_off`, `404` `ref_not_found`, `503` `code_index_not_ready` | see [Code search and symbols](#code-search-and-symbols) |
+| `503` `scm_timeout` | the index did not finish the search in its own 10 seconds (`… narrow the query or add a path constraint`), or the read ran out of the read timeout |
+
+```json
+{"workspace":"demo","indexed_sha":"3d0c5a1f0b6e2d5c8a7f4e9b1c2d3e4f5a6b7c8d","partial":false,"truncated":false,"files":[{"path":"router.go","language":"Go","matches":[{"line":3,"text":"// NewRouter builds a router."},{"line":4,"text":"func NewRouter() *Router { return &Router{} }"}]}]}
+```
+
+## `GET /api/v1/workspaces/{slug}/scm/symbols`
+
+Answers the declarations of the default branch whose name starts with a
+given name, from the outlines the index collected when it was built.
+
+| Parameter | Meaning |
+|---|---|
+| `name` | the start of the name, required, 1 to 200 characters. It is matched without regard to case unless it has an upper-case letter; a name with a `.` is matched as container and name (`Router.New`) |
+| `exact` | `true` or `false` (default): only the declarations of exactly that name |
+| `kind` | only the declarations of this kind: `func`, `method`, `type`, `class`, `interface`, `enum`, `trait`, `const`, `var`, `module` or `macro`, in any letter case |
+| `path` | only the declarations in this file or under this directory, a path of the repository as the source control reads take it |
+| `limit` | the most declarations answered, 1 to 50; default 20 |
+
+The answer has `workspace`, `indexed_sha`, `partial` (always `false`),
+`truncated` (`true` when more declarations matched than `limit`) and
+`symbols`, by path and then by line, `[]` when nothing matches. A symbol
+has `path`, `kind`, `name`, `container`, `signature`, `exported`,
+`start_line` and `end_line`, as a declaration of
+[`GET …/scm/outline`](#get-apiv1workspacesslugscmoutline) has them.
+
+| Status | When |
+|---|---|
+| `200 OK` | the declarations |
+| `304 Not Modified` | the caller's copy is current |
+| `400` `invalid_request` | no `name` or one over 200 characters; an `exact` that is neither `true` nor `false`; a `kind` that is none of the kinds; a `path` the source control reads refuse; a `limit` that is no integer from 1 to 50 |
+| `409` `code_index_partial` | the index is partial: symbols need a complete index. The error object has `indexed_sha`; code search answers from a partial index |
+| `422` `too_many_matches` | more than 1,000 declarations match: give a longer name, a kind or a path. A `path` that names a file is judged by its directory |
+| `404` `code_index_disabled`, `409` `code_index_off`, `404` `ref_not_found`, `503` `code_index_not_ready` | see [Code search and symbols](#code-search-and-symbols) |
+| `503` `scm_timeout` | the read ran out of the read timeout |
+
+```json
+{"workspace":"demo","indexed_sha":"3d0c5a1f0b6e2d5c8a7f4e9b1c2d3e4f5a6b7c8d","partial":false,"truncated":false,"symbols":[{"path":"router.go","kind":"func","name":"NewRouter","container":"","signature":"func NewRouter() *Router","exported":true,"start_line":3,"end_line":3}]}
 ```
 
 ## Source control writes

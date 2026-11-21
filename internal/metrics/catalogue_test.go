@@ -43,7 +43,7 @@ var documented = []struct {
 		closed("service", "info-refs", "upload-pack", "receive-pack"), closed("result", "ok", "refused", "error")}, nil},
 	{"parley_scm_requests_total", metrics.Counter, []label{
 		closed("op", "refs", "commits", "tree", "file", "diff", "compare", "blame", "search", "outline",
-			"code_index", "commit", "ref_create", "ref_move", "ref_delete", "rebase"),
+			"code_index", "code_search", "symbols", "commit", "ref_create", "ref_move", "ref_delete", "rebase"),
 		closed("result", "ok", "ref_moved", "refused", "error")}, nil},
 	{"parley_changes_open", metrics.Gauge, []label{open("workspace")}, nil},
 	{"parley_lands_total", metrics.Counter, []label{closed("result", "landed", "conflict", "blocked", "failed")}, nil},
@@ -78,6 +78,8 @@ var documented = []struct {
 	{"parley_code_index_builds_total", metrics.Counter, []label{closed("outcome", "ok", "partial", "failed")}, nil},
 	{"parley_code_index_build_duration_seconds", metrics.Histogram, nil, []float64{0.1, 0.5, 1, 5, 10, 30, 60, 120, 300, 600}},
 	{"parley_code_index_bytes", metrics.Gauge, nil, nil},
+	{"parley_code_index_wait_seconds", metrics.Histogram, []label{closed("outcome", "ready", "timeout", "failed")},
+		[]float64{0.01, 0.05, 0.1, 0.5, 1, 2.5, 5, 10, 30, 60}},
 }
 
 // zeroSeries is what a fresh registry exports for a documented metric: one

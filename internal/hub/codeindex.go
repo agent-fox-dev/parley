@@ -107,9 +107,10 @@ func composeCodeIndex(c *Composition) {
 			Repos: func(ctx context.Context, slug string) (codeindex.Repository, error) {
 				return git.Open(ctx, c.workspaces.RepoPath(slug))
 			},
-			Metrics: c.metrics,
-			Scrub:   func(text string) string { return rt.Scrubber.Scrub(text) },
-			Now:     rt.Now,
+			Metrics:     c.metrics,
+			Scrub:       func(text string) string { return rt.Scrubber.Scrub(text) },
+			ReadTimeout: rt.Config.SCM.ReadTimeout,
+			Now:         rt.Now,
 		}
 		for _, adjust := range c.codeIndexAdjusters {
 			adjust(&d)

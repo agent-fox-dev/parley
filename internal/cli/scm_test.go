@@ -48,6 +48,13 @@ func TestSCM_ReadsSendOneGetAndPrintTheAnswer(t *testing.T) {
 		{scmCommand("outline", "demo", "internal/api/router.go"), scmPath("outline"), "path=internal%2Fapi%2Frouter.go"},
 		{scmCommand("outline", "demo", "internal/api/router.go", "--ref", "v1"), scmPath("outline"), "path=internal%2Fapi%2Frouter.go&ref=v1"},
 		{scmCommand("code-index", "demo"), scmPath("code-index"), ""},
+		{scmCommand("code-search", "demo", "sym:Handler lang:go"), scmPath("code-search"), "q=sym%3AHandler+lang%3Ago"},
+		{scmCommand("code-search", "demo", "sym:Handler lang:go", "--limit", "5"), scmPath("code-search"), "limit=5&q=sym%3AHandler+lang%3Ago"},
+		{scmCommand("symbols", "demo", "NewRouter"), scmPath("symbols"), "name=NewRouter"},
+		{
+			scmCommand("symbols", "demo", "NewRouter", "--exact", "--kind", "func", "--path", "internal/api", "--limit", "5"),
+			scmPath("symbols"), "exact=true&kind=func&limit=5&name=NewRouter&path=internal%2Fapi",
+		},
 		{scmCommand("search", "demo", "TODO"), scmPath("search"), "q=TODO"},
 		{
 			scmCommand("search", "demo", "to do", "--ref", "v1", "--path", "src/**", "--path", "*.go", "--regex", "--ignore-case"),
@@ -231,6 +238,11 @@ func TestSCM_RefusesABadCommandLineBeforeAnyRequest(t *testing.T) {
 		{"scm", "outline", "demo"},
 		{"scm", "outline", "demo", "a.go", "b.go"},
 		{"scm", "code-index"},
+		{"scm", "code-search", "demo"},
+		{"scm", "code-search", "demo", "a", "b"},
+		{"scm", "code-search", "demo", "a", "--limit", "many"},
+		{"scm", "symbols", "demo"},
+		{"scm", "symbols", "demo", "a", "--limit", "many"},
 		{"scm", "code-index", "demo", "extra"},
 		{"scm", "refs", "demo", "--limit", "many"},
 	}
@@ -254,7 +266,7 @@ func TestSCM_WithoutACommandPrintsItsHelp(t *testing.T) {
 	if code != 0 || stderr != "" {
 		t.Errorf("exit status %d, stderr %q; want 0 and nothing", code, stderr)
 	}
-	for _, sub := range []string{"refs", "log", "show", "ls", "cat", "diff", "compare", "blame", "outline", "code-index", "search", "commit", "rebase"} {
+	for _, sub := range []string{"refs", "log", "show", "ls", "cat", "diff", "compare", "blame", "outline", "code-index", "code-search", "symbols", "search", "commit", "rebase"} {
 		if !slices.ContainsFunc(nonEmptyLines(stdout), func(l string) bool { return strings.HasPrefix(strings.TrimSpace(l), sub+" ") }) {
 			t.Errorf("stdout does not list %s:\n%s", sub, stdout)
 		}
