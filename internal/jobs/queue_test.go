@@ -602,7 +602,7 @@ func TestHasten_MakesAFailedJobDueAtOnce(t *testing.T) {
 	}
 }
 
-func TestWithdraw_CancelsThePendingJobsOfATypeAndWorkspaceAndEndsItsRunningAttempt(t *testing.T) {
+func TestCancelPending_CancelsTheWaitingJobsOfATypeAndWorkspaceAndInterruptEndsTheRunningOne(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	q := newTestQueue(t)

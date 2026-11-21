@@ -38,7 +38,8 @@ const maxLinkTarget = 4096
 // entry whose path is not a plain relative path, or lies under a .git, is
 // left out, and so is an entry whose path is taken on this file system, as
 // two names that differ only by case are on some, so that no file is ever
-// written through a link the tree itself made.
+// written through a link the tree itself made, and an entry whose name the
+// file system cannot hold.
 func (r *Repo) WriteTree(ctx context.Context, commit, dir string) (written int, err error) {
 	out, err := r.git(ctx, "ls-tree", "-r", "-z", "--full-tree", strings.ToLower(commit))
 	if err != nil {
@@ -213,11 +214,13 @@ func writeEntry(root *os.Root, mode, name string, content io.Reader) (bool, erro
 }
 
 // taken is nil for the error of an entry that is left out: its name is
-// taken, a part of its path is no directory, or the tree's own links lead
-// its path out of the directory. Any other error, such as a full disk, is
-// returned.
+// taken, a part of its path is no directory, the tree's own links lead its
+// path out of the directory, or this file system cannot hold the name (too
+// long, or bytes it does not take). Any other error, such as a full disk,
+// is returned.
 func taken(err error) error {
 	if errors.Is(err, fs.ErrExist) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.ELOOP) ||
+		errors.Is(err, syscall.ENAMETOOLONG) || errors.Is(err, syscall.EILSEQ) ||
 		strings.Contains(err.Error(), "path escapes") {
 		return nil
 	}

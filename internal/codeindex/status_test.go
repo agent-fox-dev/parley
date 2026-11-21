@@ -72,9 +72,9 @@ func TestStatus_AnswersTheStateOfTheIndex(t *testing.T) {
 			t.Errorf("the status = %+v (built_at %s, %v), want ready at %s with 2 files, built at %s", got, str(got.BuiltAt), err, head, rec.BuiltAt)
 		}
 
-		next := w.commit(t, "demo", "main", map[string]string{"c.go": "package a\n"})
-		held := string(filepath.Separator) + next + string(filepath.Separator)
+		held := string(filepath.Separator) + "demo" + string(filepath.Separator)
 		t.Cleanup(s.hold(held))
+		next := w.commit(t, "demo", "main", map[string]string{"c.go": "package a\n"})
 		s.waitBegan(t, held)
 		got = w.statusOf(t, "demo")
 		if got.State != "building" || str(got.HeadSHA) != next || str(got.IndexedSHA) != head || got.FilesIndexed != 2 || got.BuiltAt == nil {
@@ -263,11 +263,16 @@ func TestMetrics_CountsTheBuildsAndMeasuresTheDisk(t *testing.T) {
 	eventually(t, "the build of broken to fail", func() bool { return w.builds(t)["failed"] >= 1 })
 
 	text := w.metricsText(t)
-	if n := w.builds(t); n["ok"] != 1 || n["partial"] != 1 || n["failed"] != 1 {
-		t.Errorf("builds by outcome = %v, want one of each", n)
+	// The failed build is retried after its delay, so it may have failed
+	// more than once by now.
+	n := w.builds(t)
+	if n["ok"] != 1 || n["partial"] != 1 || n["failed"] < 1 {
+		t.Errorf("builds by outcome = %v, want one ok, one partial and the failed one", n)
 	}
-	if !strings.Contains(text, "parley_code_index_build_duration_seconds_count 3") {
-		t.Errorf("the duration histogram does not count 3 builds:\n%s", grep(text, "parley_code_index_build_duration_seconds_count"))
+	if !strings.Contains(text, "parley_code_index_build_duration_seconds_count ") ||
+		strings.Contains(text, "parley_code_index_build_duration_seconds_count 0\n") || strings.Contains(text, "parley_code_index_build_duration_seconds_count 1\n") ||
+		strings.Contains(text, "parley_code_index_build_duration_seconds_count 2\n") {
+		t.Errorf("the duration histogram does not count the three builds or more:\n%s", grep(text, "parley_code_index_build_duration_seconds_count"))
 	}
 	if strings.Contains(text, "parley_code_index_bytes 0\n") || !strings.Contains(text, "parley_code_index_bytes ") {
 		t.Errorf("parley_code_index_bytes is not above 0:\n%s", grep(text, "parley_code_index_bytes"))

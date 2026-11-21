@@ -7650,7 +7650,7 @@ directory per build, named after the commit it built:
 ```
 code-index/<slug>/<commit>/tree     the commit's files
 code-index/<slug>/<commit>/index    the index codesearch stored (its IndexDir)
-code-index/<slug>/<commit>/run      where a loaded index works; removed when it is closed
+code-index/<slug>/<commit>/run      where a loaded index works; emptied when it is closed
 ```
 
 A build never writes into the directory of the index there is: with
@@ -7678,8 +7678,9 @@ whose job is gone with its workspace, or that a stop gave up, leaves no
 record and counts as no outcome. A bound leaves a partial index and a
 completed job; any other error fails the attempt, which the queue retries.
 `[code_index].workers` is the queue's limit of that type
-(`jobs.(*Queue).Limit`): a build beyond it stays queued and counts no
-attempt. Once a settlement has committed, the builds the record no longer
+(`jobs.(*Queue).Limit`), never more than one below the queue's own four,
+so that a backlog of builds leaves a place for every other job: a build
+beyond it stays queued and counts no attempt. Once a settlement has committed, the builds the record no longer
 names are removed and `parley_code_index_bytes` is measured.
 
 **What queues a build** is listed in
@@ -7708,8 +7709,9 @@ pass removes the rest. An archived workspace keeps everything.
 
 **Use.** `Files(ctx, slug, query)` loads the index the record names on its
 first use (`Build` over the stored directories loads; a partial index,
-which is not stored whole, is built again within its bounds) and keeps it
-until the record names another; the background work `code-index` closes
+which is not stored whole, is built again within its bounds), outside the
+component's lock, which every settlement takes, and keeps it until the
+record names another; the background work `code-index` closes
 the loaded indexes at the hub's stop. One that cannot be loaded is treated
 as none: its directory is removed and its build queued. The status route
 (`status.go`) answers from the record, the head and the queue.

@@ -273,7 +273,7 @@ func TestBuild_RunsAtMostTheConfiguredWorkersAtOnce(t *testing.T) {
 		}
 		return running, queued
 	}
-	eventually(t, "two builds to run", func() bool { r, _ := count(); return len(r) == 2 })
+	eventually(t, "two builds to run and three to wait", func() bool { r, q := count(); return len(r) == 2 && q == 3 })
 	// The queue passes again and again; no third build may begin.
 	time.Sleep(300 * time.Millisecond)
 	running, queued := count()

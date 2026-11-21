@@ -1031,7 +1031,7 @@ name; a page is never refused for it.
 | `parley_sandbox_runtime_up` | gauge | none | `1` while the sandbox runtime is reachable |
 | `parley_code_index_builds_total` | counter | `outcome` (`ok`, `partial`, `failed`) | code index builds that ended; a build stopped by a bound is `partial`, and one ended from outside (the hub's stop, the workspace's delete, its setting turned off) is counted under none |
 | `parley_code_index_build_duration_seconds` | histogram | none | time a counted build ran, in seconds; buckets 0.1, 0.5, 1, 5, 10, 30, 60, 120, 300, 600 |
-| `parley_code_index_bytes` | gauge | none | bytes of the trees and indexes under the hub's code index directory, measured at start, after every build and after every maintenance pass, not at every scrape |
+| `parley_code_index_bytes` | gauge | none | bytes of the trees and indexes under the hub's code index directory, measured at start, after every build that ended, complete, partial or failed, and after every maintenance pass, not at every scrape |
 
 The sandbox metrics stay at `0` while sandboxes are off. Counters start
 from zero when `parleyd` starts.
@@ -4516,7 +4516,7 @@ after one failed, they are those of the index built before.
 |---|---|
 | `off` | `enabled` is `false`. What is left of an index is removed in the next maintenance pass |
 | `building` | a build of the workspace is running |
-| `ready` | no build is running and `indexed_sha` is `head_sha` |
+| `ready` | no build is running, `indexed_sha` is `head_sha` and the index is on disk |
 | `failed` | no build is running and the last build of `head_sha` failed; it is retried with growing delays, and at once when the head moves |
 | `queued` | otherwise: the index is not at the head and a build waits or is due, a workspace without a repository yet included |
 

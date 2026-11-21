@@ -212,9 +212,11 @@ func (h buildHandler) Run(ctx context.Context, j jobs.Job) error {
 	if now, found, err := repo.ResolveBranch(ctx, ws.DefaultBranch); err == nil && found && now != head {
 		a.moved = true
 	}
-	if a.err != nil {
+	if a.err != nil && ctx.Err() == nil {
 		// What a failed build wrote is of no use; the index there was is
-		// in another directory and stays.
+		// in another directory and stays. A build ended from outside
+		// leaves its directory to the sweep: by now it may be another
+		// build's, of a workspace made again under the slug.
 		_ = os.RemoveAll(c.buildDir(ws.Slug, head))
 	}
 	if a.err != nil && ctx.Err() != nil {
@@ -308,6 +310,7 @@ func (h buildHandler) Settled(ctx context.Context, tx *sql.Tx, j jobs.Job, _ boo
 		if err := recordFailed(ctx, tx, a.slug, a.sha, c.failureText(a.err), now); err != nil {
 			return err
 		}
+		go c.settled(a.slug)
 	default:
 		if a.partial {
 			outcome = outcomePartial
@@ -425,23 +428,29 @@ func (c *Component) sweepWorkspace(ctx context.Context, slug string) error {
 		c.deps.Jobs.Interrupt(JobType, slug)
 		c.mu.Lock()
 		delete(c.building, slug)
+		for id, a := range c.attempts {
+			if a.slug == slug {
+				delete(c.attempts, id)
+			}
+		}
 		c.mu.Unlock()
 		c.release(slug, "")
 		return os.RemoveAll(dir)
-	}
-	rec, _, err := c.Record(ctx, slug)
-	if err != nil {
-		return err
 	}
 	builds, err := os.ReadDir(dir)
 	if err != nil {
 		return err
 	}
-	c.release(slug, rec.IndexedSHA)
 	var failures []error
 	for _, b := range builds {
-		// The build under way is asked for last: one that began after the
-		// record was read is kept, not taken for a leftover.
+		// Each removal is decided on the record as it is then, and the
+		// build under way asked for after it: a build that settled or began
+		// while an older tree was being removed is kept.
+		rec, _, err := c.Record(ctx, slug)
+		if err != nil {
+			return errors.Join(append(failures, err)...)
+		}
+		c.release(slug, rec.IndexedSHA)
 		if b.Name() == rec.IndexedSHA || b.Name() == c.buildingOf(slug) {
 			continue
 		}
@@ -494,10 +503,13 @@ func (c *Component) loaded(ctx context.Context, slug string) (Index, error) {
 		return nil, ErrNoIndex
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if o := c.open[slug]; o != nil && o.sha == rec.IndexedSHA {
+		c.mu.Unlock()
 		return o.idx, nil
 	}
+	c.mu.Unlock()
+	// The load runs outside the lock, which every settlement of a build
+	// takes: a load may copy a large index, or build a partial one again.
 	dir := c.buildDir(slug, rec.IndexedSHA)
 	idx, err := c.deps.Open(filepath.Join(dir, treeDir), filepath.Join(dir, storeDir), filepath.Join(dir, scratchDir), c.bounds())
 	if err == nil {
@@ -508,11 +520,22 @@ func (c *Component) loaded(ctx context.Context, slug string) (Index, error) {
 		}
 	}
 	if err != nil {
+		if ctx.Err() != nil {
+			// The caller gave up; the stored index is not at fault.
+			return nil, ctx.Err()
+		}
 		_ = os.RemoveAll(dir)
 		go func() { _ = c.Queue(context.WithoutCancel(ctx), slug) }()
 		return nil, fmt.Errorf("%w that can be loaded: %w", ErrNoIndex, err)
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if o := c.open[slug]; o != nil {
+		if o.sha == rec.IndexedSHA {
+			// Another caller loaded it meanwhile.
+			_ = idx.Close()
+			return o.idx, nil
+		}
 		_ = o.idx.Close()
 	}
 	if c.open == nil {
@@ -604,9 +627,9 @@ func (c *Component) measure() {
 }
 
 // Measure reports the bytes of the code index directory, as the hub does at
-// its start.
+// its start, beside it: the walk of every tree does not hold the start up.
 func (c *Component) Measure() {
 	if c.Enabled() {
-		c.measure()
+		go c.measure()
 	}
 }

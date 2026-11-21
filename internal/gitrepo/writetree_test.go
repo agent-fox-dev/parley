@@ -62,3 +62,23 @@ func TestWriteTree_WritesNothingOutsideItsDirectory(t *testing.T) {
 		}
 	}
 }
+
+// A name this file system cannot hold leaves its entry out, not the tree.
+func TestWriteTree_LeavesOutAnEntryTheFileSystemRefuses(t *testing.T) {
+	t.Parallel()
+	ctx, dir := context.Background(), filepath.Join(t.TempDir(), "repo.git")
+	gitrepotest.InitBare(t, dir, "main")
+	head := gitrepotest.Commit(t, dir, "long", map[string]string{strings.Repeat("n", 300) + ".txt": "too long a name\n", "kept.txt": "kept\n"})
+	repo, err := gitrepo.Git{}.Open(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree := filepath.Join(t.TempDir(), "tree")
+	written, err := repo.WriteTree(ctx, head, tree)
+	if err != nil || written != 1 {
+		t.Fatalf("WriteTree = %d, %v; want the one file this file system takes and no error", written, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(tree, "kept.txt")); err != nil || string(got) != "kept\n" {
+		t.Errorf("kept.txt = %q (%v), want the blob's bytes", got, err)
+	}
+}

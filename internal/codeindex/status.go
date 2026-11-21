@@ -134,7 +134,7 @@ func (c *Component) Status(ctx context.Context, ws Workspace) (Status, error) {
 	switch {
 	case len(running) > 0:
 		st.State = StateBuilding
-	case head != "" && rec.IndexedSHA == head:
+	case head != "" && rec.IndexedSHA == head && c.stored(ws.Slug, head):
 		st.State = StateReady
 	case head != "" && rec.FailedSHA == head:
 		st.State = StateFailed
@@ -148,12 +148,20 @@ func (c *Component) Status(ctx context.Context, ws Workspace) (Status, error) {
 // keeps secret, and cut to maxErrorBytes between two characters.
 func (c *Component) failureText(err error) string {
 	text := c.deps.Scrub(err.Error())
-	if len(text) <= maxErrorBytes {
-		return text
+	if len(text) > maxErrorBytes {
+		cut := maxErrorBytes
+		for cut > 0 && !utf8.RuneStart(text[cut]) {
+			cut--
+		}
+		text = text[:cut]
 	}
-	cut := maxErrorBytes
-	for cut > 0 && !utf8.RuneStart(text[cut]) {
-		cut--
+	// Whoever cut it, the text ends on a whole character.
+	for len(text) > 0 {
+		r, size := utf8.DecodeLastRuneInString(text)
+		if r != utf8.RuneError || size != 1 {
+			break
+		}
+		text = text[:len(text)-1]
 	}
-	return text[:cut]
+	return text
 }

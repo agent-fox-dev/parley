@@ -12,6 +12,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/carrypatch"
 	"github.com/agent-fox-dev/parley/internal/codeindex"
 	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
+	"github.com/agent-fox-dev/parley/internal/jobs"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -120,13 +121,21 @@ func composeCodeIndex(c *Composition) {
 		if err := comp.CheckPlatform(); err != nil {
 			return err
 		}
-		// The builds are bounded apart from whatever else the queue runs.
-		c.Jobs().Limit(codeindex.JobType, rt.Config.CodeIndex.Workers)
+		// The builds are bounded apart from whatever else the queue runs,
+		// and never take the queue's last place: a backlog of builds, such
+		// as the first start with the section, would hold every other job
+		// until it is through.
+		c.Jobs().Limit(codeindex.JobType, min(rt.Config.CodeIndex.Workers, jobs.MaxRunning-1))
 		c.Jobs().Register(codeindex.JobType, comp.Handler())
-		// The queue has recovered what a stop left running; what moved
-		// while the hub was down is queued here.
 		comp.Measure()
-		return comp.Reconcile(ctx)
+		// The queue has recovered what a stop left running; what moved
+		// while the hub was down is queued here. A workspace whose head
+		// cannot be read is no reason not to start: the maintenance pass
+		// looks again.
+		if err := comp.Reconcile(ctx); err != nil {
+			rt.Logger.Warn("code index builds not all queued at start", "error", err)
+		}
+		return nil
 	})
 	c.AddBackgroundWork(codeIndexWork, codeIndexGrace, func(ctx context.Context, _ *Runtime) { comp.Run(ctx) })
 	// The record goes in the delete's transaction; the queue's own remover

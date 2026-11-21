@@ -56,9 +56,11 @@ func TestKeep_RemovesEverythingOfADeletedWorkspace(t *testing.T) {
 	w := newWorld(t, enabled, s.adjust)
 	w.addWorkspace(t, "demo", map[string]string{"a.go": "package a\n"})
 	w.indexed(t, "demo")
-	next := w.commit(t, "demo", "main", map[string]string{"b.go": "package a\n"})
-	held := string(filepath.Separator) + next + string(filepath.Separator)
-	t.Cleanup(s.hold(held))
+	// Held before the commit that starts it, so the build cannot slip by.
+	held := string(filepath.Separator) + "demo" + string(filepath.Separator)
+	release := s.hold(held)
+	t.Cleanup(release)
+	w.commit(t, "demo", "main", map[string]string{"b.go": "package a\n"})
 	s.waitBegan(t, held)
 
 	if status, body := w.Call(t, http.MethodPost, "/api/v1/workspaces/demo/archive", w.key, nil); status != http.StatusOK {
@@ -80,6 +82,7 @@ func TestKeep_RemovesEverythingOfADeletedWorkspace(t *testing.T) {
 	}
 
 	// The slug is taken again by another repository.
+	release()
 	again := w.addWorkspace(t, "demo", map[string]string{"other.go": "package other\n"})
 	w.indexed(t, "demo")
 	if got := w.tree(t, "demo", again); len(got) != 1 || got["other.go"] == "" {
@@ -96,9 +99,11 @@ func TestKeep_RemovesTheIndexOfAWorkspaceWhoseSettingIsTurnedOff(t *testing.T) {
 	w := newWorld(t, enabled, s.adjust)
 	w.addWorkspace(t, "demo", map[string]string{"a.go": "package a\n"})
 	w.indexed(t, "demo")
-	next := w.commit(t, "demo", "main", map[string]string{"b.go": "package a\n"})
-	held := string(filepath.Separator) + next + string(filepath.Separator)
-	t.Cleanup(s.hold(held))
+	// Held before the commit that starts it, so the build cannot slip by.
+	held := string(filepath.Separator) + "demo" + string(filepath.Separator)
+	release := s.hold(held)
+	t.Cleanup(release)
+	w.commit(t, "demo", "main", map[string]string{"b.go": "package a\n"})
 	s.waitBegan(t, held)
 	// One more waits beside the build that runs.
 	w.commit(t, "demo", "main", map[string]string{"c.go": "package a\n"})
@@ -127,5 +132,43 @@ func TestKeep_RemovesTheIndexOfAWorkspaceWhoseSettingIsTurnedOff(t *testing.T) {
 	check("after a second pass")
 	if n := w.builds(t); n["failed"] != 0 {
 		t.Errorf("builds by outcome = %v, want the build that was ended counted under none", n)
+	}
+}
+
+func TestKeep_LoadsAnIndexWithoutHoldingUpTheBuilds(t *testing.T) {
+	t.Parallel()
+	s := newSeam()
+	w := newWorld(t, enabled, s.adjust)
+	w.addWorkspace(t, "demo", map[string]string{"a.go": "package a\n\nfunc Zebra() {}\n"})
+	w.addWorkspace(t, "other", map[string]string{"o.go": "package o\n"})
+	w.indexed(t, "demo")
+
+	// The load of demo's index is held, as a slow one is.
+	held := string(filepath.Separator) + "demo" + string(filepath.Separator)
+	release := s.hold(held)
+	t.Cleanup(release)
+	ctx, cancel := context.WithCancel(context.Background())
+	loaded := make(chan error, 1)
+	go func() {
+		_, err := w.index.Files(ctx, "demo", "Zebra")
+		loaded <- err
+	}()
+	s.waitBegan(t, held)
+
+	// A build of another workspace settles meanwhile.
+	w.indexed(t, "other")
+
+	// The caller gives up: the stored index is not the one at fault.
+	cancel()
+	if err := <-loaded; err == nil {
+		t.Error("the load whose caller gave up answered, want its error")
+	}
+	release()
+	files, err := w.index.Files(context.Background(), "demo", "Zebra")
+	if err != nil || !slices.Equal(files, []string{"a.go"}) {
+		t.Errorf("after a load that was given up the index answers %q (%v), want a.go from the index that was stored", files, err)
+	}
+	if n := w.builds(t); n["ok"] != 2 {
+		t.Errorf("builds = %v, want the two there were: a load that was given up builds nothing", n)
 	}
 }
