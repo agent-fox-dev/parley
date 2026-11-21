@@ -70,6 +70,7 @@ const (
 	CodeIndexBuildsTotal          = "parley_code_index_builds_total"
 	CodeIndexBuildDurationSeconds = "parley_code_index_build_duration_seconds"
 	CodeIndexBytes                = "parley_code_index_bytes"
+	CodeIndexWaitSeconds          = "parley_code_index_wait_seconds"
 )
 
 func closed(name string, values ...string) Label { return Label{Name: name, Values: values} }
@@ -166,4 +167,8 @@ var catalogue = []Metric{
 		Help:    "Time a code index build ran, in seconds.",
 		Buckets: []float64{0.1, 0.5, 1, 5, 10, 30, 60, 120, 300, 600}},
 	{Name: CodeIndexBytes, Type: Gauge, Help: "Bytes of the code index trees and indexes on disk."},
+	{Name: CodeIndexWaitSeconds, Type: Histogram,
+		Help:    "Time a code search or symbol lookup waited for the index of the head, in seconds.",
+		Labels:  []Label{closed("outcome", "ready", "timeout", "failed")},
+		Buckets: []float64{0.01, 0.05, 0.1, 0.5, 1, 2.5, 5, 10, 30, 60}},
 }

@@ -87,8 +87,8 @@ func TestMetrics_RetentionPrunesOldRecordsAtStartAndTheOperatorWatchesIt(t *test
 		t.Errorf("Content-Type media type %q, version %q; want text/plain, 0.0.4", mediaType, version)
 	}
 	catalogue := metrics.New(nil).Gather(context.Background())
-	if len(catalogue) != 32 {
-		t.Fatalf("the catalogue holds %d metrics, want 32", len(catalogue))
+	if len(catalogue) != 33 {
+		t.Fatalf("the catalogue holds %d metrics, want 33", len(catalogue))
 	}
 	for _, f := range catalogue {
 		if !families[f.Name] {

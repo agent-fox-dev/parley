@@ -430,7 +430,6 @@ func (i seamIndex) Build(ctx context.Context) error {
 			wait = ch
 		}
 	}
-	fail := s.fail
 	s.mu.Unlock()
 	select {
 	case s.began <- i.tree:
@@ -447,6 +446,11 @@ func (i seamIndex) Build(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
+	// What a build fails with is asked once it is let go, so that a test
+	// can decide it while the build is held.
+	s.mu.Lock()
+	fail := s.fail
+	s.mu.Unlock()
 	if fail != nil {
 		if err := fail(i.tree); err != nil {
 			return err

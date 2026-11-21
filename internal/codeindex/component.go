@@ -80,6 +80,15 @@ type Component struct {
 	building map[string]string
 	// open are the indexes loaded for use, by slug.
 	open map[string]*openIndex
+	// pins counts the queries that load or read the index of a build, by
+	// slug/commit, and removing holds the builds whose directory the sweep
+	// is taking: a pinned build's directory stays, and one being removed
+	// is not pinned.
+	pins     map[string]int
+	removing map[string]bool
+	// changed is closed, and replaced, whenever the settlement of a build
+	// has committed: what a query that waits for the index waits on.
+	changed chan struct{}
 }
 
 // Bind gives the component its dependencies, the defaults in place of the

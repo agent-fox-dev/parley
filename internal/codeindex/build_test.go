@@ -7,6 +7,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -156,11 +157,25 @@ type clockedWorld struct {
 func newClockedWorld(t *testing.T, s *seam) *clockedWorld {
 	t.Helper()
 	c := &clockedWorld{clock: hubtest.NewJobClock(time.Now)}
-	c.world = newComposedWorld(t, hubtest.Config{TOML: enabled, Compose: func(h *hub.Composition) {
+	// An hour between maintenance passes: every build is queued by the test
+	// or by the notice of a commit, which the test waits for (noticed), so
+	// that no late notice makes a failed build due again behind its back.
+	c.world = newComposedWorld(t, hubtest.Config{TOML: enabled, MaintenanceInterval: time.Hour, Compose: func(h *hub.Composition) {
 		c.jobq = h.Jobs()
 		h.AdjustJobs(func(d *jobs.Deps) { d.Clock, d.NoWake = c.clock, true })
 	}}, s.adjust)
 	return c
+}
+
+// noticed commits put to main of slug and waits until the ref writer's
+// notice of it has queued the build.
+func (c *clockedWorld) noticed(t *testing.T, slug string, put map[string]string) string {
+	t.Helper()
+	sha := c.commit(t, slug, "main", put)
+	eventually(t, "the notice of the commit to queue a build of "+slug, func() bool {
+		return slices.Contains(c.jobs(t, slug), jobs.StatusQueued)
+	})
+	return sha
 }
 
 // run runs one pass of the queue and waits until no build of slug runs.
@@ -191,9 +206,8 @@ func TestBuild_LeavesThePreviousIndexWhenItFailsAndTriesAgain(t *testing.T) {
 		t.Fatalf("the record = %+v, want the index of %s", built, a)
 	}
 
-	b := w.commit(t, "demo", "main", map[string]string{"b.go": "package a\n"})
+	b := w.noticed(t, "demo", map[string]string{"b.go": "package a\n"})
 	s.failWith(func(string) error { return errors.New("the disk went away") })
-	w.queue(t, "demo")
 	w.run(t, "demo")
 	rec := w.record(t, "demo")
 	if rec.IndexedSHA != a || !rec.BuiltAt.Equal(*built.BuiltAt) || rec.FilesIndexed != built.FilesIndexed {
@@ -238,9 +252,9 @@ func TestBuild_BuildsANewHeadWithoutWaitingForAFailedBuildsRetry(t *testing.T) {
 	}
 
 	s.failWith(nil)
-	c := w.commit(t, "demo", "main", map[string]string{"c.go": "package a\n"})
-	w.queue(t, "demo")
-	// The clock has not moved.
+	// The notice of the new head makes the failed build due; the clock has
+	// not moved.
+	c := w.noticed(t, "demo", map[string]string{"c.go": "package a\n"})
 	w.run(t, "demo")
 	if rec := w.reaches(t, "demo", c); rec.Error != "" {
 		t.Errorf("the record = %+v, want the index of the new head %s", rec, c)

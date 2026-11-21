@@ -454,7 +454,14 @@ func (c *Component) sweepWorkspace(ctx context.Context, slug string) error {
 		if b.Name() == rec.IndexedSHA || b.Name() == c.buildingOf(slug) {
 			continue
 		}
+		// A build whose index a query still loads or reads stays; the end
+		// of that query sweeps again.
+		removed, ok := c.claimRemoval(slug, b.Name())
+		if !ok {
+			continue
+		}
 		failures = append(failures, os.RemoveAll(filepath.Join(dir, b.Name())))
+		removed()
 	}
 	return errors.Join(failures...)
 }
@@ -479,10 +486,11 @@ func (c *Component) buildingOf(slug string) string {
 // matches query, a query of the index, from the index its record names. It
 // builds nothing: the index a build stored is loaded on its first use.
 func (c *Component) Files(ctx context.Context, slug, query string) ([]string, error) {
-	idx, err := c.loaded(ctx, slug)
+	idx, _, done, err := c.acquire(ctx, slug)
 	if err != nil {
 		return nil, err
 	}
+	defer done()
 	res, err := idx.Search(ctx, query, maxSearchFiles)
 	if err != nil {
 		return nil, err
@@ -501,80 +509,199 @@ const maxSearchFiles = 25
 // none.
 var ErrNoIndex = errors.New("the workspace has no code index")
 
-// loaded is the index the record of the workspace slug names, loaded from
-// what its build stored on its first use and kept until the record names
-// another. A stored index that cannot be loaded is treated as none: its
-// directory is removed and its build queued.
-func (c *Component) loaded(ctx context.Context, slug string) (Index, error) {
-	rec, found, err := c.Record(ctx, slug)
-	if err != nil {
-		return nil, err
+// acquire is the index the record of the workspace slug names and the
+// commit it holds, loaded from what its build stored on its first use and
+// kept until the record names another. The caller calls done when its use
+// has ended: until then the index stays open and the directory of its
+// build stays on disk, also when a newer build replaces it meanwhile, since
+// the index reads the tree it was built from. A stored index that cannot
+// be loaded is treated as none: its directory is removed and its build
+// queued.
+func (c *Component) acquire(ctx context.Context, slug string) (idx Index, sha string, done func(), err error) {
+	for attempt := 0; ; attempt++ {
+		rec, found, err := c.Record(ctx, slug)
+		if err != nil {
+			return nil, "", nil, err
+		}
+		if !found || rec.IndexedSHA == "" {
+			return nil, "", nil, ErrNoIndex
+		}
+		sha := rec.IndexedSHA
+		// The record may name another commit by now, and the sweep may be
+		// taking this one's directory: then the record is read again.
+		if !c.pin(slug, sha) {
+			if attempt >= acquireTries {
+				return nil, "", nil, fmt.Errorf("%w that stays long enough to be loaded", ErrNoIndex)
+			}
+			select {
+			case <-ctx.Done():
+				return nil, "", nil, context.Cause(ctx)
+			case <-time.After(time.Millisecond):
+			}
+			continue
+		}
+		o, err := c.open1(ctx, slug, sha)
+		if err == nil {
+			return o.idx, sha, func() { c.done(o); c.unpin(slug, sha) }, nil
+		}
+		c.unpin(slug, sha)
+		if ctx.Err() != nil {
+			// The caller gave up; the stored index is not at fault.
+			return nil, "", nil, context.Cause(ctx)
+		}
+		if now, _, recErr := c.Record(ctx, slug); recErr == nil && now.IndexedSHA != sha && attempt < acquireTries {
+			continue
+		}
+		_ = os.RemoveAll(c.buildDir(slug, sha))
+		go func() { _ = c.Queue(context.WithoutCancel(ctx), slug) }()
+		return nil, "", nil, fmt.Errorf("%w that can be loaded: %w", ErrNoIndex, err)
 	}
-	if !found || rec.IndexedSHA == "" {
-		return nil, ErrNoIndex
-	}
+}
+
+// acquireTries is how often acquire reads the record again when the index
+// it named was replaced before it could be loaded.
+const acquireTries = 50
+
+// open1 is the loaded index of the build of the commit sha of the
+// workspace slug, with one more use counted; the caller has pinned the
+// build's directory.
+func (c *Component) open1(ctx context.Context, slug, sha string) (*openIndex, error) {
 	c.mu.Lock()
-	if o := c.open[slug]; o != nil && o.sha == rec.IndexedSHA {
+	if o := c.open[slug]; o != nil && o.sha == sha {
+		o.uses++
 		c.mu.Unlock()
-		return o.idx, nil
+		return o, nil
 	}
 	c.mu.Unlock()
 	// The load runs outside the lock, which every settlement of a build
 	// takes: a load may copy a large index, or build a partial one again.
-	dir := c.buildDir(slug, rec.IndexedSHA)
-	idx, err := c.deps.Open(filepath.Join(dir, treeDir), filepath.Join(dir, storeDir), filepath.Join(dir, scratchDir), c.bounds())
+	dir := c.buildDir(slug, sha)
+	loaded, err := c.deps.Open(filepath.Join(dir, treeDir), filepath.Join(dir, storeDir), filepath.Join(dir, scratchDir), c.bounds())
 	if err == nil {
 		// Over the directories a build stored into, this loads; only a
 		// partial index, which is not stored whole, is built again.
-		if err = idx.Build(ctx); err != nil {
-			_ = idx.Close()
+		if err = loaded.Build(ctx); err != nil {
+			_ = loaded.Close()
 		}
 	}
 	if err != nil {
-		if ctx.Err() != nil {
-			// The caller gave up; the stored index is not at fault.
-			return nil, ctx.Err()
-		}
-		_ = os.RemoveAll(dir)
-		go func() { _ = c.Queue(context.WithoutCancel(ctx), slug) }()
-		return nil, fmt.Errorf("%w that can be loaded: %w", ErrNoIndex, err)
+		return nil, err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if o := c.open[slug]; o != nil {
-		if o.sha == rec.IndexedSHA {
+		if o.sha == sha {
 			// Another caller loaded it meanwhile.
-			_ = idx.Close()
-			return o.idx, nil
+			_ = loaded.Close()
+			o.uses++
+			return o, nil
 		}
-		_ = o.idx.Close()
+		c.retire(slug, o)
 	}
 	if c.open == nil {
 		c.open = map[string]*openIndex{}
 	}
-	c.open[slug] = &openIndex{sha: rec.IndexedSHA, idx: idx}
-	return idx, nil
+	o := &openIndex{slug: slug, sha: sha, idx: loaded, uses: 1}
+	c.open[slug] = o
+	return o, nil
 }
 
-// openIndex is a loaded index and the commit it holds.
-type openIndex struct {
-	sha string
-	idx Index
-}
-
-// release closes the loaded index of the workspace slug unless it holds
-// the commit keep.
-func (c *Component) release(slug, keep string) {
+// pin keeps the directory of the build of the commit sha of the workspace
+// slug from the sweep until unpin; it reports false when the sweep is
+// taking the directory already.
+func (c *Component) pin(slug, sha string) bool {
 	c.mu.Lock()
-	o := c.open[slug]
-	if o != nil && o.sha != keep {
-		delete(c.open, slug)
-	} else {
-		o = nil
+	defer c.mu.Unlock()
+	key := slug + "/" + sha
+	if c.removing[key] {
+		return false
+	}
+	if c.pins == nil {
+		c.pins = map[string]int{}
+	}
+	c.pins[key]++
+	return true
+}
+
+// unpin ends one pin; the last one lets the sweep take the directory of a
+// build the record no longer names.
+func (c *Component) unpin(slug, sha string) {
+	c.mu.Lock()
+	key := slug + "/" + sha
+	c.pins[key]--
+	last := c.pins[key] <= 0
+	if last {
+		delete(c.pins, key)
 	}
 	c.mu.Unlock()
-	if o != nil {
+	if last {
+		go func() { _ = c.sweepWorkspace(context.Background(), slug) }()
+	}
+}
+
+// claimRemoval reports whether the sweep may remove the directory of the
+// build of sha, which no one has pinned, and keeps anyone from pinning it
+// until removed is called.
+func (c *Component) claimRemoval(slug, sha string) (removed func(), ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := slug + "/" + sha
+	if c.pins[key] > 0 || c.removing[key] {
+		return nil, false
+	}
+	if c.removing == nil {
+		c.removing = map[string]bool{}
+	}
+	c.removing[key] = true
+	return func() {
+		c.mu.Lock()
+		delete(c.removing, key)
+		c.mu.Unlock()
+	}, true
+}
+
+// openIndex is a loaded index of a workspace, the commit it holds, how many
+// callers use it now, and whether it is to be closed once none does.
+type openIndex struct {
+	slug, sha string
+	idx       Index
+	uses      int
+	retired   bool
+}
+
+// retire takes o, the loaded index of slug, out of use: it is closed now,
+// or once its last user is done. The caller holds c.mu.
+func (c *Component) retire(slug string, o *openIndex) {
+	if c.open[slug] == o {
+		delete(c.open, slug)
+	}
+	if o.uses == 0 {
 		_ = o.idx.Close()
+		return
+	}
+	// A query still reads it; its last use closes it.
+	o.retired = true
+}
+
+// done ends one use of o, and closes it when it was the last use of an
+// index a newer one replaced.
+func (c *Component) done(o *openIndex) {
+	c.mu.Lock()
+	o.uses--
+	closing := o.retired && o.uses == 0
+	c.mu.Unlock()
+	if closing {
+		_ = o.idx.Close()
+	}
+}
+
+// release takes the loaded index of the workspace slug out of use unless
+// it holds the commit keep.
+func (c *Component) release(slug, keep string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if o := c.open[slug]; o != nil && o.sha != keep {
+		c.retire(slug, o)
 	}
 }
 
@@ -617,8 +744,31 @@ func (c *Component) settled(slug string) {
 	if err := c.deps.Store.Tx(ctx, func(*sql.Tx) error { return nil }); err != nil {
 		return
 	}
+	c.wake()
 	_ = c.sweepWorkspace(ctx, slug)
 	c.measure()
+}
+
+// settlements is what is closed when the next settlement of a build has
+// committed. A caller takes it before it reads the record it then waits
+// to change, so that no settlement between the two is missed.
+func (c *Component) settlements() <-chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.changed == nil {
+		c.changed = make(chan struct{})
+	}
+	return c.changed
+}
+
+// wake tells everyone who waits on settlements.
+func (c *Component) wake() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.changed != nil {
+		close(c.changed)
+		c.changed = nil
+	}
 }
 
 // measure reports the bytes of the code index directory.
