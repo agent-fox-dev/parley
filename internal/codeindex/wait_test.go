@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -302,5 +303,81 @@ func TestWait_ObservesHowLongEachRequestWaited(t *testing.T) {
 	}
 	if sum < 0.3 || sum > 20 {
 		t.Errorf("the ready requests waited %v s in sum, want at least the 0.3 s the second one was held", sum)
+	}
+}
+
+// The request arrived at B. The index reaches C, a later head, while the
+// branch has moved on to D, whose build has not ended: C answers.
+func TestWait_AnswersFromAHeadAfterArrivalThatIsNoLongerTheNewest(t *testing.T) {
+	t.Parallel()
+	s := newSeam()
+	w := newWorld(t, enabled, s.adjust)
+	w.addWorkspace(t, "demo", map[string]string{"a.go": "package a\n"})
+	w.indexed(t, "demo")
+
+	releaseB := s.hold(demoPart)
+	t.Cleanup(releaseB)
+	b := w.commit(t, "demo", "main", map[string]string{"b.go": "package a\n\n// arrivalword\n"})
+	s.waitBegan(t, demoPart)
+	search := w.later(t, "code-search", "q=arrivalword")
+	waits(t, search, "the search")
+	c := w.commit(t, "demo", "main", map[string]string{"c.go": "package a\n"})
+	s.failWith(func(tree string) error {
+		if strings.Contains(tree, b) {
+			return errors.New("the build of the arrival head is lost")
+		}
+		return nil
+	})
+	// The build of C is held where it begins, so that D can be committed
+	// while it runs; the build of D is held for good.
+	sep := string(filepath.Separator)
+	releaseC := s.holdOnly(sep + c + sep)
+	t.Cleanup(releaseC)
+	releaseB()
+	s.waitBegan(t, sep+c+sep)
+	d := w.commit(t, "demo", "main", map[string]string{"d.go": "package a\n"})
+	t.Cleanup(s.holdOnly(sep + d + sep))
+	releaseC()
+
+	var found searchAnswer
+	if a := arrives(t, search, "the search"); a.code != http.StatusOK || json.Unmarshal(a.body, &found) != nil ||
+		str(found.IndexedSHA) != c || !slices.Contains(found.paths(), "b.go") {
+		t.Errorf("the search answers %d %s, want 200 from the index of %s, a head after the one it arrived at, while the build of %s runs", a.code, a.body, c, d)
+	}
+}
+
+// A request that waits is told when its workspace's index is turned off.
+func TestWait_EndsWhenTheWorkspacesSettingIsTurnedOff(t *testing.T) {
+	t.Parallel()
+	s := newSeam()
+	w := newWorld(t, enabled, s.adjust)
+	w.addWorkspace(t, "demo", map[string]string{"a.go": "package a\n"})
+	w.indexed(t, "demo")
+	t.Cleanup(s.hold(demoPart))
+	w.commit(t, "demo", "main", map[string]string{"b.go": "package a\n"})
+	s.waitBegan(t, demoPart)
+	search := w.later(t, "code-search", "q=package")
+	waits(t, search, "the search")
+
+	if code, body := w.Call(t, http.MethodPatch, "/api/v1/workspaces/demo", w.key, map[string]any{"settings": map[string]any{"code_index": false}}); code != http.StatusOK {
+		t.Fatalf("PATCH code_index false = %d %s, want 200", code, body)
+	}
+	if a := arrives(t, search, "the search"); a.code != http.StatusConflict || a.refusal().Error.ErrorType != "code_index_off" {
+		t.Errorf("the waiting search answers %d %s, want 409 code_index_off once the setting is off", a.code, a.body)
+	}
+}
+
+// An index whose files are gone from the disk is no index: the request
+// waits for the build that puts it back.
+func TestWait_BuildsAgainAnIndexWhoseFilesAreGone(t *testing.T) {
+	t.Parallel()
+	w := newComposedWorld(t, hubtest.Config{TOML: enabled, MaintenanceInterval: time.Hour})
+	head := w.addWorkspace(t, "demo", map[string]string{"a.go": "package a\n\n// goneword\n"})
+	w.indexed(t, "demo")
+	if err := os.RemoveAll(filepath.Dir(w.index.TreeDir("demo", head))); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := w.search(t, "demo", "goneword"); str(got.IndexedSHA) != head || !slices.Equal(got.paths(), []string{"a.go"}) {
+		t.Errorf("the search answers %+v, want a.go from an index of %s built again", got, head)
 	}
 }

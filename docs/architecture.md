@@ -7711,8 +7711,11 @@ pass removes the rest. An archived workspace keeps everything.
 loads it on its first use (`Build` over the stored directories loads; a
 partial index, which is not stored whole, is built again within its
 bounds), outside the component's lock, which every settlement takes, and
-keeps it until the record names another. `acquire` pins the build's
-directory until the query is done: the index reads the tree it was built
+keeps it until the record names another. A commit is loaded once however
+many queries ask for it at once, and the load goes on when the query that
+began it gives up (`open1`, `load`). `acquire` pins the build's directory
+until the query is done, and loads only a build that is on disk once
+pinned: the index reads the tree it was built
 from, so the sweep leaves a pinned build alone, also once a newer build
 has replaced it, and takes it when its last query has ended; the replaced
 index is closed then too. An index that cannot be loaded is treated as
@@ -7725,11 +7728,14 @@ the scope, the access mark and the request metric of the source control
 reads, bounded by `[scm].read_timeout` (`query`). Their shared checks
 (`prepare`) run in the order the API documents and end in the waiting rule
 (`await`): the head of the default branch is read when the request
-arrives, and the request goes on once the record names that commit or the
-branch's head as it is then. A waiter takes the component's settlement
-channel before it reads the record and is woken when the settlement of a
-build has committed (`settled` closes the channel), so it reads the store
-once per build and never polls; it queues a build when none is pending,
+arrives, and the request goes on once the record names that commit, the
+branch's head as it is then, or a commit with the arrival head in its
+history (`notOlder`). A waiter takes the component's settlement channel
+before it reads the record and is woken when the settlement of any
+workspace's build has committed, or a workspace's builds were stopped
+(`wake` closes the channel), so it reads the store once per such event and
+never polls; it reads the workspace again each time, so a setting turned
+off meanwhile ends its wait; it queues a build when none is pending,
 and is refused at once when the last build of the head failed and waits
 for its retry. Code search asks the index through its `code_search` tool
 with no context lines and answers the lines the tool marks as matches;

@@ -86,6 +86,8 @@ type Component struct {
 	// is not pinned.
 	pins     map[string]int
 	removing map[string]bool
+	// loads are the loads of an index under way, by slug/commit.
+	loads map[string]*load
 	// changed is closed, and replaced, whenever the settlement of a build
 	// has committed: what a query that waits for the index waits on.
 	changed chan struct{}

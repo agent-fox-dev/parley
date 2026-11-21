@@ -4545,8 +4545,8 @@ is another route and needs no index.
 
 **The waiting rule.** An answer never comes from a commit older than the
 head of the default branch at the time the request arrived. When the index
-holds that head, or a head the branch reached after it, the answer is
-immediate. Otherwise the request waits for the build, which it queues when
+holds that head, the branch's head as it is now, or a commit that has the
+arrival head in its history, the answer is immediate. Otherwise the request waits for the build, which it queues when
 none is on its way, for at most the read timeout:
 
 - when the wait runs out: `503` `code_index_not_ready` with `Retry-After: 5`
@@ -4592,7 +4592,7 @@ Answers the files of the default branch that match a query, best first.
 | `workspace` | the workspace whose index answered: `{slug}`, or its parent for a fork |
 | `indexed_sha` | the commit the index that answered was built from |
 | `partial` | `true` when a bound stopped the build of that index, which then holds some of the files |
-| `truncated` | `true` when more files matched than `limit` |
+| `truncated` | `true` when more files matched than `limit`, and when the index cut an answer of more than 50 KB of matching text, which then holds fewer files than matched |
 | `files` | the files that match, in rank order; `[]` when none does |
 
 A file has `path`, `language` (the outline route's name for the path's
@@ -4622,7 +4622,7 @@ given name, from the outlines the index collected when it was built.
 
 | Parameter | Meaning |
 |---|---|
-| `name` | the start of the name, required, 1 to 200 characters. It is matched without regard to case unless it has an upper-case letter |
+| `name` | the start of the name, required, 1 to 200 characters. It is matched without regard to case unless it has an upper-case letter; a name with a `.` is matched as container and name (`Router.New`) |
 | `exact` | `true` or `false` (default): only the declarations of exactly that name |
 | `kind` | only the declarations of this kind: `func`, `method`, `type`, `class`, `interface`, `enum`, `trait`, `const`, `var`, `module` or `macro`, in any letter case |
 | `path` | only the declarations in this file or under this directory, a path of the repository as the source control reads take it |
@@ -4641,7 +4641,7 @@ has `path`, `kind`, `name`, `container`, `signature`, `exported`,
 | `304 Not Modified` | the caller's copy is current |
 | `400` `invalid_request` | no `name` or one over 200 characters; an `exact` that is neither `true` nor `false`; a `kind` that is none of the kinds; a `path` the source control reads refuse; a `limit` that is no integer from 1 to 50 |
 | `409` `code_index_partial` | the index is partial: symbols need a complete index. The error object has `indexed_sha`; code search answers from a partial index |
-| `422` `too_many_matches` | more than 1,000 declarations match: give a longer name, a kind or a path |
+| `422` `too_many_matches` | more than 1,000 declarations match: give a longer name, a kind or a path. A `path` that names a file is judged by its directory |
 | `404` `code_index_disabled`, `409` `code_index_off`, `404` `ref_not_found`, `503` `code_index_not_ready` | see [Code search and symbols](#code-search-and-symbols) |
 | `503` `scm_timeout` | the read ran out of the read timeout |
 

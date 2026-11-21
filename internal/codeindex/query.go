@@ -57,10 +57,14 @@ func (c *Component) query(op string, h server.HandlerFunc) server.HandlerFunc {
 		// A refusal carries none of the caching headers its handler set
 		// before it failed.
 		uncached := scm.Uncached(w.Header())
+		failed := true
+		defer func() {
+			if failed {
+				uncached()
+			}
+		}()
 		err := h(w, r.WithContext(ctx))
-		if err != nil {
-			uncached()
-		}
+		failed = err != nil
 		if _, answered := errors.AsType[*server.Error](err); err != nil && !answered && context.Cause(ctx) == errReadTimeout {
 			err = server.NewError("scm_timeout", http.StatusServiceUnavailable,
 				fmt.Sprintf("the read did not finish within the read timeout of %s", c.deps.ReadTimeout))
@@ -108,8 +112,7 @@ func (c *Component) prepare(w http.ResponseWriter, r *http.Request, params func(
 		return target{}, server.NotFound("workspace not found")
 	}
 	if !ws.Indexed {
-		return target{}, server.NewError("code_index_off", http.StatusConflict,
-			fmt.Sprintf("workspace %q has its code index off; set %s to true to search it", ws.Slug, SettingName))
+		return target{}, indexOff(ws)
 	}
 	head, err := c.headOf(ctx, ws)
 	if err != nil {
@@ -146,44 +149,57 @@ func (c *Component) await(w http.ResponseWriter, r *http.Request, ws Workspace, 
 	for {
 		// Taken before the record is read: a settlement after this wakes.
 		settled := c.settlements()
+		// The workspace as it is now: its setting may have been turned off
+		// while the request waited.
+		now, found, err := c.deps.Workspace(ctx, ws.Slug)
+		if err != nil {
+			return Record{}, err
+		}
+		if !found {
+			return Record{}, server.NotFound("workspace not found")
+		}
+		if !now.Indexed {
+			return Record{}, indexOff(now)
+		}
 		rec, _, err := c.Record(ctx, ws.Slug)
 		if err != nil {
 			return Record{}, err
 		}
-		head, err := c.headOf(ctx, ws)
+		head, err := c.headOf(ctx, now)
 		if err != nil {
 			return Record{}, err
 		}
-		if rec.IndexedSHA != "" && (rec.IndexedSHA == arrival || rec.IndexedSHA == head) && c.stored(ws.Slug, rec.IndexedSHA) {
-			observe(waitReady)
-			return rec, nil
-		}
-		pending, err := c.deps.Jobs.List(ctx, JobType, ws.Slug, "", nil, 4)
-		if err != nil {
-			return Record{}, err
-		}
-		var failed *jobs.Job
-		building := false
-		for i, j := range pending {
-			switch j.Status {
-			case jobs.StatusQueued, jobs.StatusRunning:
-				building = true
-			case jobs.StatusFailed:
-				failed = &pending[i]
+		if rec.IndexedSHA != "" && c.onDisk(ws.Slug, rec.IndexedSHA) {
+			ok, err := c.notOlder(ctx, ws, rec.IndexedSHA, arrival, head)
+			if err != nil {
+				return Record{}, err
+			}
+			if ok {
+				observe(waitReady)
+				return rec, nil
 			}
 		}
+		running, err := c.pending(ctx, ws.Slug, jobs.StatusRunning, jobs.StatusQueued)
+		if err != nil {
+			return Record{}, err
+		}
+		failed, err := c.pending(ctx, ws.Slug, jobs.StatusFailed)
+		if err != nil {
+			return Record{}, err
+		}
 		switch {
-		case building:
-		case failed != nil && rec.FailedSHA == head:
+		case len(running) > 0:
+		case len(failed) > 0 && rec.FailedSHA == head:
 			retry := 1
-			if failed.NextAttemptAt != nil {
-				retry = max(1, int(math.Ceil(failed.NextAttemptAt.Sub(c.deps.Now()).Seconds())))
+			if failed[0].NextAttemptAt != nil {
+				retry = max(1, int(math.Ceil(failed[0].NextAttemptAt.Sub(c.deps.Now()).Seconds())))
 			}
 			observe(waitFailed)
 			return Record{}, c.notReady(w, StateFailed, retry, head, rec)
 		default:
-			// No build is on its way: the notice of this head was lost, or
-			// the failed build is of an older one.
+			// No build is on its way: the notice of this head was lost, the
+			// index's files are gone, or the failed build is of an older
+			// head.
 			if err := c.Queue(ctx, ws.Slug); err != nil {
 				return Record{}, err
 			}
@@ -198,6 +214,51 @@ func (c *Component) await(w http.ResponseWriter, r *http.Request, ws Workspace, 
 			return Record{}, c.notReady(w, StateBuilding, retryAfterBuild, head, rec)
 		}
 	}
+}
+
+// notOlder reports whether an index of the commit indexed satisfies the
+// waiting rule for a request that arrived at the head arrival: it is that
+// commit, or the branch's head as it is now, or a commit that has arrival
+// in its history, which the branch reached after it.
+func (c *Component) notOlder(ctx context.Context, ws Workspace, indexed, arrival, head string) (bool, error) {
+	if indexed == arrival || indexed == head {
+		return true, nil
+	}
+	repo, err := c.deps.Repos(ctx, ws.Slug)
+	if err != nil {
+		return false, nil
+	}
+	return repo.IsAncestor(ctx, arrival, indexed)
+}
+
+// pending are the build jobs of the workspace slug in one of statuses, at
+// most one of each.
+func (c *Component) pending(ctx context.Context, slug string, statuses ...string) ([]jobs.Job, error) {
+	var all []jobs.Job
+	for _, status := range statuses {
+		found, err := c.deps.Jobs.List(ctx, JobType, slug, status, nil, 1)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, found...)
+	}
+	return all, nil
+}
+
+// indexOff is the refusal of a query of a workspace whose setting is off.
+func indexOff(ws Workspace) error {
+	return server.NewError("code_index_off", http.StatusConflict,
+		fmt.Sprintf("workspace %q has its code index off; set %s to true to search it", ws.Slug, SettingName))
+}
+
+// unavailable is err as a query answers it when its index went away
+// between the waiting rule and its use: the refusal of an index that is not
+// ready, for the client to ask again.
+func (c *Component) unavailable(w http.ResponseWriter, err error, t target) error {
+	if !errors.Is(err, ErrNoIndex) && !errors.Is(err, errReplaced) {
+		return err
+	}
+	return c.notReady(w, StateBuilding, retryAfterBuild, t.head, t.rec)
 }
 
 // headOf is the head of the default branch of ws. A workspace without one,
@@ -283,7 +344,7 @@ func (c *Component) getSearch(w http.ResponseWriter, r *http.Request) error {
 	// it meanwhile closes it only afterwards.
 	idx, indexed, done, err := c.acquire(ctx, t.ws.Slug)
 	if err != nil {
-		return err
+		return c.unavailable(w, err, t)
 	}
 	defer done()
 	// The answer is the index's of this commit to this query: a caller who
@@ -368,29 +429,42 @@ func (c *Component) getSymbols(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	if t.rec.Partial {
+	partialOf := func(rec Record) error {
 		return server.NewError("code_index_partial", http.StatusConflict,
 			fmt.Sprintf("the code index of %q is partial: symbols need a complete index; scm/code-search answers from a partial one", t.ws.Slug)).
-			With("indexed_sha", t.rec.IndexedSHA)
+			With("indexed_sha", rec.IndexedSHA)
+	}
+	// Refused from the record, before a partial index is loaded.
+	if t.rec.Partial {
+		return partialOf(t.rec)
 	}
 	ctx := r.Context()
+	idx, indexed, done, err := c.acquire(ctx, t.ws.Slug)
+	if err != nil {
+		return c.unavailable(w, err, t)
+	}
+	defer done()
+	if indexed != t.rec.IndexedSHA {
+		// A newer build's index: its own record says whether it is partial.
+		if rec, _, err := c.Record(ctx, t.ws.Slug); err != nil {
+			return err
+		} else if rec.IndexedSHA == indexed && rec.Partial {
+			return partialOf(rec)
+		}
+	}
 	// The index looks under a directory; for a file it is asked for the
-	// file's directory and the file's declarations are kept.
+	// file's directory and the file's declarations are kept. The tree is
+	// the one of the index that answers, which the query holds.
 	q.Dir = path
 	file := ""
 	if path != "" {
-		if info, err := os.Lstat(filepath.Join(c.TreeDir(t.ws.Slug, t.rec.IndexedSHA), filepath.FromSlash(path))); err == nil && !info.IsDir() {
+		if info, err := os.Lstat(filepath.Join(c.TreeDir(t.ws.Slug, indexed), filepath.FromSlash(path))); err == nil && !info.IsDir() {
 			file = path
 			if q.Dir = pathpkg.Dir(path); q.Dir == "." {
 				q.Dir = ""
 			}
 		}
 	}
-	idx, indexed, done, err := c.acquire(ctx, t.ws.Slug)
-	if err != nil {
-		return err
-	}
-	defer done()
 	if scm.Revalidated(w, r, indexed) {
 		return nil
 	}

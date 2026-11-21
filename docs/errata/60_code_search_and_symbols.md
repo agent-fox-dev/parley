@@ -28,6 +28,25 @@ reads, and the sweep that removes the builds a newer one replaced leaves a
 pinned one until its last query has ended. The test of searches against
 concurrent commits found this.
 
+## A head the branch reached after arrival is told by its history
+
+The package lets an index of "a head the default branch reached after" the
+arrival head answer, and has the hub compare the record with the arrival
+head and the branch's current head. Under commits that arrive faster than
+builds end, an index is of a commit that is neither, and a request would
+wait for a build that is always one behind. The hub also accepts a commit
+that has the arrival head in its history (`git merge-base --is-ancestor`,
+read in process). A head that was moved to a commit outside that history,
+by a forced ref move, answers once it is the branch's current head.
+
+## truncated is also true for an answer the index cut by size
+
+`truncated` is "true exactly when more files matched". agentkit-go's
+`code_search` also cuts an answer whose matching text is over 50 KB, drops
+whole files for it and reports that as truncated; the hub has no other way
+to ask. Such an answer holds fewer files than `limit` and says
+`truncated: true`.
+
 ## A workspace without a head is 404 ref_not_found
 
 The package answers such a workspace "as `GET …/scm/tree` without a ref
@@ -47,5 +66,10 @@ answers for it". That is `404` `ref_not_found`, with the message
   loading is what a first query after a restart pays, tagged or not.
 - A symbols request to a partial index is refused from the record, before
   the index is loaded.
+- An index that goes away between the waiting rule and its use (its
+  setting was turned off, its files could not be loaded) is answered
+  `503 code_index_not_ready` with `Retry-After: 5`, not an internal error.
+- A `path` that names a file is judged against the 1,000 declarations by
+  its directory, since that is what the index is asked for.
 - `internal/scm` exports three small helpers for the reads this package
   serves: `CheckPath`, `Revalidated` and `Uncached`.

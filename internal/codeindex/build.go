@@ -51,6 +51,9 @@ type Workspace struct {
 type Repository interface {
 	ResolveBranch(ctx context.Context, branch string) (id string, found bool, err error)
 	WriteTree(ctx context.Context, commit, dir string) (written int, err error)
+	// IsAncestor reports whether the commit ancestor is reachable from the
+	// commit descendant.
+	IsAncestor(ctx context.Context, ancestor, descendant string) (bool, error)
 }
 
 // attempt is what one attempt of a build job did, kept from its run to its
@@ -435,7 +438,28 @@ func (c *Component) sweepWorkspace(ctx context.Context, slug string) error {
 		}
 		c.mu.Unlock()
 		c.release(slug, "")
-		return os.RemoveAll(dir)
+		c.wake()
+		// A build a query still reads stays until that query has ended,
+		// which sweeps again.
+		builds, err := os.ReadDir(dir)
+		if err != nil {
+			return err
+		}
+		var failures []error
+		kept := false
+		for _, b := range builds {
+			removed, ok := c.claimRemoval(slug, b.Name())
+			if !ok {
+				kept = true
+				continue
+			}
+			failures = append(failures, os.RemoveAll(filepath.Join(dir, b.Name())))
+			removed()
+		}
+		if !kept {
+			failures = append(failures, os.Remove(dir))
+		}
+		return errors.Join(failures...)
 	}
 	builds, err := os.ReadDir(dir)
 	if err != nil {
@@ -528,15 +552,35 @@ func (c *Component) acquire(ctx context.Context, slug string) (idx Index, sha st
 		}
 		sha := rec.IndexedSHA
 		// The record may name another commit by now, and the sweep may be
-		// taking this one's directory: then the record is read again.
-		if !c.pin(slug, sha) {
+		// taking this one's directory, or have taken it: then the record
+		// is read again. Only a pinned build that is on disk is loaded; an
+		// index made over a tree that is gone would hold no file.
+		again := func() (retry bool, err error) {
 			if attempt >= acquireTries {
-				return nil, "", nil, fmt.Errorf("%w that stays long enough to be loaded", ErrNoIndex)
+				return false, fmt.Errorf("%w that stays long enough to be loaded", ErrNoIndex)
 			}
 			select {
 			case <-ctx.Done():
-				return nil, "", nil, context.Cause(ctx)
+				return false, context.Cause(ctx)
 			case <-time.After(time.Millisecond):
+				return true, nil
+			}
+		}
+		if !c.pin(slug, sha) {
+			if retry, err := again(); !retry {
+				return nil, "", nil, err
+			}
+			continue
+		}
+		if !c.onDisk(slug, sha) {
+			c.unpin(slug, sha)
+			if now, _, recErr := c.Record(ctx, slug); recErr == nil && now.IndexedSHA == sha {
+				// The record's own build is gone: no index; its build is
+				// queued by whoever waits for it.
+				return nil, "", nil, fmt.Errorf("%w on disk", ErrNoIndex)
+			}
+			if retry, err := again(); !retry {
+				return nil, "", nil, err
 			}
 			continue
 		}
@@ -552,10 +596,22 @@ func (c *Component) acquire(ctx context.Context, slug string) (idx Index, sha st
 		if now, _, recErr := c.Record(ctx, slug); recErr == nil && now.IndexedSHA != sha && attempt < acquireTries {
 			continue
 		}
-		_ = os.RemoveAll(c.buildDir(slug, sha))
+		// An index that cannot be loaded is none: its directory goes,
+		// unless another query still reads it, and its build is queued.
+		if removed, ok := c.claimRemoval(slug, sha); ok {
+			_ = os.RemoveAll(c.buildDir(slug, sha))
+			removed()
+		}
 		go func() { _ = c.Queue(context.WithoutCancel(ctx), slug) }()
 		return nil, "", nil, fmt.Errorf("%w that can be loaded: %w", ErrNoIndex, err)
 	}
+}
+
+// onDisk reports whether the tree and the stored index of the build of sha
+// are there.
+func (c *Component) onDisk(slug, sha string) bool {
+	tree, err := os.Stat(c.TreeDir(slug, sha))
+	return err == nil && tree.IsDir() && c.stored(slug, sha)
 }
 
 // acquireTries is how often acquire reads the record again when the index
@@ -564,17 +620,70 @@ const acquireTries = 50
 
 // open1 is the loaded index of the build of the commit sha of the
 // workspace slug, with one more use counted; the caller has pinned the
-// build's directory.
+// build's directory. A commit is loaded once however many callers ask for
+// it at once, and the load goes on when the caller that began it gives up,
+// so that a load longer than one request's time, such as a partial index
+// built again, still ends for the requests after it.
 func (c *Component) open1(ctx context.Context, slug, sha string) (*openIndex, error) {
+	key := slug + "/" + sha
 	c.mu.Lock()
 	if o := c.open[slug]; o != nil && o.sha == sha {
 		o.uses++
 		c.mu.Unlock()
 		return o, nil
 	}
+	l := c.loads[key]
+	if l == nil {
+		l = &load{done: make(chan struct{})}
+		if c.loads == nil {
+			c.loads = map[string]*load{}
+		}
+		c.loads[key] = l
+		// The load's own pin: its caller may leave before it ends.
+		if c.pins == nil {
+			c.pins = map[string]int{}
+		}
+		c.pins[key]++
+		go c.load(slug, sha, l)
+	}
 	c.mu.Unlock()
-	// The load runs outside the lock, which every settlement of a build
-	// takes: a load may copy a large index, or build a partial one again.
+	select {
+	case <-l.done:
+	case <-ctx.Done():
+		return nil, context.Cause(ctx)
+	}
+	if l.err != nil {
+		return nil, l.err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if o := c.open[slug]; o != nil && o.sha == sha {
+		o.uses++
+		return o, nil
+	}
+	// Loaded, and replaced by a newer build before this caller came back.
+	return nil, errReplaced
+}
+
+// errReplaced is the error of a load whose index a newer build replaced
+// before its caller could use it.
+var errReplaced = errors.New("the index was replaced while it was loaded")
+
+// load is one load of an index, which the callers that asked for it wait
+// for.
+type load struct {
+	done chan struct{}
+	err  error
+}
+
+// load loads the index of the build of sha for the callers that wait on l.
+// It runs outside the lock, which every settlement of a build takes: a
+// load may copy a large index, or build a partial one again.
+func (c *Component) load(slug, sha string, l *load) {
+	key := slug + "/" + sha
+	// Bounded like a build: a partial index is built again here.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*c.deps.Settings.BuildTimeout+time.Minute)
+	defer cancel()
 	dir := c.buildDir(slug, sha)
 	loaded, err := c.deps.Open(filepath.Join(dir, treeDir), filepath.Join(dir, storeDir), filepath.Join(dir, scratchDir), c.bounds())
 	if err == nil {
@@ -584,26 +693,21 @@ func (c *Component) open1(ctx context.Context, slug, sha string) (*openIndex, er
 			_ = loaded.Close()
 		}
 	}
-	if err != nil {
-		return nil, err
-	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if o := c.open[slug]; o != nil {
-		if o.sha == sha {
-			// Another caller loaded it meanwhile.
-			_ = loaded.Close()
-			o.uses++
-			return o, nil
+	delete(c.loads, key)
+	l.err = err
+	if err == nil {
+		if o := c.open[slug]; o != nil {
+			c.retire(slug, o)
 		}
-		c.retire(slug, o)
+		if c.open == nil {
+			c.open = map[string]*openIndex{}
+		}
+		c.open[slug] = &openIndex{slug: slug, sha: sha, idx: loaded}
 	}
-	if c.open == nil {
-		c.open = map[string]*openIndex{}
-	}
-	o := &openIndex{slug: slug, sha: sha, idx: loaded, uses: 1}
-	c.open[slug] = o
-	return o, nil
+	c.mu.Unlock()
+	close(l.done)
+	c.unpin(slug, sha)
 }
 
 // pin keeps the directory of the build of the commit sha of the workspace
@@ -633,8 +737,11 @@ func (c *Component) unpin(slug, sha string) {
 	if last {
 		delete(c.pins, key)
 	}
+	// A build the workspace's loaded index is of is the record's, which
+	// the sweep keeps anyway; any other was replaced and may go now.
+	replaced := c.open[slug] == nil || c.open[slug].sha != sha
 	c.mu.Unlock()
-	if last {
+	if last && replaced {
 		go func() { _ = c.sweepWorkspace(context.Background(), slug) }()
 	}
 }
@@ -731,6 +838,8 @@ func (c *Component) Stop(ctx context.Context, slug string) error {
 		return err
 	})
 	c.deps.Jobs.Interrupt(JobType, slug)
+	// Whoever waits for a build of it is told that none will come.
+	c.wake()
 	return err
 }
 

@@ -201,8 +201,8 @@ func TestSearch_RefusesAQueryOrALimitItDoesNotTake(t *testing.T) {
 		{"limit not a number", "q=a&limit=x", "limit"},
 	} {
 		a := w.ask(t, "demo", "code-search", tc.query, w.key)
-		if r := a.refusal(); a.code != http.StatusBadRequest || r.Error.ErrorType != "invalid_request" || !strings.Contains(r.Error.Message, tc.names) {
-			t.Errorf("%s: %d %s, want 400 invalid_request with a message naming %s", tc.name, a.code, a.body, tc.names)
+		if r := a.refusal(); a.code != http.StatusBadRequest || r.Error.ErrorType != "invalid_request" || !strings.HasPrefix(r.Error.Message, tc.names+" ") {
+			t.Errorf("%s: %d %s, want 400 invalid_request with a message that begins with the parameter %s", tc.name, a.code, a.body, tc.names)
 		}
 	}
 	s.mu.Lock()
@@ -217,12 +217,18 @@ func TestSearch_RefusesAQueryTheIndexCannotParseWithItsParsersMessage(t *testing
 	w := newWorld(t, enabled)
 	w.addWorkspace(t, "demo", map[string]string{"a.go": "package a\n"})
 	w.indexed(t, "demo")
+	messages := map[string]bool{}
 	for _, q := range []string{"(unclosed", "file:[", "a)"} {
 		a := w.ask(t, "demo", "code-search", "q="+url.QueryEscape(q), w.key)
 		r := a.refusal()
-		if a.code != http.StatusBadRequest || r.Error.ErrorType != "invalid_query" || r.Error.Message == "" || a.header.Get("ETag") != "" {
+		if a.code != http.StatusBadRequest || r.Error.ErrorType != "invalid_query" || len(r.Error.Message) < 8 || a.header.Get("ETag") != "" {
 			t.Errorf("q=%s: %d %s, want 400 invalid_query with the parser's message and no ETag", q, a.code, a.body)
 		}
+		messages[r.Error.Message] = true
+	}
+	// The parser says what is wrong with each, not one sentence for all.
+	if len(messages) != 3 {
+		t.Errorf("the three queries are refused with the messages %v, want the parser's own for each", messages)
 	}
 }
 

@@ -383,6 +383,16 @@ func (s *seam) hold(part string) (release func()) {
 	return sync.OnceFunc(func() { close(ch) })
 }
 
+// holdOnly is hold without forgetting the builds that began before: for a
+// second hold while the first still holds a build.
+func (s *seam) holdOnly(part string) (release func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch := make(chan struct{})
+	s.held[part] = ch
+	return sync.OnceFunc(func() { close(ch) })
+}
+
 // failWith sets what the builds fail with.
 func (s *seam) failWith(fail func(tree string) error) {
 	s.mu.Lock()
@@ -433,10 +443,10 @@ type seamIndex struct {
 func (i seamIndex) Build(ctx context.Context) error {
 	s := i.seam
 	s.mu.Lock()
-	var wait chan struct{}
+	var wait []chan struct{}
 	for part, ch := range s.held {
 		if strings.Contains(i.tree, part) {
-			wait = ch
+			wait = append(wait, ch)
 		}
 	}
 	s.mu.Unlock()
@@ -444,9 +454,9 @@ func (i seamIndex) Build(ctx context.Context) error {
 	case s.began <- i.tree:
 	default:
 	}
-	if wait != nil {
+	for _, held := range wait {
 		select {
-		case <-wait:
+		case <-held:
 		case <-ctx.Done():
 			select {
 			case s.ended <- i.tree:
