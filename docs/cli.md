@@ -3003,6 +3003,8 @@ the hub to judge; a boolean flag sends its value below when given.
 | `parley scm blame <slug> <path> [--ref <rev>] [--lines <start>:<end>]` | `GET …/scm/blame` | `path`, `ref`, `--lines` `start_line` and `end_line` |
 | `parley scm outline <slug> <path> [--ref <rev>]` | `GET …/scm/outline` | `path`, `ref` |
 | `parley scm code-index <slug>` | `GET …/scm/code-index` | none |
+| `parley scm code-search <slug> <query> [--limit <n>]` | `GET …/scm/code-search` | `q`, `limit` |
+| `parley scm symbols <slug> <name> [--exact] [--kind <kind>] [--path <path>] [--limit <n>]` | `GET …/scm/symbols` | `name`, `exact=true`, `kind`, `path`, `limit` |
 | `parley scm search <slug> <query> [--ref <rev>] [--path <glob>]... [--regex] [--ignore-case]` | `GET …/scm/search` | `q`, `ref`, one `path` per `--path`, `regex=true`, `--ignore-case` `case_sensitive=false` |
 
 `parley scm search demo 'to do' --ref v1 --path 'src/**' --path '*.go'
@@ -3301,7 +3303,7 @@ exits `0` without a session; it needs a hub and a credential only with
 **Which commands are tools.** `--groups` names command groups (the first
 word of a command), separated by commas. A name alone serves the group's
 commands; `name:read` only those whose route is a `GET`. The default is
-`activity,change,claim,fork,land,sandbox,scm,workspace:read`, 70 tools
+`activity,change,claim,fork,land,sandbox,scm,workspace:read`, 72 tools
 today. A group named twice is a `usage_error`. `--read-only` narrows
 whatever is selected to `GET` commands, and leaves out of those the flags
 that make one write to the hub (`withdraw` of `change_approvals`), as
