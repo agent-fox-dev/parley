@@ -1,16 +1,51 @@
 # Performance targets
 
-The hub's performance targets are an initial bar, to be revisited with
-measurements. `test/perf` measures them against one running hub: it is a
-black-box HTTP client of that hub and imports no code of the project. A
-missed target never fails a test run; the report says, per target, what was
+## Why there are targets
+
+Parley is built for many agents working on one repository at once. That
+only works if the things an agent does all day are fast enough not to be
+worth avoiding: forking for a task, reading a file, committing, landing.
+The targets put a number on each of them, and on how much one hub holds,
+so that "fast enough" can be measured and a regression noticed.
+
+They promise this much: one hub on a host with 8 cores, 32 GB of memory and
+local SSD storage, with repositories of up to 5 GB of history, meets them.
+They are an initial bar, to be revisited with measurements, not a
+guarantee for every host. Because they are stated for a host of that size,
+they are measured against a hub you provide and never in the ordinary test
+run, and a missed target never fails a test: the report says what was
 measured and whether the target was met.
 
-The targets are stated for a host of 8 cores and 32 GB with repositories of
-up to 5 GB, so the harness runs against a hub the operator provides, never
-in the ordinary test run.
+## The targets
 
-## Running it
+Fourteen scenarios, run one after the other in this order:
+
+| Scenario | What is done | Measured | Target |
+|---|---|---|---|
+| `fork_create` | 50 forks created one after the other | p95 of the request duration | under 1000 ms |
+| `file_read` | 200 reads, alternately a file and a tree | p95 | under 100 ms |
+| `commit_create` | 50 commits of 100 files each | p95 | under 500 ms |
+| `land` | 20 changes of 20 commits each, landed one at a time | p95 from the land request to the attempt's success | under 2000 ms |
+| `land_throughput` | 120 one-commit changes, at most 8 land requests in flight | changes landed per minute | at least 60 |
+| `land_concurrency` | 16 non-conflicting changes landed at the same time | land attempts that did not succeed | 0 |
+| `mergeability` | 100 open changes, then the target branch moves | seconds until none reports `mergeable` `unknown` | at most 60 |
+| `event_latency` | 50 commits with a subscriber on the event stream | the largest time from a commit's response to its event | at most 1000 ms |
+| `active_forks` (capacity) | forks created over all listed workspaces | forks that exist at once | at least 5000 |
+| `open_changes` (capacity) | changes opened in the first workspace | open changes | at least 2000 |
+| `event_streams` (capacity) | event streams opened | streams open at once | at least 500 |
+| `sandboxes_running` (capacity, sandbox) | sandboxes created | sandboxes `provisioning` or `ready` | at least 200 |
+| `sandbox_ready` (sandbox) | 5 sandboxes created one after the other | the largest time from the create response to `ready` | at most 60 s |
+| `sandbox_exec` (sandbox) | 50 execs of `true` in one sandbox | p95 of the request duration, an upper bound of what the hub adds | under 200 ms |
+
+p95 is the nearest-rank percentile: of n samples sorted ascending, the one
+at position ⌈0.95·n⌉. A capacity scenario creates until it reaches its
+target or the hub refuses; the count reached is the measurement.
+
+## Measuring a hub
+
+The harness in `test/perf` is an HTTP client like any other: it measures
+what a client sees. Give it a running hub, a user's credential with write
+access, and one or more cloned workspaces:
 
 ```sh
 PARLEY_PERF_URL=https://hub.example PARLEY_PERF_TOKEN=... PARLEY_PERF_WORKSPACE=acme-app \
@@ -19,77 +54,27 @@ PARLEY_PERF_URL=https://hub.example PARLEY_PERF_TOKEN=... PARLEY_PERF_WORKSPACE=
 
 | Variable | Meaning |
 |---|---|
-| `PARLEY_PERF_URL` | the hub's base URL. Unset: `TestPerformanceTargets` is skipped, with a message naming the variable |
-| `PARLEY_PERF_TOKEN` | a user's credential with write access to the workspaces |
-| `PARLEY_PERF_WORKSPACE` | one or more slugs of cloned workspaces, separated by commas. The first is used by every scenario; the others only by `active_forks` |
-| `PARLEY_PERF_SANDBOX_PROFILE` | a sandbox profile. Unset: the three sandbox scenarios are `skipped` |
-| `PARLEY_PERF_CAPACITY` | `1` runs the four capacity scenarios. Otherwise they are `skipped` |
+| `PARLEY_PERF_URL` | the hub's base URL; unset, the test is skipped |
+| `PARLEY_PERF_TOKEN` | a user's credential with write access to the workspaces; required |
+| `PARLEY_PERF_WORKSPACE` | slugs of cloned workspaces, separated by commas; required. Every scenario uses the first; `active_forks` uses all |
+| `PARLEY_PERF_SANDBOX_PROFILE` | a sandbox profile; unset, the three sandbox scenarios are `skipped` |
+| `PARLEY_PERF_CAPACITY` | `1` runs the four capacity scenarios; otherwise they are `skipped` |
 | `PARLEY_PERF_REPORT` | where the report is written; default `parley-perf-report.json` in the system's temporary directory |
 
-With `PARLEY_PERF_URL` set, the test fails only when the harness cannot do
-its job: `PARLEY_PERF_TOKEN` or `PARLEY_PERF_WORKSPACE` is unset (the
-message names the variable), `GET /version` does not answer 200 within 10
-seconds (the message names the URL, and no scenario runs), or the report
-cannot be written (the message names the path). A missed target, a skipped
-scenario and a scenario that ends in an error never fail it.
+The test fails only when the harness cannot do its job: a required
+variable is unset, the hub does not answer `GET /version` with 200 within
+10 seconds, or the report cannot be written.
 
-## Scenarios
+The harness never writes to a default branch. It works on a branch
+`perf/<run id>` and branches `perf-<run id>/<scenario>/<n>` of the first
+workspace and on forks of its own. After each scenario it deletes its forks
+and sandboxes, closes its streams and abandons the changes `open_changes`
+opened. The branches, and the changes the latency scenarios landed or left
+open, stay: use a workspace made for measuring.
 
-Fourteen, run one after the other in this order:
+## Reading the report
 
-| Name | What is done | Measured | Target |
-|---|---|---|---|
-| `fork_create` | 50 forks created one after the other | p95 of the request duration, ms | under 1000 |
-| `file_read` | 200 reads, alternately a file and a tree | p95, ms | under 100 |
-| `commit_create` | 50 commits of 100 files each on a branch of the run | p95, ms | under 500 |
-| `land` | 20 changes of 20 commits each with disjoint files, landed one at a time | p95 of the time from the land request to the land attempt's success, ms | under 2000 |
-| `land_throughput` | 120 one-commit changes with disjoint files, at most 8 land requests in flight | changes landed × 60 ÷ seconds elapsed | at least 60 per minute |
-| `land_concurrency` | 16 land requests for 16 non-conflicting changes sent at the same time | land attempts that did not end in success | at most 0 |
-| `mergeability` | 100 open changes; the target branch moved by landing one more | seconds until none of the 100 reports `mergeable` `unknown` (polled at most once a second) | at most 60 |
-| `event_latency` | a subscriber on `GET /events`; 50 commits created one after the other | the largest time from a commit's response to its event's arrival, ms | at most 1000 |
-| `active_forks` (capacity) | forks created over all listed workspaces until 5,000 exist or every workspace refuses | forks that exist at once | at least 5000 |
-| `open_changes` (capacity) | changes opened in the first workspace until 2,000 are open or the hub refuses | open changes | at least 2000 |
-| `event_streams` (capacity) | `GET /events` connections opened until 500 are open or the hub refuses | connections open at once | at least 500 |
-| `sandboxes_running` (capacity, sandbox) | sandboxes created until 200 are `provisioning` or `ready` or the hub refuses | sandboxes in those states | at least 200 |
-| `sandbox_ready` (sandbox) | 5 sandboxes created one after the other | the largest time from the create response to state `ready`, s | at most 60 |
-| `sandbox_exec` (sandbox) | 50 execs of the command `true` in one sandbox | p95 of the request duration, ms (an upper bound of the hub's overhead) | under 200 |
-
-p95 is the nearest-rank percentile: of n samples sorted ascending, the one
-at position ⌈0.95·n⌉.
-
-A scenario is `met` when its measurement satisfies the target, `missed` when
-it does not, `skipped` when the variable it needs is not set (the detail
-names the variable), and `error` when a request that is not its expected
-stop is answered with 400 or more or fails in transport, or when it runs
-past its deadline (10 minutes; 60 for a capacity scenario). The detail of an
-`error` names the method, the path, the status and the `error_type` of the
-first failing request, or says `deadline exceeded`. For a capacity scenario
-the hub's refusal of a creation is the expected stop: the count reached is
-the measurement, and the detail says `refused with <status> <error_type>
-after <count>`, then the method, the path and the hub's message;
-`active_forks`, which fills each workspace in turn, writes one
-`<workspace> refused with <status> <error_type> after <count>` per
-workspace that refused, separated by `; `. A scenario that ends in `error` does not stop the run.
-
-The default limits (200 forks per workspace, 20 sandboxes per user) are
-below two capacity targets: list enough workspaces or raise the limits, and
-the report shows what was reached.
-
-## What it leaves behind
-
-The harness never writes to a workspace's default branch. It creates a
-target branch `perf/<run id>` at the head of the default branch of the
-first workspace, source branches `perf-<run id>/<scenario>/<n>`, and forks
-of its own. When a scenario ends, in any verdict, it closes the event
-streams it opened, deletes the forks and sandboxes it created and abandons
-the changes `open_changes` opened. A clean-up request that fails is listed
-in the report's `cleanup_errors` and changes no verdict. The branches, and
-the changes the latency scenarios landed or left open, stay.
-
-## The report
-
-One JSON document, written to the report path and logged by the test as a
-table:
+The test logs a table and writes one JSON document:
 
 ```json
 {"hub":{"url":"https://hub.example","version":{"version":"1.4.0","commit":"3f2a1bc","build_time":"2026-01-02T03:04:05Z"}},
@@ -99,8 +84,36 @@ table:
  "cleanup_errors":[]}
 ```
 
-`results` holds the fourteen scenarios in the order above, whatever
-happened. `comparison` is `lt`, `le` or `ge`; `measured` is `null` when
-there is no measurement; `hub.version` is the document `GET /version`
-returned. The token appears nowhere in the report, and text taken from a
-hub response is cut to 200 bytes.
+`results` always holds the fourteen scenarios in order. `comparison` is
+`lt`, `le` or `ge`; `measured` is `null` when there is no measurement;
+`hub.version` is what `GET /version` returned. The token never appears, and
+text from a hub response is cut to 200 bytes.
+
+| `status` | Meaning |
+|---|---|
+| `met` | the measurement satisfies the target |
+| `missed` | it does not |
+| `skipped` | a variable the scenario needs is not set; `detail` names it |
+| `error` | a request was answered with 400 or more or failed in transport, or the scenario ran past its deadline (10 minutes, 60 for a capacity scenario); `detail` names the first failing request or says `deadline exceeded` |
+
+For a capacity scenario, `detail` says where the hub refused: `refused
+with <status> <error_type> after <count>`, per workspace for
+`active_forks`. `cleanup_errors` lists clean-up requests that failed; they
+change no verdict. An `error` in one scenario does not stop the others.
+
+## When a target is missed
+
+- **Check the host first.** The targets hold for 8 cores, 32 GB and local
+  SSD storage. On a smaller or busier host a miss says little.
+- **Check that the hub's limits allow the target.** The defaults of
+  [configuration.md](configuration.md#server-and-storage) are below two
+  capacity targets: 200 forks per workspace (list at least 25 workspaces
+  or raise `[forks].max_per_workspace`) and, for
+  [sandboxes](configuration.md#sandboxes), 20 per user and 50 per
+  workspace against a target of 200. A capacity `detail` that names a
+  limit is a configuration finding, not a performance one. A scenario
+  that ends in `error` with a `429` met the rate limit: raise
+  `[limits].requests_per_minute` for the run.
+- **Then treat it as a regression.** Run again to rule out noise, compare
+  with the report of the previous release (`hub.version` tells them
+  apart), and report the scenario, both measurements and the host.
