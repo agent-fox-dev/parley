@@ -328,13 +328,33 @@ type seam struct {
 	fail func(tree string) error
 	// partial makes every index report itself partial.
 	partial bool
-	// began receives the tree of every build that began; opened are the
-	// bounds every index was made with.
-	began  chan string
-	opened []codeindex.Bounds
+	// began receives the tree of every build that began, and ended the
+	// tree of every held build whose context ended; opened are the bounds
+	// every index was made with.
+	began, ended chan string
+	opened       []codeindex.Bounds
 }
 
-func newSeam() *seam { return &seam{held: map[string]chan struct{}{}, began: make(chan string, 64)} }
+func newSeam() *seam {
+	return &seam{held: map[string]chan struct{}{}, began: make(chan string, 64), ended: make(chan string, 64)}
+}
+
+// waitEnded waits for a held build of a tree whose path holds part to see
+// its context end.
+func (s *seam) waitEnded(t *testing.T, part string) {
+	t.Helper()
+	deadline := time.After(20 * time.Second)
+	for {
+		select {
+		case tree := <-s.ended:
+			if strings.Contains(tree, part) {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("waited 20 s for the held build of %s to be ended", part)
+		}
+	}
+}
 
 // hold makes the builds of the trees whose path holds part wait, and
 // returns what lets them go.
@@ -412,6 +432,10 @@ func (i seamIndex) Build(ctx context.Context) error {
 		select {
 		case <-wait:
 		case <-ctx.Done():
+			select {
+			case s.ended <- i.tree:
+			default:
+			}
 			return ctx.Err()
 		}
 	}

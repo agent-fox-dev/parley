@@ -215,6 +215,16 @@ func (h buildHandler) Run(ctx context.Context, j jobs.Job) error {
 		// in another directory and stays.
 		_ = os.RemoveAll(c.buildDir(ws.Slug, head))
 	}
+	if a.err != nil && ctx.Err() != nil {
+		// Ended from outside: by the hub's stop, the workspace's delete, or
+		// its setting turned off. It is no outcome of a build, and where
+		// the hub keeps no index of the workspace any more, no failure to
+		// try again.
+		if now, found, err := c.deps.Workspace(context.WithoutCancel(ctx), ws.Slug); err == nil && (!found || !c.indexes(now)) {
+			return nil
+		}
+		return a.err
+	}
 	c.keep(j.ID, a)
 	return a.err
 }
@@ -303,6 +313,7 @@ func (h buildHandler) Settled(ctx context.Context, tx *sql.Tx, j jobs.Job, _ boo
 		if err := recordBuilt(ctx, tx, a.slug, a.sha, a.partial, a.files, now); err != nil {
 			return err
 		}
+		go c.settled(a.slug)
 		if a.moved {
 			// The job is settled, so this is the workspace's one pending
 			// build, or the one a notice queued already is.
@@ -386,6 +397,7 @@ func (c *Component) Sweep(ctx context.Context) error {
 			failures = append(failures, fmt.Errorf("code index of %s: %w", e.Name(), err))
 		}
 	}
+	c.measure()
 	return errors.Join(failures...)
 }
 
@@ -399,12 +411,20 @@ func (c *Component) sweepWorkspace(ctx context.Context, slug string) error {
 	if !found || !c.indexes(ws) {
 		// A build of it may still run, for a workspace whose setting was
 		// just turned off; what it writes goes with the next pass.
-		if err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error { return RemoveWorkspace(ctx, tx, slug) }); err != nil {
+		err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+			if _, err := c.deps.Jobs.CancelPending(ctx, tx, JobType, slug); err != nil {
+				return err
+			}
+			return RemoveWorkspace(ctx, tx, slug)
+		})
+		if err != nil {
 			return err
 		}
+		c.deps.Jobs.Interrupt(JobType, slug)
 		c.mu.Lock()
 		delete(c.building, slug)
 		c.mu.Unlock()
+		c.release(slug, "")
 		return os.RemoveAll(dir)
 	}
 	rec, _, err := c.Record(ctx, slug)
@@ -415,6 +435,7 @@ func (c *Component) sweepWorkspace(ctx context.Context, slug string) error {
 	if err != nil {
 		return err
 	}
+	c.release(slug, rec.IndexedSHA)
 	var failures []error
 	for _, b := range builds {
 		// The build under way is asked for last: one that began after the
@@ -441,4 +462,149 @@ func (c *Component) buildingOf(slug string) string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.building[slug]
+}
+
+// Files are the paths of the files of the workspace slug whose content
+// matches query, a query of the index, from the index its record names. It
+// builds nothing: the index a build stored is loaded on its first use.
+func (c *Component) Files(ctx context.Context, slug, query string) ([]string, error) {
+	idx, err := c.loaded(ctx, slug)
+	if err != nil {
+		return nil, err
+	}
+	return idx.Files(ctx, query)
+}
+
+// ErrNoIndex is the error of a use of the index of a workspace that has
+// none.
+var ErrNoIndex = errors.New("the workspace has no code index")
+
+// loaded is the index the record of the workspace slug names, loaded from
+// what its build stored on its first use and kept until the record names
+// another. A stored index that cannot be loaded is treated as none: its
+// directory is removed and its build queued.
+func (c *Component) loaded(ctx context.Context, slug string) (Index, error) {
+	rec, found, err := c.Record(ctx, slug)
+	if err != nil {
+		return nil, err
+	}
+	if !found || rec.IndexedSHA == "" {
+		return nil, ErrNoIndex
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if o := c.open[slug]; o != nil && o.sha == rec.IndexedSHA {
+		return o.idx, nil
+	}
+	dir := c.buildDir(slug, rec.IndexedSHA)
+	idx, err := c.deps.Open(filepath.Join(dir, treeDir), filepath.Join(dir, storeDir), filepath.Join(dir, scratchDir), c.bounds())
+	if err == nil {
+		// Over the directories a build stored into, this loads; only a
+		// partial index, which is not stored whole, is built again.
+		if err = idx.Build(ctx); err != nil {
+			_ = idx.Close()
+		}
+	}
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		go func() { _ = c.Queue(context.WithoutCancel(ctx), slug) }()
+		return nil, fmt.Errorf("%w that can be loaded: %w", ErrNoIndex, err)
+	}
+	if o := c.open[slug]; o != nil {
+		_ = o.idx.Close()
+	}
+	if c.open == nil {
+		c.open = map[string]*openIndex{}
+	}
+	c.open[slug] = &openIndex{sha: rec.IndexedSHA, idx: idx}
+	return idx, nil
+}
+
+// openIndex is a loaded index and the commit it holds.
+type openIndex struct {
+	sha string
+	idx Index
+}
+
+// release closes the loaded index of the workspace slug unless it holds
+// the commit keep.
+func (c *Component) release(slug, keep string) {
+	c.mu.Lock()
+	o := c.open[slug]
+	if o != nil && o.sha != keep {
+		delete(c.open, slug)
+	} else {
+		o = nil
+	}
+	c.mu.Unlock()
+	if o != nil {
+		_ = o.idx.Close()
+	}
+}
+
+// Run keeps the component until ctx ends, the hub's stop, and then closes
+// every index it has loaded; what their builds stored stays.
+func (c *Component) Run(ctx context.Context) {
+	<-ctx.Done()
+	c.mu.Lock()
+	open := c.open
+	c.open = nil
+	c.mu.Unlock()
+	for _, o := range open {
+		_ = o.idx.Close()
+	}
+}
+
+// Stop ends the builds of the workspace slug: the ones that wait are
+// cancelled and the one that runs is interrupted. It is what turning the
+// workspace's setting off does at once; the maintenance pass removes the
+// record, the tree and the index.
+func (c *Component) Stop(ctx context.Context, slug string) error {
+	if !c.Enabled() {
+		return nil
+	}
+	err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := c.deps.Jobs.CancelPending(ctx, tx, JobType, slug)
+		return err
+	})
+	c.deps.Jobs.Interrupt(JobType, slug)
+	return err
+}
+
+// settled runs once the settlement of a build of the workspace slug has
+// committed: the builds its record no longer names go, the index loaded
+// from one of them is closed, and the bytes on disk are measured.
+func (c *Component) settled(slug string) {
+	ctx := context.Background()
+	// The store runs its write transactions one at a time, in the order
+	// they are asked for, so the settlement's has ended when this one has.
+	if err := c.deps.Store.Tx(ctx, func(*sql.Tx) error { return nil }); err != nil {
+		return
+	}
+	_ = c.sweepWorkspace(ctx, slug)
+	c.measure()
+}
+
+// measure reports the bytes of the code index directory.
+func (c *Component) measure() {
+	var total int64
+	_ = filepath.WalkDir(filepath.Join(c.deps.DataDir, DirName), func(_ string, d os.DirEntry, err error) error {
+		if err != nil {
+			// A build or a removal changes the directory meanwhile.
+			return nil
+		}
+		if info, err := d.Info(); err == nil && !d.IsDir() {
+			total += info.Size()
+		}
+		return nil
+	})
+	_ = c.deps.Metrics.Set(metrics.CodeIndexBytes, nil, float64(total))
+}
+
+// Measure reports the bytes of the code index directory, as the hub does at
+// its start.
+func (c *Component) Measure() {
+	if c.Enabled() {
+		c.measure()
+	}
 }

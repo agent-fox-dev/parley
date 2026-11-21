@@ -3,7 +3,7 @@
   "spec_id": "59",
   "spec_name": "code_index_builds",
   "schema_version": 3,
-  "updated_at": "2026-11-21T15:52:32Z",
+  "updated_at": "2026-11-21T15:58:58Z",
   "tasks": [
     {
       "id": 1,
@@ -329,7 +329,83 @@
     },
     {
       "id": 4,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-5.1",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestKeep_HasTheIndexAfterARestartWithoutBuildingIt",
+              "failed": {
+                "at": "2026-11-21T15:54:23Z",
+                "tree": "6d6d822b146f38bc0ae0e2475afe186e322206f8"
+              },
+              "passed": {
+                "at": "2026-11-21T15:58:56Z",
+                "tree": "cd82f711af45d74bae61dafb709fbd91550ad47c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.2",
+          "no_red": "an archive must change nothing of the index, and nothing the hub does on an archive touches it yet; the test fails once an archive, or the maintenance pass after it, removes the tree or the record",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestKeep_KeepsTheIndexOfAnArchivedWorkspace",
+              "passed": {
+                "at": "2026-11-21T15:58:56Z",
+                "tree": "cd82f711af45d74bae61dafb709fbd91550ad47c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.3",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestKeep_RemovesEverythingOfADeletedWorkspace",
+              "failed": {
+                "at": "2026-11-21T15:54:23Z",
+                "tree": "6d6d822b146f38bc0ae0e2475afe186e322206f8"
+              },
+              "passed": {
+                "at": "2026-11-21T15:58:56Z",
+                "tree": "cd82f711af45d74bae61dafb709fbd91550ad47c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.2",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestKeep_RemovesTheIndexOfAWorkspaceWhoseSettingIsTurnedOff",
+              "failed": {
+                "at": "2026-11-21T15:54:23Z",
+                "tree": "6d6d822b146f38bc0ae0e2475afe186e322206f8"
+              },
+              "passed": {
+                "at": "2026-11-21T15:58:56Z",
+                "tree": "cd82f711af45d74bae61dafb709fbd91550ad47c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.5",
+          "no_red": "the maintenance pass was delivered and seen failing first in task 3, which owns the criterion too",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestMaintenance_QueuesWhatIsBehindAndRemovesWhatIsStray",
+              "passed": {
+                "at": "2026-11-21T15:58:56Z",
+                "tree": "cd82f711af45d74bae61dafb709fbd91550ad47c"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 5,

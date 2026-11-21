@@ -75,6 +75,8 @@ type Component struct {
 	// building is the commit of the last build of each workspace this
 	// process began, by slug.
 	building map[string]string
+	// open are the indexes loaded for use, by slug.
+	open map[string]*openIndex
 }
 
 // Bind gives the component its dependencies, the defaults in place of the

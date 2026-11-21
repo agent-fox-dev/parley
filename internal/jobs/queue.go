@@ -109,8 +109,8 @@ type Queue struct {
 
 // worker is an attempt of a job the queue runs.
 type worker struct {
-	// typ is the type of the attempt's job.
-	typ string
+	// typ is the type of the attempt's job and slug its workspace.
+	typ, slug string
 	// cancel cancels the context of the attempt.
 	cancel context.CancelFunc
 	// done is closed once the attempt has ended and its outcome is
@@ -344,7 +344,7 @@ func (q *Queue) reserve(base context.Context, j Job) (c claim, full bool) {
 		}
 	}
 	ctx, cancel := context.WithCancel(base)
-	w := &worker{typ: j.Type, cancel: cancel, done: make(chan struct{})}
+	w := &worker{typ: j.Type, slug: j.Workspace, cancel: cancel, done: make(chan struct{})}
 	if q.running == nil {
 		q.running = map[string]*worker{}
 	}

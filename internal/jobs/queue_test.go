@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -598,5 +599,45 @@ func TestHasten_MakesAFailedJobDueAtOnce(t *testing.T) {
 	q.pass(t)
 	if got := h.Enter(t); got.ID != j.ID {
 		t.Errorf("the queue claimed %s, want the hastened job %s", got.ID, j.ID)
+	}
+}
+
+func TestWithdraw_CancelsThePendingJobsOfATypeAndWorkspaceAndEndsItsRunningAttempt(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	q := newTestQueue(t)
+	h := newScriptedHandler(true)
+	q.Register("probe", h)
+	running := q.enqueue(t, "probe", "w", json.RawMessage(`{}`))
+	other := q.enqueue(t, "probe", "other", json.RawMessage(`{}`))
+	q.pass(t)
+	h.Enter(t)
+	h.Enter(t)
+	var follow Job
+	if err := q.st.Tx(ctx, func(tx *sql.Tx) (err error) {
+		follow, err = q.EnqueueFollowUp(ctx, tx, "probe", "w", running.ID, json.RawMessage(`{}`))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var cancelled int
+	if err := q.st.Tx(ctx, func(tx *sql.Tx) (err error) {
+		cancelled, err = q.CancelPending(ctx, tx, "probe", "w")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	q.Interrupt("probe", "w")
+	if got := q.status(t, follow.ID); cancelled != 1 || got != StatusCancelled {
+		t.Errorf("CancelPending cancelled %d jobs and the waiting one is %q, want 1 and cancelled", cancelled, got)
+	}
+	// The running attempt saw its context end and returned its error.
+	waitClosed(t, q.doneOf(running.ID), "the interrupted attempt")
+	if got := q.get(t, running.ID); got.Status != StatusFailed || got.Error == nil || !strings.Contains(*got.Error, "context canceled") {
+		t.Errorf("the interrupted job = %+v, want failed with the end of its context", got)
+	}
+	if got := q.status(t, other.ID); got != StatusRunning {
+		t.Errorf("the job of another workspace = %q, want running", got)
 	}
 }

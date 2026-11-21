@@ -1,0 +1,131 @@
+package codeindex_test
+
+import (
+	"context"
+	"net/http"
+	"path/filepath"
+	"slices"
+	"testing"
+)
+
+func TestKeep_HasTheIndexAfterARestartWithoutBuildingIt(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, enabled)
+	head := w.addWorkspace(t, "demo", map[string]string{"a.go": "package a\n\nfunc Zebra() {}\n", "b.go": "package a\n\nfunc Yak() {}\n"})
+	before := w.indexed(t, "demo")
+
+	w.Restart(t)
+	w.pass(t)
+	after := w.record(t, "demo")
+	if after.IndexedSHA != head || !after.BuiltAt.Equal(*before.BuiltAt) || after.FilesIndexed != before.FilesIndexed {
+		t.Errorf("after the restart the record = %+v, want it as it was, %+v", after, before)
+	}
+	files, err := w.index.Files(context.Background(), "demo", "Zebra")
+	if err != nil || !slices.Equal(files, []string{"a.go"}) {
+		t.Errorf("the index answers %q (%v) for Zebra, want a.go", files, err)
+	}
+	for outcome, n := range w.builds(t) {
+		if n != 0 {
+			t.Errorf("parley_code_index_builds_total{outcome=%q} = %v after the restart, want 0", outcome, n)
+		}
+	}
+}
+
+func TestKeep_KeepsTheIndexOfAnArchivedWorkspace(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, enabled)
+	head := w.addWorkspace(t, "demo", map[string]string{"a.go": "package a\n"})
+	before := w.indexed(t, "demo")
+	tree := w.tree(t, "demo", head)
+
+	if status, body := w.Call(t, http.MethodPost, "/api/v1/workspaces/demo/archive", w.key, nil); status != http.StatusOK {
+		t.Fatalf("archive demo = %d %s, want 200", status, body)
+	}
+	w.pass(t)
+	if after := w.record(t, "demo"); after.IndexedSHA != head || !after.BuiltAt.Equal(*before.BuiltAt) {
+		t.Errorf("after the archive the record = %+v, want it as it was, %+v", after, before)
+	}
+	if got := w.tree(t, "demo", head); len(got) != len(tree) || got["a.go"] != tree["a.go"] {
+		t.Errorf("after the archive the tree holds %q, want %q", got, tree)
+	}
+}
+
+func TestKeep_RemovesEverythingOfADeletedWorkspace(t *testing.T) {
+	t.Parallel()
+	s := newSeam()
+	w := newWorld(t, enabled, s.adjust)
+	w.addWorkspace(t, "demo", map[string]string{"a.go": "package a\n"})
+	w.indexed(t, "demo")
+	next := w.commit(t, "demo", "main", map[string]string{"b.go": "package a\n"})
+	held := string(filepath.Separator) + next + string(filepath.Separator)
+	t.Cleanup(s.hold(held))
+	s.waitBegan(t, held)
+
+	if status, body := w.Call(t, http.MethodPost, "/api/v1/workspaces/demo/archive", w.key, nil); status != http.StatusOK {
+		t.Fatalf("archive demo = %d %s, want 200", status, body)
+	}
+	if status, body := w.Call(t, http.MethodDelete, "/api/v1/workspaces/demo", w.key, nil); status >= 300 {
+		t.Fatalf("delete demo = %d %s, want it deleted", status, body)
+	}
+	if jobs := w.jobs(t, "demo"); len(jobs) != 0 {
+		t.Errorf("after the delete the queue holds the code_index jobs %q of demo, want none", jobs)
+	}
+	if rec := w.record(t, "demo"); rec.IndexedSHA != "" || rec.Workspace != "" {
+		t.Errorf("after the delete the record of demo = %+v, want none", rec)
+	}
+	s.waitEnded(t, held)
+	w.pass(t)
+	if got := w.entries(t, "demo"); len(got) != 0 {
+		t.Errorf("after the delete and a maintenance pass the code index directory holds %q of demo, want nothing", got)
+	}
+
+	// The slug is taken again by another repository.
+	again := w.addWorkspace(t, "demo", map[string]string{"other.go": "package other\n"})
+	w.indexed(t, "demo")
+	if got := w.tree(t, "demo", again); len(got) != 1 || got["other.go"] == "" {
+		t.Errorf("the tree of the new demo holds %q, want its own file alone", got)
+	}
+	if got := w.entries(t, "demo"); !slices.Equal(got, []string{again}) {
+		t.Errorf("the directory of the new demo holds %q, want the build of its head, %s, alone", got, again)
+	}
+}
+
+func TestKeep_RemovesTheIndexOfAWorkspaceWhoseSettingIsTurnedOff(t *testing.T) {
+	t.Parallel()
+	s := newSeam()
+	w := newWorld(t, enabled, s.adjust)
+	w.addWorkspace(t, "demo", map[string]string{"a.go": "package a\n"})
+	w.indexed(t, "demo")
+	next := w.commit(t, "demo", "main", map[string]string{"b.go": "package a\n"})
+	held := string(filepath.Separator) + next + string(filepath.Separator)
+	t.Cleanup(s.hold(held))
+	s.waitBegan(t, held)
+	// One more waits beside the build that runs.
+	w.commit(t, "demo", "main", map[string]string{"c.go": "package a\n"})
+	eventually(t, "a build waiting beside the running one", func() bool { return len(w.jobs(t, "demo")) == 2 })
+
+	status, body := w.Call(t, http.MethodPatch, "/api/v1/workspaces/demo", w.key, map[string]any{"settings": map[string]any{"code_index": false}})
+	if status != http.StatusOK {
+		t.Fatalf("PATCH code_index false = %d %s, want 200", status, body)
+	}
+	s.waitEnded(t, held)
+	w.pass(t)
+	check := func(when string) {
+		t.Helper()
+		if got := w.entries(t, "demo"); len(got) != 0 {
+			t.Errorf("%s the code index directory holds %q of demo, want nothing", when, got)
+		}
+		if jobs := w.jobs(t, "demo"); len(jobs) != 0 {
+			t.Errorf("%s the queue holds the code_index jobs %q of demo, want none", when, jobs)
+		}
+		if rec := w.record(t, "demo"); rec.Workspace != "" {
+			t.Errorf("%s the record of demo = %+v, want none", when, rec)
+		}
+	}
+	check("after one maintenance pass")
+	w.pass(t)
+	check("after a second pass")
+	if n := w.builds(t); n["failed"] != 0 {
+		t.Errorf("builds by outcome = %v, want the build that was ended counted under none", n)
+	}
+}

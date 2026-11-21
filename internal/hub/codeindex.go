@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/carrypatch"
@@ -17,6 +18,13 @@ import (
 // codeIndexHook is the start hook that binds the code index component and,
 // on a hub with [code_index], refuses a platform the index cannot run on.
 const codeIndexHook = "code-index"
+
+// codeIndexWork is the background work that closes the loaded indexes at
+// the hub's stop, within codeIndexGrace.
+const (
+	codeIndexWork  = "code-index"
+	codeIndexGrace = 10 * time.Second
+)
 
 // codeIndexTask is the maintenance task that queues a build for every
 // workspace whose index is not at its head and removes the trees and
@@ -66,8 +74,11 @@ func composeCodeIndex(c *Composition) {
 		settings := c.workspaces.Settings()
 		was, _ := settings.EffectiveSettings(before.Settings, before.DefaultBranch)[codeindex.SettingName].(bool)
 		is, _ := settings.EffectiveSettings(after.Settings, after.DefaultBranch)[codeindex.SettingName].(bool)
-		if !was && is {
+		switch {
+		case !was && is:
 			return comp.Queue(ctx, after.Slug)
+		case was && !is:
+			return comp.Stop(ctx, after.Slug)
 		}
 		return nil
 	})
@@ -111,8 +122,14 @@ func composeCodeIndex(c *Composition) {
 		c.Jobs().Register(codeindex.JobType, comp.Handler())
 		// The queue has recovered what a stop left running; what moved
 		// while the hub was down is queued here.
+		comp.Measure()
 		return comp.Reconcile(ctx)
 	})
+	c.AddBackgroundWork(codeIndexWork, codeIndexGrace, func(ctx context.Context, _ *Runtime) { comp.Run(ctx) })
+	// The record goes in the delete's transaction; the queue's own remover
+	// deletes the builds and ends the one that runs, and the maintenance
+	// pass removes the directory.
+	c.workspaces.Teardown().RegisterRemover(codeindex.RemoveWorkspace)
 	c.AddMaintenanceTask(codeIndexTask, func(ctx context.Context, _ *Runtime) error {
 		return errors.Join(comp.Reconcile(ctx), comp.Sweep(ctx))
 	})
