@@ -57,12 +57,16 @@ func newWorld(t *testing.T, toml string, adjust ...func(*codeindex.Deps)) *world
 }
 
 // newComposedWorld is newWorld on cfg, whose Compose runs after the world's
-// own.
+// own and whose MaintenanceInterval, when set, replaces passInterval: a
+// test of a notice sets a long one, so that no pass can do the notice's
+// work.
 func newComposedWorld(t *testing.T, cfg hubtest.Config, adjust ...func(*codeindex.Deps)) *world {
 	t.Helper()
 	w := &world{}
 	compose := cfg.Compose
-	cfg.MaintenanceInterval = passInterval
+	if cfg.MaintenanceInterval == 0 {
+		cfg.MaintenanceInterval = passInterval
+	}
 	// The workspaces are made by hand, so nothing is cloned; the rate limit
 	// would count the polls of a status.
 	cfg.TOML = "[limits]\nrequests_per_minute = 0\n" + cfg.TOML

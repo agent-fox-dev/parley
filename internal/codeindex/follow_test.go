@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
@@ -22,9 +23,10 @@ func TestFollow_BuildsAWorkspaceOnceItHasItsRepository(t *testing.T) {
 		t.Fatal(err)
 	}
 	w := newComposedWorld(t, hubtest.Config{
-		Server: `external_url = "https://hub.example/"`,
-		TOML:   enabled,
-		Env:    map[string]string{"GIT_SSL_CAINFO": origin.CAFile(), secret.EnvCurrentKey: base64.StdEncoding.EncodeToString(key)},
+		Server:              `external_url = "https://hub.example/"`,
+		TOML:                enabled,
+		MaintenanceInterval: time.Hour,
+		Env:                 map[string]string{"GIT_SSL_CAINFO": origin.CAFile(), secret.EnvCurrentKey: base64.StdEncoding.EncodeToString(key)},
 	})
 	status, body := w.Call(t, http.MethodPost, "/api/v1/workspaces", w.key, map[string]any{"slug": "demo", "git_url": origin.URL()})
 	if status != http.StatusCreated {
@@ -96,7 +98,7 @@ func TestFollow_BuildsAtStartWhatMovedWhileTheHubWasDown(t *testing.T) {
 
 func TestFollow_BuildsAWorkspaceWhoseSettingIsTurnedOn(t *testing.T) {
 	t.Parallel()
-	w := newWorld(t, enabled)
+	w := newComposedWorld(t, hubtest.Config{TOML: enabled, MaintenanceInterval: time.Hour})
 	head := w.addWorkspace(t, "demo", map[string]string{"a.go": "package a\n"})
 	set := func(on bool) {
 		t.Helper()
