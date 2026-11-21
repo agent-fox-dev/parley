@@ -24,7 +24,7 @@ var settingDefaults = map[string]any{
 	"forge_api_url": "", "upstream_forge_api_url": "", "patch_branch_source": "hub",
 	"patch_divergence_policy": "replace", "push_patches_to_origin": false, "auto_rebuild_after_push": true,
 	"auto_rebuild_after_sync": true, "rebuild_strategy": "rebase", "rebuild_fail_mode": "fail_fast",
-	"rebuild_push_integration_branch": false, "squash_merge_detection": "both",
+	"rebuild_push_integration_branch": false, "squash_merge_detection": "both", "code_index": true,
 }
 
 // settingKeys is a registry holding the hub's setting keys.

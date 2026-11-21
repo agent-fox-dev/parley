@@ -31,6 +31,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/awareness"
 	"github.com/agent-fox-dev/parley/internal/carrypatch"
 	"github.com/agent-fox-dev/parley/internal/change"
+	"github.com/agent-fox-dev/parley/internal/codeindex"
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/forge"
@@ -97,6 +98,7 @@ var parts = []func(*Composition){
 	composeTelemetry,
 	composeAudit,
 	composeWebhooks,
+	composeCodeIndex,
 	composeMetrics,
 }
 
@@ -320,6 +322,11 @@ type Composition struct {
 	// (AdjustJobs).
 	jobs          *jobs.Queue
 	jobsAdjusters []func(*jobs.Deps)
+	// codeIndex is the code index component, which composeCodeIndex creates
+	// and binds in its start hook (CodeIndex), after codeIndexAdjusters have
+	// changed its dependencies (AdjustCodeIndex).
+	codeIndex          *codeindex.Component
+	codeIndexAdjusters []func(*codeindex.Deps)
 
 	// carryPatch is the carry-patch component composeCarryPatch creates
 	// and binds in its start hook (CarryPatch), after carryPatchAdjusters

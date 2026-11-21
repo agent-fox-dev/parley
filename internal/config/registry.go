@@ -72,7 +72,9 @@ type Registry struct {
 
 // NewRegistry returns a registry holding the keys the configuration loader
 // owns: those of [server], [database], [workspace], [logging], [limits],
-// [forks], [scm], [changes] and [land].
+// [forks], [scm], [changes] and [land], and the section [code_index], which
+// it owns as a whole so that the file holding it, even empty, turns the code
+// index on.
 func NewRegistry() *Registry {
 	r := &Registry{keys: map[string]map[string]Key{}, sections: map[string]func(map[string]any) error{}}
 	for _, k := range slices.Concat(ownKeys, forkKeys, scmKeys, changesKeys, landKeys) {
@@ -80,6 +82,10 @@ func NewRegistry() *Registry {
 		// are fixed and well formed, so there is none.
 		_ = r.Register(k)
 	}
+	_ = r.RegisterSection(codeIndexSection, func(table map[string]any) error {
+		_, err := codeIndexFrom(table)
+		return err
+	})
 	return r
 }
 

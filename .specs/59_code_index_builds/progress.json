@@ -3,11 +3,112 @@
   "spec_id": "59",
   "spec_name": "code_index_builds",
   "schema_version": 3,
-  "updated_at": "",
+  "updated_at": "2026-11-21T06:36:48Z",
   "tasks": [
     {
       "id": 1,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-1.1",
+          "tests": [
+            {
+              "test": "./internal/config:TestLoad_ReadsTheCodeIndexBoundsOrTheirDefaults",
+              "failed": {
+                "at": "2026-11-21T06:33:25Z",
+                "tree": "97f663c7ccf61d69dfcf8e254b0fe6aa6bda068b"
+              },
+              "passed": {
+                "at": "2026-11-21T06:36:44Z",
+                "tree": "32675310d8e2c90db02c9322a30c51248aacc86c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.2",
+          "tests": [
+            {
+              "test": "./internal/config:TestLoad_RefusesACodeIndexSectionItCannotUse",
+              "failed": {
+                "at": "2026-11-21T06:33:25Z",
+                "tree": "97f663c7ccf61d69dfcf8e254b0fe6aa6bda068b"
+              },
+              "passed": {
+                "at": "2026-11-21T06:36:44Z",
+                "tree": "32675310d8e2c90db02c9322a30c51248aacc86c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.3",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestCheckPlatform_RefusesAPlatformTheIndexCannotRunOn",
+              "failed": {
+                "at": "2026-11-21T06:33:25Z",
+                "tree": "97f663c7ccf61d69dfcf8e254b0fe6aa6bda068b"
+              },
+              "passed": {
+                "at": "2026-11-21T06:36:44Z",
+                "tree": "32675310d8e2c90db02c9322a30c51248aacc86c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.4",
+          "no_red": "a hub without the section must do nothing, and a hub in which the component does not build yet does nothing either; the test fails once a build runs without [code_index]",
+          "tests": [
+            {
+              "test": "./internal/codeindex:TestFeatureOff_BuildsNothingAndUsesNoDisk",
+              "passed": {
+                "at": "2026-11-21T06:36:44Z",
+                "tree": "32675310d8e2c90db02c9322a30c51248aacc86c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.1",
+          "tests": [
+            {
+              "test": "./internal/workspace:TestSettings_ShowsEveryKeyWithItsStoredValueOrItsDefault",
+              "failed": {
+                "at": "2026-11-21T06:33:25Z",
+                "tree": "97f663c7ccf61d69dfcf8e254b0fe6aa6bda068b"
+              },
+              "passed": {
+                "at": "2026-11-21T06:36:44Z",
+                "tree": "32675310d8e2c90db02c9322a30c51248aacc86c"
+              }
+            },
+            {
+              "test": "./internal/workspace:TestSettings_StoresAValueItsKeyAcceptsAndRefusesAnyOther",
+              "failed": {
+                "at": "2026-11-21T06:33:25Z",
+                "tree": "97f663c7ccf61d69dfcf8e254b0fe6aa6bda068b"
+              },
+              "passed": {
+                "at": "2026-11-21T06:36:44Z",
+                "tree": "32675310d8e2c90db02c9322a30c51248aacc86c"
+              }
+            },
+            {
+              "test": "./internal/workspace:TestRead_ShowsAForkTheEffectiveSettingsOfItsParent",
+              "failed": {
+                "at": "2026-11-21T06:33:25Z",
+                "tree": "97f663c7ccf61d69dfcf8e254b0fe6aa6bda068b"
+              },
+              "passed": {
+                "at": "2026-11-21T06:36:44Z",
+                "tree": "32675310d8e2c90db02c9322a30c51248aacc86c"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 2,
