@@ -357,7 +357,14 @@ func TestProvision_ReportsTheEndAfterItsCommit(t *testing.T) {
 	mu.Lock()
 	refuse = false
 	mu.Unlock()
-	h.pass(t, sandbox.ProvisionInterval)
+	// The provisioner frees the sandbox only once its provisioning has
+	// returned, after the bound is stopped, and a pass that finds it still
+	// being provisioned leaves it: passes come until one provisions it again.
+	provisionings := h.timers.created(sandbox.ProvisionBound)
+	eventually(t, "a pass to provision the sandbox again", func() bool {
+		h.pass(t, sandbox.ProvisionInterval)
+		return h.timers.created(sandbox.ProvisionBound) > provisionings
+	})
 	if rec := h.settled(t, id); rec.State != sandbox.StateFailed {
 		t.Fatalf("sandbox = %s; want failed", rec.State)
 	}
