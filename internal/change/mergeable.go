@@ -365,13 +365,20 @@ func ownBase(ctx context.Context, q Querier, ch Change) (string, error) {
 // an unknown in between does not replace: a conflict after a clean result,
 // or after none, writes parley.change.conflict by the hub; a conflict after
 // a conflict replaces the report and writes nothing; a clean result clears
-// the report. A landing blocked for a missing target is re-evaluated,
-// since the check found the target again, and the announcement step
-// (AnnounceLandable) runs last. An error leaves tx to be rolled back, the
-// result and its events with it.
+// the report. A result the change already holds, for the same pair and as
+// the value last computed, is not written again, so that its updated_at
+// stays: a check runs whenever one was scheduled, also by a transaction
+// that was rolled back, and finds then what the change holds. A landing
+// blocked for a missing target is re-evaluated, since the check found the
+// target again, and the announcement step (AnnounceLandable) runs last. An
+// error leaves tx to be rolled back, the result and its events with it.
 func (c *Component) StoreMergeability(ctx context.Context, tx *sql.Tx, workspace string, number int64, head, onto string, report *gitrepo.ConflictReport) error {
-	var last sql.NullString
-	err := tx.QueryRowContext(ctx, `SELECT mergeable_last FROM changes WHERE workspace_slug = ? AND number = ?`, workspace, number).Scan(&last)
+	var (
+		stored                         string
+		last, held, heldHead, heldOnto sql.NullString
+	)
+	err := tx.QueryRowContext(ctx, `SELECT mergeable, conflict, mergeable_head, mergeable_onto, mergeable_last
+FROM changes WHERE workspace_slug = ? AND number = ?`, workspace, number).Scan(&stored, &held, &heldHead, &heldOnto, &last)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return errChangeNotFound(workspace, number)
@@ -386,12 +393,16 @@ func (c *Component) StoreMergeability(ctx context.Context, tx *sql.Tx, workspace
 		}
 		value, conflict = MergeableConflict, b
 	}
-	if err := c.SetMergeable(ctx, tx, workspace, number, value, conflict); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE changes SET mergeable_head = ?, mergeable_onto = ?, mergeable_last = ?
+	unchanged := stored == value && last.String == value && held.String == string(conflict) &&
+		heldHead.String == head && heldOnto.String == onto
+	if !unchanged {
+		if err := c.SetMergeable(ctx, tx, workspace, number, value, conflict); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE changes SET mergeable_head = ?, mergeable_onto = ?, mergeable_last = ?
 WHERE workspace_slug = ? AND number = ?`, head, onto, value, workspace, number); err != nil {
-		return fmt.Errorf("store the mergeable of %s: %w", Ref(workspace, number), err)
+			return fmt.Errorf("store the mergeable of %s: %w", Ref(workspace, number), err)
+		}
 	}
 	ch, err := readChange(ctx, tx, workspace, number)
 	if err != nil {
