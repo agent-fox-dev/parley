@@ -13,7 +13,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -91,9 +90,9 @@ func TestRestore_AHubStartsOnTheCopyOfAnIdleHubsSnapshotWithItsDataAndTakesNewWo
 	if got := status(t, r.URL("/readyz")); got != http.StatusOK {
 		t.Errorf("GET /readyz of the restored hub = %d, want 200", got)
 	}
-	if r.calls.Load() != 1 || r.bound.Load() || r.rows.Load() != 100 {
-		t.Errorf("the start hook ran %d times, with the listener bound: %t, and read %d rows; want once, before the bind, 100 rows",
-			r.calls.Load(), r.bound.Load(), r.rows.Load())
+	if r.calls.Load() != 1 || r.taken.Load() || r.rows.Load() != 100 {
+		t.Errorf("the start hook ran %d times, with the listener taken: %t, and read %d rows; want once, before the bind, 100 rows",
+			r.calls.Load(), r.taken.Load(), r.rows.Load())
 	}
 	if got := adminTokenHash(t, r.rt.Store); got != tokenHash {
 		t.Errorf("the restored admin token hash = %q, want the source's %q", got, tokenHash)
@@ -161,7 +160,7 @@ func TestRestore_ABackupTakenUnderLoadRestoresToAHubWithSoundStoresAndCompleteRe
 			t.Errorf("backup %d: GET /readyz of the running hub = %d after the backup, want 200", round, ready)
 		}
 
-		dir := restore(t, snapshot, 0)
+		dir := restore(t, snapshot)
 		var rt2 *hub.Runtime
 		restored := hubtest.Serve(t, hub.Options{WorkDir: dir, Env: env, Compose: steps(&rt2)})
 		if got := status(t, restored.URL("/readyz")); got != http.StatusOK {
@@ -219,8 +218,9 @@ func backup(t *testing.T, workDir string, env config.Env) (dir string, code int,
 
 // restore copies the snapshot's stores and workspace root into the data
 // directory of a new working directory whose config.toml says where they
-// are and binds 127.0.0.1 on port, and returns the working directory.
-func restore(t *testing.T, snapshot string, port int) string {
+// are and binds 127.0.0.1 on a port the system chooses, and returns the
+// working directory.
+func restore(t *testing.T, snapshot string) string {
 	t.Helper()
 	dir := t.TempDir()
 	data := filepath.Join(dir, "data")
@@ -236,8 +236,8 @@ func restore(t *testing.T, snapshot string, port int) string {
 			t.Fatalf("copy the snapshot's %s: %v", name, err)
 		}
 	}
-	writeConfig(t, dir, fmt.Sprintf("[server]\nbind = \"127.0.0.1\"\nport = %d\n\n"+
-		"[database]\npath = \"data/parley.db\"\n\n[workspace]\npath = \"data/workspaces\"\n", port))
+	writeConfig(t, dir, "[server]\nbind = \"127.0.0.1\"\nport = 0\n\n"+
+		"[database]\npath = \"data/parley.db\"\n\n[workspace]\npath = \"data/workspaces\"\n")
 	return dir
 }
 
@@ -303,50 +303,44 @@ func rowCount(t *testing.T, db *sql.DB, table string) int {
 // start hook saw.
 type restoredHub struct {
 	*hubtest.Served
-	// dir is its working directory and addr the address its config.toml
-	// names.
+	// dir is its working directory and addr the address of the listener
+	// the test handed it.
 	dir, addr string
 	rt        *hub.Runtime
-	// calls counts the runs of the start hook, bound says whether a
-	// connection the hook made to addr reached another listener than the
-	// test's reservation, rows is the count of a it read.
+	// calls counts the runs of the start hook, taken says whether the hub
+	// had taken its listener into use when the hook ran, rows is the count
+	// of a it read.
 	calls, rows atomic.Int64
-	bound       atomic.Bool
+	taken       atomic.Bool
 }
 
-// startRestored copies snapshot into a new working directory whose
-// config.toml binds a port of 127.0.0.1 and starts a hub there with the
-// parts of compose and a start hook that reads table a and dials the
-// address.
+// startRestored copies snapshot into a new working directory and starts a
+// hub there with the parts of compose and a start hook that reads table a
+// and looks at the hub's listener.
 //
-// The test holds the port until the hook ends: the hub binds the address
-// of its config.toml itself, which a listener handed to it would bypass,
-// so the port is reserved by a listener of the test, and the hook dials the
-// address while the reservation still holds it and closes the reservation
-// last. A connection that arrives at the reservation shows that no other
-// listener, the hub's included, had the address; released before the dial,
-// the port could be taken by any listener of the tests running beside this
-// one, which the dial would then reach. Another process can take the port
-// only in the moment between the hook and the bind; and a hub that bound
-// before its hooks ran finds the port taken and does not start.
+// The hub is handed a listener the test bound on a free port of 127.0.0.1:
+// a port written into config.toml would be free between the test choosing
+// it and the hub binding it, and a listener of the tests running beside
+// this one could take it then. The hand-over is the stage at which the hub
+// binds its configured address otherwise, so a hook that runs before the
+// hub has asked the listener for its address or a connection ran before
+// the bind. That the hub binds its configured address only after its start
+// hooks is the start order's own test, in internal/hub.
 func startRestored(t *testing.T, snapshot string, env config.Env, compose func(*hub.Composition)) *restoredHub {
 	t.Helper()
-	reserved, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("reserve a port: %v", err)
+		t.Fatalf("bind a port for the restored hub: %v", err)
 	}
-	t.Cleanup(func() { reserved.Close() })
-	port := reserved.Addr().(*net.TCPAddr).Port
-	r := &restoredHub{dir: restore(t, snapshot, port), addr: net.JoinHostPort("127.0.0.1", strconv.Itoa(port))}
-	r.Served = hubtest.Serve(t, hub.Options{WorkDir: r.dir, Env: env, Compose: func(c *hub.Composition) {
+	t.Cleanup(func() { ln.Close() })
+	watched := &watchedListener{Listener: ln}
+	r := &restoredHub{dir: restore(t, snapshot), addr: ln.Addr().String()}
+	r.Served = hubtest.Serve(t, hub.Options{WorkDir: r.dir, Env: env, Listener: watched, Compose: func(c *hub.Composition) {
 		r.rt = c.Runtime()
 		compose(c)
 		c.AddStartHook("read_restored", func(ctx context.Context, rt *hub.Runtime) error {
 			r.calls.Add(1)
-			r.bound.Store(!reaches(reserved, r.addr))
-			if err := reserved.Close(); err != nil {
-				return err
-			}
+			r.taken.Store(watched.used.Load())
 			var n int64
 			if err := rt.Store.Main().QueryRowContext(ctx, "SELECT count(*) FROM a").Scan(&n); err != nil {
 				return err
@@ -358,22 +352,21 @@ func startRestored(t *testing.T, snapshot string, env config.Env, compose func(*
 	return r
 }
 
-// reaches says whether a connection made to addr is the one ln accepts.
-func reaches(ln net.Listener, addr string) bool {
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-	if err != nil {
-		return false
-	}
-	defer conn.Close()
-	if err := ln.(*net.TCPListener).SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		return false
-	}
-	in, err := ln.Accept()
-	if err != nil {
-		return false
-	}
-	defer in.Close()
-	return in.RemoteAddr().String() == conn.LocalAddr().String()
+// watchedListener is a listener that records whether it was asked for its
+// address or for a connection.
+type watchedListener struct {
+	net.Listener
+	used atomic.Bool
+}
+
+func (l *watchedListener) Addr() net.Addr {
+	l.used.Store(true)
+	return l.Listener.Addr()
+}
+
+func (l *watchedListener) Accept() (net.Conn, error) {
+	l.used.Store(true)
+	return l.Listener.Accept()
 }
 
 // pushNewCommit pushes one new commit onto main of the bare repository
