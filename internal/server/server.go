@@ -152,7 +152,14 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 
 	conns := newConnTracker()
-	srv := &http.Server{Handler: s.Handler(), ConnState: conns.track}
+	// The HTTP server's own errors (a failed TLS handshake, a malformed
+	// request it answers itself) go to the server's logger, not to the log
+	// package's process-wide default.
+	srv := &http.Server{
+		Handler:   s.Handler(),
+		ConnState: conns.track,
+		ErrorLog:  slog.NewLogLogger(s.logger.Handler(), slog.LevelError),
+	}
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(trackingListener{ln, conns}) }()
 

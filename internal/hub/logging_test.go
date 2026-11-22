@@ -363,3 +363,16 @@ func TestRun_GoesOnWhenALogLineCannotBeWritten(t *testing.T) {
 		t.Fatal("the hub did not stop within 10 s")
 	}
 }
+
+func TestRun_KeepsTheProcesssDefaultLoggerOffItsStderr(t *testing.T) {
+	// Not parallel: it writes through the process's default logger, which
+	// another test's hub would otherwise be the one to change.
+	var stderr bytes.Buffer
+	if code := hub.Run(t.Context(), hub.Options{WorkDir: workDir(t, localConfig+"[audit]\nmax_runs = 0\n"), Stderr: &stderr}); code != 1 {
+		t.Fatalf("Run returned %d, want 1", code)
+	}
+	slog.Info("a line of another logger in the same process")
+	if lines := strings.Split(strings.TrimSpace(stderr.String()), "\n"); len(lines) != 1 || !strings.Contains(lines[0], "cannot start") {
+		t.Errorf("stderr = %q, want only the line of the refused start", stderr.String())
+	}
+}

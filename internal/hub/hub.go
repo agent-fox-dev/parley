@@ -706,9 +706,10 @@ func Run(ctx context.Context, opts Options) int {
 	}
 	r := &run{opts: opts, cmd: cmd, level: new(slog.LevelVar), scrubber: scrub.New()}
 	// The logger exists before the configuration is loaded, at info, so that
-	// a configuration error is a JSON line like every other.
+	// a configuration error is a JSON line like every other. It is handed to
+	// what logs and never made the process's default: two hubs of one
+	// process, as in a test binary, would each take the other's lines.
 	r.logger = newLogger(stderr, r.level, r.scrubber)
-	slog.SetDefault(r.logger)
 	if cmd.backup {
 		return r.backup(ctx)
 	}
