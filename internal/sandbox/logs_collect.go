@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
@@ -72,10 +73,13 @@ func (s *Service) CollectLogs(ctx context.Context) {
 }
 
 // logFollower is the follower of one sandbox: cancel stops it, and done is
-// closed once it has stopped.
+// closed once it has stopped. ended is set as soon as one of its logs has
+// ended, before it stops reading the other: from then on it is stopping by
+// itself.
 type logFollower struct {
 	cancel context.CancelFunc
 	done   chan struct{}
+	ended  atomic.Bool
 }
 
 // collectRound is one round of CollectLogs over followers, the followers
@@ -97,15 +101,12 @@ func (s *Service) collectRound(ctx context.Context, followers map[string]*logFol
 		ready[rec.ID] = true
 	}
 	for id, f := range followers {
-		select {
-		case <-f.done:
-			delete(followers, id)
-			continue
-		default:
-		}
-		if !ready[id] {
-			// Waited for, so that a sandbox that is ready again by the next
-			// round never has two followers.
+		// The follower of a sandbox no longer ready is waited for, so that a
+		// sandbox that is ready again by the next round never has two
+		// followers. One that is stopping by itself is waited for too, so
+		// that a stream that broke before this round is opened again by it
+		// and not only by the next one.
+		if !ready[id] || f.ended.Load() {
 			f.cancel()
 			<-f.done
 			delete(followers, id)
@@ -121,15 +122,15 @@ func (s *Service) collectRound(ctx context.Context, followers map[string]*logFol
 		go func() {
 			defer close(f.done)
 			defer cancel()
-			s.followLogs(fctx, rec.ID)
+			s.followLogs(fctx, rec.ID, &f.ended)
 		}()
 	}
 }
 
 // followLogs reads both logs of the sandbox id until ctx ends or one of
-// them ends: the other is stopped then too, and the next round of the
-// collector opens both again.
-func (s *Service) followLogs(ctx context.Context, id string) {
+// them ends: ended is set then, the other is stopped too, and the next
+// round of the collector opens both again.
+func (s *Service) followLogs(ctx context.Context, id string, ended *atomic.Bool) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	sources := []string{LogSourceProcess, LogSourcePolicy}
@@ -137,6 +138,7 @@ func (s *Service) followLogs(ctx context.Context, id string) {
 	for _, source := range sources {
 		go func() {
 			err := s.followLog(ctx, id, source)
+			ended.Store(true)
 			cancel()
 			errs <- err
 		}()
