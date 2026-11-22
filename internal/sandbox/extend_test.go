@@ -17,10 +17,12 @@ import (
 
 // The extend route's behaviours share one hub: the repository demo and its
 // fork demo--t3, which expires three hours after the requests, each row
-// with a sandbox of its own.
+// with a sandbox of its own. The runtime holds none of them, so the hub's
+// reconciliation, which would fail a ready one as lost, passes only every
+// ten minutes of the hub's clock, which the rows never reach.
 func TestExtendRoute(t *testing.T) {
 	t.Parallel()
-	h := startCreateHub(t, agentProfile)
+	h := startCreateHub(t, "reconcile_interval = \"10m\"\n"+agentProfile)
 	h.repository(t, "demo", workspace.StatusReady)
 	// The requests come a minute after the sandboxes were made, so that a
 	// new expires_at is counted from the request.
