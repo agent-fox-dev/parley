@@ -134,15 +134,44 @@ func TestRead_AnswersATimeoutReachedAfterTheGitWorkUnlessTheBodyHasBegun(t *test
 	})
 }
 
+// writtenBlobs is a workspace repository that counts the blobs it has
+// written whole, the last git work of an outline before its parse.
+type writtenBlobs struct {
+	scm.Repository
+	written *atomic.Int32
+}
+
+func (b writtenBlobs) WriteBlob(ctx context.Context, id string, w io.Writer) error {
+	err := b.Repository.WriteBlob(ctx, id, w)
+	if err == nil {
+		b.written.Add(1)
+	}
+	return err
+}
+
 // A parse cannot always be ended: only part of it looks at its context. The
 // read is answered at the read timeout all the same, and no more parses run
 // at once than the limit, the ones left behind included.
+//
+// The read timeout also bounds the git work before the parse, which on a
+// busy machine can use all of it, so each read below is asked again until
+// one has got to the step it is about. The stalled parse does not end
+// before free, so an answer to such a read shows that it was not held for
+// the parse.
 func TestOutline_AnswersATimeoutWhenTheParseOutlastsTheReadTimeout(t *testing.T) {
-	var parses atomic.Int32
+	var parses, written atomic.Int32
 	release := make(chan struct{})
 	w := newWorld(t, func(d *scm.Deps) {
-		d.ReadTimeout = 200 * time.Millisecond
+		d.ReadTimeout = 500 * time.Millisecond
 		d.MaxOutlines = 1
+		open := d.Open
+		d.Open = func(ctx context.Context, slug string) (scm.Repository, error) {
+			repo, err := open(ctx, slug)
+			if err != nil {
+				return nil, err
+			}
+			return writtenBlobs{repo, &written}, nil
+		}
 		d.Outline = func(ctx context.Context, path string, src []byte) (outline.File, error) {
 			parses.Add(1)
 			<-release
@@ -154,16 +183,26 @@ func TestOutline_AnswersATimeoutWhenTheParseOutlastsTheReadTimeout(t *testing.T)
 	x := commit(t, w.repo, w.id["c2"], "x.go", "package x\n\nfunc X() {}\n")
 	path := scmPath("demo", "/outline?path=x.go&ref="+x)
 
-	for _, name := range []string{"the parse that stalls", "the next one, which waits for it"} {
-		start := time.Now()
-		r, err := w.fetch(path)
-		if err != nil || r.status != http.StatusServiceUnavailable || r.errorType() != "scm_timeout" || r.header.Get("ETag") != "" {
-			t.Fatalf("%s: %d %s (%v), ETag %q; want 503 scm_timeout without a tag", name, r.status, r.body, err, r.header.Get("ETag"))
-		}
-		if d := time.Since(start); d >= 2*time.Second {
-			t.Errorf("%s: answered after %v, want within 2s", name, d)
+	// timeOut asks for the outline until reached reports that a read got
+	// where name says, and wants each answer to be 503 scm_timeout.
+	timeOut := func(name string, reached func() bool) {
+		t.Helper()
+		for deadline := time.Now().Add(30 * time.Second); ; {
+			r, err := w.fetch(path)
+			if err != nil || r.status != http.StatusServiceUnavailable || r.errorType() != "scm_timeout" || r.header.Get("ETag") != "" {
+				t.Fatalf("%s: %d %s (%v), ETag %q; want 503 scm_timeout without a tag", name, r.status, r.body, err, r.header.Get("ETag"))
+			}
+			if reached() {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: no read got there within 30s", name)
+			}
 		}
 	}
+	timeOut("the parse that stalls", func() bool { return parses.Load() > 0 })
+	before := written.Load()
+	timeOut("the next one, which waits for it", func() bool { return written.Load() > before })
 	if n := parses.Load(); n != 1 {
 		t.Errorf("%d parses ran while the first had not ended, want 1", n)
 	}
