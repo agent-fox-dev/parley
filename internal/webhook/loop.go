@@ -244,7 +244,15 @@ func (c *Component) sleep(ctx context.Context, l *loop, until time.Time) bool {
 // subscription from the store, so that a change applies from here on, then
 // goes on with its pending delivery or, without one, with the events after
 // its position.
+//
+// The clock is read before the subscription, and the pending delivery's
+// next attempt is due by that reading: an attempt is made only with the
+// subscription as it was stored once the attempt was due, so a change
+// committed before then always applies to it. Read after the subscription,
+// the clock could pass the due time while a step held a subscription read
+// before the change, and that step would send to the old URL.
 func (c *Component) step(ctx context.Context, l *loop) (next, time.Time, error) {
+	now := c.deps.Clock.Now()
 	db := c.deps.Store.Main()
 	id := l.id
 	sub, found, err := subscriptionByID(ctx, db, id)
@@ -259,7 +267,7 @@ func (c *Component) step(ctx context.Context, l *loop) (next, time.Time, error) 
 		return idle, time.Time{}, err
 	}
 	if pending {
-		return c.resume(ctx, l, sub, d)
+		return c.resume(ctx, l, sub, d, now)
 	}
 	return c.examine(ctx, l, sub)
 }
@@ -331,13 +339,13 @@ func (c *Component) examine(ctx context.Context, l *loop, sub Subscription) (nex
 }
 
 // resume goes on with the pending delivery d of sub: it waits until its
-// next attempt is due, then reads its event again and makes the attempt.
-// An event that has left the log meanwhile cannot be sent: the delivery
-// ends failed, counted, the position moves past it, or to just before the
-// oldest event when that is further, and the subscription's state does not
-// change. While its secret waits to be tried again, it waits too.
-func (c *Component) resume(ctx context.Context, l *loop, sub Subscription, d delivery) (next, time.Time, error) {
-	now := c.deps.Clock.Now()
+// next attempt is due by now, the time read before sub, then reads its
+// event again and makes the attempt. An event that has left the log
+// meanwhile cannot be sent: the delivery ends failed, counted, the position
+// moves past it, or to just before the oldest event when that is further,
+// and the subscription's state does not change. While its secret waits to
+// be tried again, it waits too.
+func (c *Component) resume(ctx context.Context, l *loop, sub Subscription, d delivery, now time.Time) (next, time.Time, error) {
 	if d.NextAttemptAt != nil && d.NextAttemptAt.After(now) {
 		return idle, *d.NextAttemptAt, nil
 	}

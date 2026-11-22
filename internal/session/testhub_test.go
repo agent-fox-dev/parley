@@ -91,7 +91,9 @@ type world struct {
 func newWorld(t *testing.T, adjust ...func(*session.Deps)) *world {
 	t.Helper()
 	w := &world{clock: newClock()}
-	w.Hub = hubtest.StartWith(t, hubtest.Config{Now: w.clock.Now, Compose: func(c *hub.Composition) {
+	// The rate limit is off: tests read a session in a loop while links
+	// arrive, more often than a credential may in a minute.
+	w.Hub = hubtest.StartWith(t, hubtest.Config{Now: w.clock.Now, TOML: "[limits]\nrequests_per_minute = 0\n", Compose: func(c *hub.Composition) {
 		w.sessions, w.events, w.workspaces = c.Sessions(), c.Events(), c.Workspaces()
 		for _, a := range adjust {
 			c.AdjustSessions(a)

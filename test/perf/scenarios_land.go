@@ -252,7 +252,6 @@ func mergeability(ctx context.Context, e *env) (outcome, error) {
 		ours[n] = true
 	}
 	for {
-		polled := time.Now()
 		unknown, err := e.unknownChanges(ctx, target)
 		if err != nil {
 			return outcome{}, err
@@ -267,7 +266,10 @@ func mergeability(ctx context.Context, e *env) (outcome, error) {
 			s := time.Since(landed).Seconds()
 			return outcome{measured: &s, samples: len(numbers)}, nil
 		}
-		t := time.NewTimer(time.Until(polled.Add(mergeabilityPoll)))
+		// The next poll is sent a full interval after this one was answered,
+		// so that the hub never sees two polls closer than that, however long
+		// a request takes to reach it.
+		t := time.NewTimer(mergeabilityPoll)
 		select {
 		case <-ctx.Done():
 			t.Stop()

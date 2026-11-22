@@ -31,10 +31,14 @@ has already run, and that the line precedes `listening`.
 
 - The load helper of the restore tests is `test/e2e/load_test.go`, not
   `test/e2e/load.go`: `test/e2e` holds only test files.
-- The restore test of an idle hub's snapshot reserves a free loopback port
-  and writes it into `config.toml`, so that its start hook's dial of the
-  configured address shows the hook ran before the bind; with port 0 the
-  dial would fail whatever the order.
+- The restore test of an idle hub's snapshot hands the restored hub a
+  listener it bound on a free loopback port (`Options.Listener`), and its
+  start hook checks that the hub has not yet asked that listener for its
+  address or a connection, the stage at which the hub binds its configured
+  address otherwise; a port written into `config.toml` would be free
+  between the test choosing it and the hub binding it, and another test's
+  listener could take it then. That the hub binds its configured address
+  only after its start hooks is the start order's test in `internal/hub`.
 - The restore test under load takes the commits pushed before the backup
   began and the last commit pushed from the load's own record of each
   push rather than from `git rev-parse` on the source, and also checks that

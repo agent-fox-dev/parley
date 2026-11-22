@@ -166,7 +166,7 @@ func TestRun_MeasuresMergeabilityAndEventLatency(t *testing.T) {
 		}
 		polls := s.mergeabilityPolls()
 		for i := 1; i < len(polls); i++ {
-			if gap := polls[i].Sub(polls[i-1]); gap < 950*time.Millisecond {
+			if gap := polls[i].Sub(polls[i-1]); gap < time.Second {
 				t.Errorf("mergeability polled %v after its previous poll, want a second or more", gap)
 			}
 		}

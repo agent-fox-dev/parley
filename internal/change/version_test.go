@@ -359,6 +359,9 @@ func TestRecordVersion_RunsTheCollaboratorsInOrderAndWritesTheVersionEvent(t *te
 		if !errors.Is(err, errRollback) {
 			t.Fatalf("the transaction = %v, want the rollback", err)
 		}
+		// The version scheduled a mergeability check, which runs although
+		// the version was rolled back and finds the change as it was.
+		w.idle(t, 1)
 		if after := w.read(t, 1); !reflect.DeepEqual(after, before) {
 			t.Errorf("the change reads %+v, had %+v", after, before)
 		}
