@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
@@ -35,7 +37,7 @@ func TestLifecycleTimers(t *testing.T) {
 	if _, err := h.svc.Transition(ctx, nil, primer, sandbox.StateReady, sandbox.StateStopped, "", nil); err != nil {
 		t.Fatalf("stop the sandbox that wakes the loop: %v", err)
 	}
-	eventually(t, "the loop's expiry pass at t0", func() bool { return storedRecord(t, h.Hub, primer).State == sandbox.StateDeleted })
+	hubtest.Eventually(t, "the loop's expiry pass at t0", func() bool { return storedRecord(t, h.Hub, primer).State == sandbox.StateDeleted })
 	// on moves a sandbox to the workspace slug, outside any session.
 	on := func(slug string) func(*sandbox.Record) {
 		return func(r *sandbox.Record) { r.Workspace, r.SessionID = slug, nil }
@@ -239,10 +241,10 @@ func TestLifecycleTimers(t *testing.T) {
 	})
 
 	t.Run("the loop's timer runs the expiry pass at the earliest expires_at", func(t *testing.T) {
-		eventually(t, "the loop to arm its timer a second ahead", func() bool { return h.timers.live(time.Second) > 0 })
+		hubtest.Eventually(t, "the loop to arm its timer a second ahead", func() bool { return h.timers.live(time.Second) > 0 })
 		ticks := h.timers.created(sandbox.LifecycleInterval)
 		h.clock.Advance(time.Second)
-		eventually(t, "the sandbox to expire", func() bool { return storedRecord(t, h.Hub, later).State == sandbox.StateDeleted })
+		hubtest.Eventually(t, "the sandbox to expire", func() bool { return storedRecord(t, h.Hub, later).State == sandbox.StateDeleted })
 		if evs := h.sandboxEvents(t, sandbox.EventDelete, later); !bySystem(evs, "expired") {
 			t.Errorf("the delete events = %+v; want one {reason: expired} by the system", evs)
 		}
@@ -252,7 +254,7 @@ func TestLifecycleTimers(t *testing.T) {
 
 		// The loop arms its timer for the next expires_at, that of the idle
 		// rows, before the rows below make one.
-		eventually(t, "the loop to arm its timer for the next expires_at", func() bool {
+		hubtest.Eventually(t, "the loop to arm its timer for the next expires_at", func() bool {
 			return h.timers.created(t0.Add(time.Hour).Sub(h.clock.Now())) > 0
 		})
 		// A new ttl moves the timer to the new expires_at; a refused one
@@ -270,7 +272,7 @@ func TestLifecycleTimers(t *testing.T) {
 		if a := h.call(t, http.MethodPatch, path, h.key, map[string]any{"ttl": "2m"}); a.status != http.StatusOK {
 			t.Fatalf("PATCH = %d %s; want 200", a.status, a.body)
 		}
-		eventually(t, "the loop to arm its timer for the new expires_at", func() bool { return h.timers.created(2*time.Minute) > armed })
+		hubtest.Eventually(t, "the loop to arm its timer for the new expires_at", func() bool { return h.timers.created(2*time.Minute) > armed })
 		if n := h.timers.created(untilStored); n != 0 {
 			t.Errorf("the loop armed %d timers for the expires_at a refused change left; want none", n)
 		}
@@ -286,14 +288,14 @@ func TestLifecycleTimers(t *testing.T) {
 		h.rt.FailOperation(runtime.OpStopSandbox, runtime.ErrInvalid, "the runtime refuses the stop")
 		for pass := 1; pass <= 3; pass++ {
 			h.clock.Advance(sandbox.LifecycleInterval)
-			eventually(t, "the minute's idle pass", func() bool { return stops() == pass })
+			hubtest.Eventually(t, "the minute's idle pass", func() bool { return stops() == pass })
 			if rec := storedRecord(t, h.Hub, id); rec.State != sandbox.StateReady {
 				t.Fatalf("after the failed stop of pass %d the sandbox is %s; want it ready", pass, rec.State)
 			}
 		}
 		h.rt.FailOperation(runtime.OpStopSandbox, nil, "")
 		h.clock.Advance(sandbox.LifecycleInterval)
-		eventually(t, "the next pass to stop the sandbox", func() bool { return storedRecord(t, h.Hub, id).State == sandbox.StateStopped })
+		hubtest.Eventually(t, "the next pass to stop the sandbox", func() bool { return storedRecord(t, h.Hub, id).State == sandbox.StateStopped })
 		if rec := storedRecord(t, h.Hub, id); rec.StateReason != sandbox.StopIdle || stops() != 4 {
 			t.Errorf("the sandbox is stopped for %q after %d stop calls; want idle after 4", rec.StateReason, stops())
 		}

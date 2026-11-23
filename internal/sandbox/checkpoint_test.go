@@ -19,6 +19,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
@@ -500,7 +502,7 @@ func TestCheckpoint_RecordsAFailureAndKeepsTheLastRefs(t *testing.T) {
 				}()
 				if fault.bound {
 					hubtestWait(t, held, "the attempt to wait in a command")
-					eventually(t, "the attempt's bound", func() bool { return h.timers.live(sandbox.CheckpointBound) > 0 })
+					hubtest.Eventually(t, "the attempt's bound", func() bool { return h.timers.live(sandbox.CheckpointBound) > 0 })
 					h.clock.Advance(sandbox.CheckpointBound)
 				}
 				var r result
@@ -640,7 +642,7 @@ func TestCheckpointRoute(t *testing.T) {
 			defer close(done)
 			statuses[1] = h.call(t, http.MethodPost, path(id), h.key, nil).status
 		})
-		eventually(t, "the second checkpoint to end or wait for its turn", func() bool {
+		hubtest.Eventually(t, "the second checkpoint to end or wait for its turn", func() bool {
 			select {
 			case <-done:
 				return true

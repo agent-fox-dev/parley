@@ -40,7 +40,7 @@ func TestWorkers_TakeUpPendingAndCloningWorkInCreationOrderAtStart(t *testing.T)
 	wk := w.startWorkers(t, 1, runs.around(w.svc.Clone))
 	// Work recorded once Start has returned runs after all it queued.
 	wk.Enqueue("ws-z")
-	eventually(t, "four runs", func() bool { _, finished, _ := runs.snapshot(); return len(finished) == 4 })
+	hubtest.Eventually(t, "four runs", func() bool { _, finished, _ := runs.snapshot(); return len(finished) == 4 })
 	if started, _, _ := runs.snapshot(); !slices.Equal(started, []string{"ws-a", "ws-b", "ws-c", "ws-z"}) {
 		t.Errorf("clone work ran in the order %v, want ws-a, ws-b, ws-c, then the work recorded after the start", started)
 	}
@@ -102,7 +102,7 @@ func TestWorkers_RunAtMostTheirNumberOfClonesFirstRecordedFirst(t *testing.T) {
 	startedN := func(n int) func() bool {
 		return func() bool { started, _, _ := runs.snapshot(); return len(started) == n }
 	}
-	eventually(t, "two clones running", startedN(2))
+	hubtest.Eventually(t, "two clones running", startedN(2))
 	time.Sleep(50 * time.Millisecond)
 	if started, _, _ := runs.snapshot(); len(started) != 2 || !slices.Equal(slices.Sorted(slices.Values(started)), []string{"ws-1", "ws-2"}) {
 		t.Fatalf("running: %v, want ws-1 and ws-2 only", started)
@@ -114,13 +114,13 @@ func TestWorkers_RunAtMostTheirNumberOfClonesFirstRecordedFirst(t *testing.T) {
 	}
 	for n, next := range slugs[2:] {
 		runs.hold <- struct{}{}
-		eventually(t, next+" started", startedN(3+n))
+		hubtest.Eventually(t, next+" started", startedN(3+n))
 		if started, _, _ := runs.snapshot(); started[2+n] != next {
 			t.Errorf("after %d releases the clones started are %v, want %s next", n+1, started, next)
 		}
 	}
 	close(runs.hold)
-	eventually(t, "five runs", func() bool { _, finished, _ := runs.snapshot(); return len(finished) == 5 })
+	hubtest.Eventually(t, "five runs", func() bool { _, finished, _ := runs.snapshot(); return len(finished) == 5 })
 	if _, _, most := runs.snapshot(); most != 2 {
 		t.Errorf("at most %d clones ran at once, want 2", most)
 	}
@@ -166,7 +166,7 @@ func TestWorkers_StopInterruptsACloneAndLeavesItForTheNextStart(t *testing.T) {
 		t.Fatal(err)
 	}
 	wk.Enqueue("demo")
-	eventually(t, "the clone asks origin", func() bool { return o.Requests() > 0 })
+	hubtest.Eventually(t, "the clone asks origin", func() bool { return o.Requests() > 0 })
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	start := time.Now()
@@ -184,7 +184,7 @@ func TestWorkers_StopInterruptsACloneAndLeavesItForTheNextStart(t *testing.T) {
 	}
 	o.Release()
 	w.startWorkers(t, 1, nil)
-	eventually(t, "the next workers finish the clone", func() bool {
+	hubtest.Eventually(t, "the next workers finish the clone", func() bool {
 		rec, _ := w.workspace(t, "demo")
 		return rec.Status == workspace.StatusReady
 	})
@@ -205,7 +205,7 @@ WHEN NEW.status IN ('ready', 'failed') BEGIN SELECT RAISE(ABORT, 'the store refu
 	runs := &runLog{}
 	wk := w.startWorkers(t, 1, runs.around(w.svc.Clone))
 	wk.Enqueue("demo")
-	eventually(t, "the clone work returns", func() bool { _, finished, _ := runs.snapshot(); return len(finished) == 1 })
+	hubtest.Eventually(t, "the clone work returns", func() bool { _, finished, _ := runs.snapshot(); return len(finished) == 1 })
 	if rec, _ := w.workspace(t, "demo"); rec.Status != workspace.StatusCloning {
 		t.Fatalf("status %s while the store refuses the outcome, want cloning", rec.Status)
 	}
@@ -213,7 +213,7 @@ WHEN NEW.status IN ('ready', 'failed') BEGIN SELECT RAISE(ABORT, 'the store refu
 	if _, err := w.Store.Main().Exec(`DROP TRIGGER refuse_outcome`); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, "the workspace is failed once the store answers", func() bool {
+	hubtest.Eventually(t, "the workspace is failed once the store answers", func() bool {
 		rec, _ := w.workspace(t, "demo")
 		return rec.Status == workspace.StatusFailed
 	})
@@ -256,10 +256,10 @@ func TestWorkers_CloneWhatTheHubCreatesAndWhatWasPendingAtItsStart(t *testing.T)
 		return func() bool { rec, _ := w.workspace(t, slug); return rec.Status == workspace.StatusReady }
 	}
 	w.createFrom(t, "created", o.URL(), nil)
-	eventually(t, "the created workspace is ready", ready("created"))
+	hubtest.Eventually(t, "the created workspace is ready", ready("created"))
 	w.insertRecord(t, "waiting", workspace.StatusPending, w.clock(), o.URL())
 	w.Restart(t)
-	eventually(t, "the workspace pending at the start is ready", ready("waiting"))
+	hubtest.Eventually(t, "the workspace pending at the start is ready", ready("waiting"))
 	if _, err := (gitrepo.Git{}).Open(context.Background(), w.svc.RepoPath("waiting")); err != nil {
 		t.Errorf("no copy of the workspace pending at the start: %v", err)
 	}
@@ -307,7 +307,7 @@ func TestWorkers_CloneNothingWhenALaterPartStopsTheHubsStart(t *testing.T) {
 		t.Errorf("origin got %d requests from a hub whose start failed, want none", o.Requests()-asked)
 	}
 	w.Restart(t)
-	eventually(t, "the next start clones the waiting workspace", func() bool {
+	hubtest.Eventually(t, "the next start clones the waiting workspace", func() bool {
 		rec, _ := w.workspace(t, "waiting")
 		return rec.Status == workspace.StatusReady
 	})
@@ -320,7 +320,7 @@ func TestService_EnqueueHandsAPendingWorkspaceToTheCloneWorkers(t *testing.T) {
 	w := newWorld(t, withGitOrigin(o), withCloneWorkers())
 	w.insertRecord(t, "back", workspace.StatusPending, w.clock(), o.URL())
 	w.svc.Enqueue("back")
-	eventually(t, "the workspace put back to pending is ready", func() bool {
+	hubtest.Eventually(t, "the workspace put back to pending is ready", func() bool {
 		rec, _ := w.workspace(t, "back")
 		return rec.Status == workspace.StatusReady
 	})

@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
 )
@@ -69,11 +71,11 @@ func TestReconcile(t *testing.T) {
 		}
 		// The lifecycle loop and the reconciliation each wait on a timer of
 		// a minute, and each asks for the next once its pass has begun.
-		eventually(t, "both loops to wait a minute", func() bool { return h.timers.created(time.Minute) == 2 })
+		hubtest.Eventually(t, "both loops to wait a minute", func() bool { return h.timers.created(time.Minute) == 2 })
 		for i := 1; i <= 3; i++ {
 			armed := h.timers.created(time.Minute)
 			h.clock.Advance(time.Minute)
-			eventually(t, fmt.Sprintf("pass %d of the loop", i), func() bool {
+			hubtest.Eventually(t, fmt.Sprintf("pass %d of the loop", i), func() bool {
 				return passes() == 1+i && h.timers.created(time.Minute) == armed+2
 			})
 		}

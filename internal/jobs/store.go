@@ -94,7 +94,7 @@ func scanJob(s scanner) (Job, error) {
 	}
 	j.Payload = json.RawMessage(payload)
 	j.Result, j.Detail = document(result), document(detail)
-	j.NextAttemptAt, j.CompletedAt = timeOf(next), timeOf(completed)
+	j.NextAttemptAt, j.CompletedAt = store.TimeOf(next), store.TimeOf(completed)
 	if errText.Valid {
 		j.Error = &errText.String
 	}
@@ -108,15 +108,6 @@ func document(s sql.NullString) json.RawMessage {
 		return nil
 	}
 	return json.RawMessage(s.String)
-}
-
-// timeOf is a nullable UnixNano column as a time, nil for NULL.
-func timeOf(n sql.NullInt64) *time.Time {
-	if !n.Valid {
-		return nil
-	}
-	t := time.Unix(0, n.Int64).UTC()
-	return &t
 }
 
 // readJob reads the job id through q; a job that does not exist is

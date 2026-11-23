@@ -106,9 +106,9 @@ UPDATE workspaces SET
 	settings = ?, created_at = ?, updated_at = ?, instance_id = ?, maintenance = ?
 WHERE slug = ?`,
 		w.Mode, w.GitURL, w.DefaultBranch, w.DisplayName, w.Description,
-		w.HeadSHA, w.OriginHeadSHA, w.CloneError, nanos(w.LastSyncAt), w.SyncError,
+		w.HeadSHA, w.OriginHeadSHA, w.CloneError, store.Nanos(w.LastSyncAt), w.SyncError,
 		w.UpstreamURL, w.IntegrationBranch, w.UpstreamHeadSHA,
-		forkRef, forkSHA, nanos(w.ExpiresAt), w.AutoChange, w.Purpose, w.SessionID,
+		forkRef, forkSHA, store.Nanos(w.ExpiresAt), w.AutoChange, w.Purpose, w.SessionID,
 		settings, w.CreatedAt.UnixNano(), w.UpdatedAt.UnixNano(), w.InstanceID, string(w.Marker),
 		w.Slug)
 	if err != nil {
@@ -311,7 +311,7 @@ func scanWorkspace(scan func(dest ...any) error) (Workspace, error) {
 		w.ForkPoint = &ForkPoint{Ref: forkRef.String, SHA: forkSHA.String}
 	}
 	w.Status, w.Marker, w.CreatingTokenID = Status(status), Marker(marker), creator.String
-	w.LastSyncAt, w.ExpiresAt = fromNanos(lastSync), fromNanos(expires)
+	w.LastSyncAt, w.ExpiresAt = store.TimeOf(lastSync), store.TimeOf(expires)
 	w.CreatedAt, w.UpdatedAt = time.Unix(0, createdAt).UTC(), time.Unix(0, updatedAt).UTC()
 	return w, nil
 }
@@ -323,23 +323,6 @@ func encodeSettings(settings map[string]json.RawMessage) (string, error) {
 	}
 	b, err := json.Marshal(settings)
 	return string(b), err
-}
-
-// nanos is t as a query argument, NULL when t is nil.
-func nanos(t *time.Time) sql.NullInt64 {
-	if t == nil {
-		return sql.NullInt64{}
-	}
-	return sql.NullInt64{Int64: t.UnixNano(), Valid: true}
-}
-
-// fromNanos is a stored time, nil when it is NULL.
-func fromNanos(n sql.NullInt64) *time.Time {
-	if !n.Valid {
-		return nil
-	}
-	t := time.Unix(0, n.Int64).UTC()
-	return &t
 }
 
 // deref is *s, or "" when s is nil.

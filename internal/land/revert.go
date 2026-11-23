@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"slices"
 	"strconv"
@@ -47,16 +46,9 @@ type revertRequest struct {
 // not know are ignored; anything else is 400 invalid_request.
 func parseRevert(r *http.Request) (revertRequest, error) {
 	var req revertRequest
-	raw, err := io.ReadAll(r.Body)
-	if err != nil {
-		return req, server.InvalidRequest("request body could not be read")
-	}
 	body := map[string]json.RawMessage{}
-	if len(bytes.TrimSpace(raw)) > 0 {
-		r.Body = io.NopCloser(bytes.NewReader(raw))
-		if err := server.DecodeJSON(r, &body); err != nil {
-			return req, err
-		}
+	if err := server.DecodeOptionalJSON(r, &body); err != nil {
+		return req, err
 	}
 	texts := map[string]**string{"title": &req.title, "intent": &req.intent, "session_id": &req.sessionID}
 	for _, name := range []string{"title", "intent", "session_id", "draft", "auto_land"} {
@@ -121,7 +113,7 @@ func parseRevert(r *http.Request) (revertRequest, error) {
 func (c *Component) revertRoute(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	slug := server.Param(r, "slug")
-	number, ok := positive(server.Param(r, "number"))
+	number, ok := server.Positive(server.Param(r, "number"))
 	if !ok {
 		return change.ErrChangeNotFound
 	}

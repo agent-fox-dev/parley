@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/store"
+
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 )
 
@@ -88,7 +90,7 @@ func (c *Component) readLog(ctx context.Context, after int64, limit int) ([]Reco
 	}
 	var recs []Record
 	var b Bounds
-	err := c.snapshot(ctx, func(tx *sql.Tx) error {
+	err := store.ReadTx(ctx, c.deps.Store.Main(), func(tx *sql.Tx) error {
 		var err error
 		if b, err = readBounds(ctx, tx); err != nil {
 			return err
@@ -150,18 +152,6 @@ func (c *Component) Expire(ctx context.Context, cutoff time.Time) (int64, error)
 		return 0, fmt.Errorf("expire events before %s: %w", timefmt.Format(at), err)
 	}
 	return oldest, nil
-}
-
-// snapshot runs fn in a read-only transaction of the store, which begins
-// deferred, not with the write lock the store's other transactions take,
-// and sees one snapshot.
-func (c *Component) snapshot(ctx context.Context, fn func(*sql.Tx) error) error {
-	tx, err := c.deps.Store.Main().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	return fn(tx)
 }
 
 // queryRecords reads the stored events with after < seq <= upTo in q,

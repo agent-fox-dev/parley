@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
 	"github.com/agent-fox-dev/parley/internal/secret"
@@ -111,7 +113,7 @@ func TestPolicyCollector_FollowsThePolicyLogOfEachReadySandboxOnly(t *testing.T)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	col.Pass(ctx)
-	eventually(t, "the collector to follow "+a, func() bool { return slices.Equal(sandbox.PolicyFollowers(col), []string{a}) })
+	hubtest.Eventually(t, "the collector to follow "+a, func() bool { return slices.Equal(sandbox.PolicyFollowers(col), []string{a}) })
 
 	bg := context.Background()
 	if _, err := h.svc.Transition(bg, nil, c, sandbox.StateProvisioning, sandbox.StateReady, "", nil); err != nil {
@@ -121,10 +123,10 @@ func TestPolicyCollector_FollowsThePolicyLogOfEachReadySandboxOnly(t *testing.T)
 		t.Fatal(err)
 	}
 	col.Pass(ctx)
-	eventually(t, "the collector to follow "+c+" alone", func() bool { return slices.Equal(sandbox.PolicyFollowers(col), []string{c}) })
+	hubtest.Eventually(t, "the collector to follow "+c+" alone", func() bool { return slices.Equal(sandbox.PolicyFollowers(col), []string{c}) })
 	// The streams the runtime has open are the collector's alone: the
 	// hub's log collector is held.
-	eventually(t, "the log of "+c+" alone to be open", func() bool { return slices.Equal(h.followed(), []string{c}) })
+	hubtest.Eventually(t, "the log of "+c+" alone to be open", func() bool { return slices.Equal(h.followed(), []string{c}) })
 
 	returned := make(chan struct{})
 	go func() {
@@ -161,7 +163,7 @@ func TestPolicyCollector_OpensAFailedPolicyLogAgainAfterTheRetryDelay(t *testing
 			col := h.collector(t)
 			waitStopped := func() {
 				t.Helper()
-				eventually(t, "the follower of "+id+" to stop", func() bool { return len(sandbox.PolicyFollowers(col)) == 0 })
+				hubtest.Eventually(t, "the follower of "+id+" to stop", func() bool { return len(sandbox.PolicyFollowers(col)) == 0 })
 			}
 			before := h.counted()
 			h.deny(id, "curl", "x.example", 443, "GET", "/x")
@@ -192,7 +194,7 @@ func TestPolicyCollector_OpensAFailedPolicyLogAgainAfterTheRetryDelay(t *testing
 				h.retryClock.Advance(denialRetry)
 			}
 			col.Pass(ctx)
-			eventually(t, "the collector to follow "+id+" again", func() bool { return slices.Equal(sandbox.PolicyFollowers(col), []string{id}) })
+			hubtest.Eventually(t, "the collector to follow "+id+" again", func() bool { return slices.Equal(sandbox.PolicyFollowers(col), []string{id}) })
 
 			h.deny(id, "curl", "y.example", 443, "GET", "/y")
 			h.reported(t, id, 2)
@@ -257,7 +259,7 @@ func TestPolicyCollector_TakesADenialAgainLaterWhenTheSandboxsValuesCannotBeKnow
 	h.deny(id, "curl", "a.example", 443, "GET", "/a")
 	h.deny(id, "curl", "b.example", 443, "GET", "/b")
 	col.Pass(ctx)
-	eventually(t, "the follower of "+id+" to stop or report", func() bool {
+	hubtest.Eventually(t, "the follower of "+id+" to stop or report", func() bool {
 		return len(sandbox.PolicyFollowers(col)) == 0 || len(h.denials(t, id)) > 0
 	})
 	if evs := h.denials(t, id); len(evs) != 0 {
@@ -476,10 +478,10 @@ func TestPolicyCollector_ListsProposalsFirstOneIntervalAfterItStarts(t *testing.
 	}()
 	// The follower is started under the pass's lock, which PolicyFollowers
 	// takes: once it is there, the first pass is over.
-	eventually(t, "the first pass to follow "+id, func() bool { return slices.Equal(sandbox.PolicyFollowers(col), []string{id}) })
+	hubtest.Eventually(t, "the first pass to follow "+id, func() bool { return slices.Equal(sandbox.PolicyFollowers(col), []string{id}) })
 	if n := h.runtimeCalls(runtime.OpListProposals, ""); n != 0 {
 		t.Fatalf("proposal listings of the first pass = %d; want 0", n)
 	}
 	h.clock.Advance(collectorInterval)
-	eventually(t, "the proposal of "+id+" to be stored", func() bool { return len(h.proposals(t, id, sandbox.ProposalOpen)) == 1 })
+	hubtest.Eventually(t, "the proposal of "+id+" to be stored", func() bool { return len(h.proposals(t, id, sandbox.ProposalOpen)) == 1 })
 }

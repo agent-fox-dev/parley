@@ -55,7 +55,7 @@ func TestRecordCleanup_RemovesTheRecordsDeletedMoreThanADayAgo(t *testing.T) {
 		})
 	}
 	from := passes.Load()
-	eventually(t, "a maintenance pass", func() bool { return passes.Load() >= from+2 })
+	hubtest.Eventually(t, "a maintenance pass", func() bool { return passes.Load() >= from+2 })
 	for i, row := range rows {
 		t.Run(row.name, func(t *testing.T) {
 			a := h.call(t, http.MethodGet, sandboxPath("ws", ids[i]), h.key, nil)

@@ -17,13 +17,6 @@ import (
 // otherwise.
 type trialFunc func(ctx context.Context, repo *gitrepo.Repo, base, head, onto string) (*gitrepo.ConflictReport, error)
 
-// setTrial makes trial the trial rebase the conflict reads run.
-func (c *Component) setTrial(trial trialFunc) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.trialSeam = trial
-}
-
 // trial is the trial rebase the conflict reads run: the mergeability
 // check's, unless a test set another.
 func (c *Component) trial() trialFunc {

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/server"
+
 	"github.com/agent-fox-dev/parley/internal/scrub"
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 )
@@ -167,7 +169,7 @@ func (in Input) check() (Record, error) {
 	}
 	var session *string
 	if in.SessionID != nil {
-		if !isUUID(*in.SessionID) {
+		if !server.IsUUID(*in.SessionID) {
 			return Record{}, invalid("session_id", "%q is not a UUID", *in.SessionID)
 		}
 		s := strings.ToLower(*in.SessionID)
@@ -213,26 +215,6 @@ func encodeMetadata(m any) (json.RawMessage, error) {
 		return nil, invalid("metadata", "is not a JSON object")
 	}
 	return json.RawMessage(b.Bytes()), nil
-}
-
-// isUUID reports whether s is a UUID in the 8-4-4-4-12 form, in either case.
-func isUUID(s string) bool {
-	if len(s) != 36 {
-		return false
-	}
-	for i, c := range s {
-		switch i {
-		case 8, 13, 18, 23:
-			if c != '-' {
-				return false
-			}
-		default:
-			if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F') {
-				return false
-			}
-		}
-	}
-	return true
 }
 
 // maxPaths is the most paths a metadata list built with PathList holds.

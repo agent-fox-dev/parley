@@ -115,6 +115,7 @@ grepping for declarations.
   with the options a test gives until the test ends (its `Served` has
   `URL(path)` and `Call(t, method, path, credential, body)`, which sends a
   request with a bearer credential and returns the answer's status and
-  body), and `hubtest.LogBuffer` is the buffer a running hub may write its
-  log to while the test reads it. A test that needs a running hub starts it
+  body), `hubtest.LogBuffer` is the buffer a running hub may write its
+  log to while the test reads it, and `hubtest.Eventually` waits for a
+  condition to hold. A test that needs a running hub starts it
   with these.

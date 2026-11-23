@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+	"uuid"
 
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
@@ -45,7 +46,7 @@ func (c *Component) readPostmortem(f fields, t target) (p postmortem, err error)
 		return postmortem{}, err
 	}
 	now := c.deps.Now().UTC().Truncate(time.Second)
-	p.head = head{ID: newID(), Workspace: t.workspace, RunID: t.runID, Timestamp: clientTime(now), IngestedAt: timefmt.Time(now)}
+	p.head = head{ID: uuid.NewV4().String(), Workspace: t.workspace, RunID: t.runID, Timestamp: clientTime(now), IngestedAt: timefmt.Time(now)}
 	p.SchemaVersion = postmortemVersion
 	if _, err := f.required("run_status"); err != nil {
 		return postmortem{}, err

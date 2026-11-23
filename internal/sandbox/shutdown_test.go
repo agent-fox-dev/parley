@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
 )
@@ -22,7 +24,7 @@ func TestShutdown_EndsTheBackgroundWorkWithoutTouchingTheRuntimeOrARecord(t *tes
 	h := startCheckpointHub(t)
 	// The hub's own loops are waiting for the clock, which does not move, so
 	// that what follows is the work this test starts and stops.
-	eventually(t, "the hub's loops to wait a minute", func() bool { return h.timers.created(time.Minute) == 2 })
+	hubtest.Eventually(t, "the hub's loops to wait a minute", func() bool { return h.timers.created(time.Minute) == 2 })
 	h.hooks.set(func(ctx context.Context, op, _ string) error {
 		if op != runtime.OpExec {
 			return nil
@@ -54,7 +56,7 @@ func TestShutdown_EndsTheBackgroundWorkWithoutTouchingTheRuntimeOrARecord(t *tes
 	work.Go(func() { _ = h.svc.IdlePass(ctx) })
 	work.Go(func() { _ = h.svc.Reconcile(ctx) })
 	busy := []string{ids["ready, idle"], ids["ready, expired"], ids["ready, main process ended"]}
-	eventually(t, "a checkpoint of each pass to run a command", func() bool {
+	hubtest.Eventually(t, "a checkpoint of each pass to run a command", func() bool {
 		for _, id := range busy {
 			if len(h.hooks.runs(id)) == 0 {
 				return false

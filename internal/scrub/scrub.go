@@ -140,18 +140,18 @@ func userinfoAt(text string, from int) int {
 			return -1
 		}
 		i += from
-		if _, at := authority(text, i+3); at >= 0 {
+		if at := authority(text, i+3); at >= 0 {
 			return i
 		}
 		from = i + 1
 	}
 }
 
-// authority returns the end of the authority that starts at start (the
-// index of the next '/', whitespace or the end of text) and the index of its
-// last '@', or -1 when it has none.
-func authority(text string, start int) (end, at int) {
-	end = start + strings.IndexFunc(text[start:], func(r rune) bool {
+// authority returns the index of the last '@' of the authority that starts
+// at start and ends at the next '/', whitespace or the end of text, or -1
+// when it has none.
+func authority(text string, start int) (at int) {
+	end := start + strings.IndexFunc(text[start:], func(r rune) bool {
 		return r == '/' || isSpace(r)
 	})
 	if end < start {
@@ -161,7 +161,7 @@ func authority(text string, start int) (end, at int) {
 	if at >= 0 {
 		at += start
 	}
-	return end, at
+	return at
 }
 
 func isSpace(r rune) bool {
@@ -184,7 +184,7 @@ func removeUserinfo(text string) string {
 	kept := 0
 	for i >= 0 {
 		start := i + 3
-		_, at := authority(text, start)
+		at := authority(text, start)
 		b.WriteString(text[kept:start])
 		kept = at + 1
 		// A later "://" begins at the authority's last character at the

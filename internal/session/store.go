@@ -240,7 +240,7 @@ func object(ctx context.Context, db *sql.DB, r row) (Object, error) {
 		ended := timefmt.Time(*r.EndedAt)
 		o.EndedAt = &ended
 	}
-	err := snapshot(ctx, db, func(tx *sql.Tx) error {
+	err := store.ReadTx(ctx, db, func(tx *sql.Tx) error {
 		var err error
 		if o.TokenSummary, err = tokenSummary(ctx, tx, r.ID); err != nil {
 			return err
@@ -251,19 +251,6 @@ func object(ctx context.Context, db *sql.DB, r row) (Object, error) {
 		return Object{}, err
 	}
 	return o, nil
-}
-
-// snapshot runs fn in a read-only transaction of db, which sees one
-// snapshot of the store. A read-only transaction begins deferred, not with
-// the write lock the store's other transactions take (_txlock=immediate),
-// so that it neither waits for a writer nor holds one up.
-func snapshot(ctx context.Context, db *sql.DB, fn func(*sql.Tx) error) error {
-	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return fmt.Errorf("begin a read: %w", err)
-	}
-	defer tx.Rollback()
-	return fn(tx)
 }
 
 // tokenSummary sums the usage records of the session id.

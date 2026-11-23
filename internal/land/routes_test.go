@@ -17,17 +17,13 @@ import (
 	"time"
 	"uuid"
 
+	"github.com/agent-fox-dev/parley/internal/server"
+
 	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/land"
 )
-
-// isUUID reports whether s is a UUID in its 36-character form.
-func isUUID(s string) bool {
-	_, err := uuid.Parse(s)
-	return len(s) == 36 && err == nil
-}
 
 // ids are the ids of the items of a list answer, in order.
 func ids(t *testing.T, answer map[string]any) []string {
@@ -525,7 +521,7 @@ func TestLand_CreatesARunningAttemptBeforeAnyReplay(t *testing.T) {
 	if status != 202 {
 		t.Fatalf("land = %d %v, want 202", status, a)
 	}
-	if id, _ := a["id"].(string); !isUUID(id) {
+	if id, _ := a["id"].(string); !server.IsUUID(id) {
 		t.Errorf("id %v is no UUID", a["id"])
 	}
 	want := map[string]any{"workspace_slug": "api", "target_branch": "main", "changes": []any{float64(three.Number)},
@@ -930,7 +926,7 @@ func TestLand_AnswersAFinalAttemptInTheFormOfItsStatus(t *testing.T) {
 			errObj, _ := r["error"].(map[string]any)
 			d, _ := errObj["details"].(map[string]any)
 			id, _ := d["id"].(string)
-			if status != c.status || errorType(r) != c.errorType || errObj["code"] != float64(c.status) || !isUUID(id) ||
+			if status != c.status || errorType(r) != c.errorType || errObj["code"] != float64(c.status) || !server.IsUUID(id) ||
 				d["status"] != c.final {
 				t.Fatalf("land = %d %v, want %d %s with the %s attempt in details", status, r, c.status, c.errorType, c.final)
 			}

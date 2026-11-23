@@ -16,6 +16,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
@@ -588,7 +590,7 @@ func TestPush_CompletesAfterTheCallerLeaves(t *testing.T) {
 			if c.outcome == "pushed" {
 				p.origin.Release()
 			}
-			eventually(t, "the push is recorded", func() bool { return len(p.eventsOf(t, pushEvent)) == n+1 })
+			hubtest.Eventually(t, "the push is recorded", func() bool { return len(p.eventsOf(t, pushEvent)) == n+1 })
 			want := ""
 			if c.outcome == "pushed" {
 				want = head

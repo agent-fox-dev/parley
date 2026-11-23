@@ -88,10 +88,12 @@ func Ended(c *Component, id string) <-chan struct{} { return c.ended(id) }
 // run, and returns what reads the count.
 func CountReplays(c *Component) func() int64 {
 	var n atomic.Int64
-	c.setTrial(func(ctx context.Context, repo *gitrepo.Repo, base, head, onto string) (*gitrepo.ConflictReport, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.trialSeam = func(ctx context.Context, repo *gitrepo.Repo, base, head, onto string) (*gitrepo.ConflictReport, error) {
 		n.Add(1)
 		return change.TrialRebase(ctx, repo, base, head, onto)
-	})
+	}
 	return n.Load
 }
 

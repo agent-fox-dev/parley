@@ -104,7 +104,7 @@ func (h *Hub) User(name string) *User {
 	}).Want(h.t, http.StatusOK)
 	user, _ := r.Body["user"].(map[string]any)
 	key, _ := r.Body["api_key"].(map[string]any)
-	u := &User{ID: str(user["id"]), Name: name, Email: email(name), Key: str(key["key"])}
+	u := &User{ID: Str(user["id"]), Name: name, Email: email(name), Key: Str(key["key"])}
 	h.users[name] = u
 	return u
 }
@@ -115,7 +115,7 @@ func (h *Hub) CreateOrg(slug string) string {
 	h.t.Helper()
 	r := h.Call(http.MethodPost, "/api/v1/orgs", h.AdminToken, map[string]any{"name": slug, "slug": slug}).
 		Want(h.t, http.StatusCreated)
-	return str(r.Body["id"])
+	return Str(r.Body["id"])
 }
 
 // AddMember makes u a member of the organization org, its id or slug.
@@ -146,15 +146,15 @@ func (h *Hub) mint(u *User, path string, permissions, paths []string) string {
 	if len(paths) > 0 {
 		body["paths"] = paths
 	}
-	return str(h.Call(http.MethodPost, path, u.Key, body).Want(h.t, http.StatusCreated).Body["token"])
+	return Str(h.Call(http.MethodPost, path, u.Key, body).Want(h.t, http.StatusCreated).Body["token"])
 }
 
 // AgentScopes are the permissions an agent's token needs to clone, push,
 // open and land changes in a fork.
 var AgentScopes = []string{"git:read", "git:write", "changes:read", "changes:write", "workspaces:read"}
 
-// str is v when it is a string, "" otherwise.
-func str(v any) string {
+// Str is v when it is a string, "" otherwise.
+func Str(v any) string {
 	s, _ := v.(string)
 	return s
 }

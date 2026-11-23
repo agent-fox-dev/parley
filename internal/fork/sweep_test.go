@@ -15,6 +15,8 @@ import (
 	"time"
 	"uuid"
 
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/fork"
 	"github.com/agent-fox-dev/parley/internal/hub"
@@ -281,9 +283,9 @@ func TestSweepLoop_PassesAtStartAndAtEachTickUntilCancelled(t *testing.T) {
 		defer close(ended)
 		fork.SweepLoop(ctx, ticks, func(context.Context) { passes.Add(1) })
 	}()
-	eventually(t, "the pass at start", func() bool { return passes.Load() == 1 })
+	hubtest.Eventually(t, "the pass at start", func() bool { return passes.Load() == 1 })
 	within(t, "the loop takes a tick", func() { ticks <- time.Now() })
-	eventually(t, "the pass of the tick", func() bool { return passes.Load() == 2 })
+	hubtest.Eventually(t, "the pass of the tick", func() bool { return passes.Load() == 2 })
 	cancel()
 	within(t, "the loop ends", func() { <-ended })
 	select {
@@ -306,13 +308,13 @@ func TestSweep_RunsAtEachTickAndAsTheMaintenanceTask(t *testing.T) {
 	w.seedFork(t, "demo--s", expiring(w, -time.Second))
 	w.seedFork(t, "demo--a", expiring(w, time.Minute))
 	tk.hold.Unlock()
-	eventually(t, "the pass at start removes demo--s", func() bool { return len(w.eventsFor(t, fork.EventExpire, "demo--s")) == 1 })
+	hubtest.Eventually(t, "the pass at start removes demo--s", func() bool { return len(w.eventsFor(t, fork.EventExpire, "demo--s")) == 1 })
 	w.advance(2 * time.Minute)
 	if n := len(w.eventsFor(t, fork.EventExpire, "demo--a")); n != 0 {
 		t.Fatalf("expire events of demo--a before the tick = %d, want none", n)
 	}
 	within(t, "the sweep takes a tick", func() { tk.c <- time.Now() })
-	eventually(t, "the tick's pass removes demo--a", func() bool { return len(w.eventsFor(t, fork.EventExpire, "demo--a")) == 1 })
+	hubtest.Eventually(t, "the tick's pass removes demo--a", func() bool { return len(w.eventsFor(t, fork.EventExpire, "demo--a")) == 1 })
 
 	// Held, the sweep waits for its ticker before its first pass, so only
 	// the maintenance loop's first pass can remove the fork.
@@ -320,7 +322,7 @@ func TestSweep_RunsAtEachTickAndAsTheMaintenanceTask(t *testing.T) {
 	tk.hold.Lock()
 	defer tk.hold.Unlock()
 	w.Restart(t)
-	eventually(t, "the maintenance pass removes demo--b", func() bool { return len(w.eventsFor(t, fork.EventExpire, "demo--b")) == 1 })
+	hubtest.Eventually(t, "the maintenance pass removes demo--b", func() bool { return len(w.eventsFor(t, fork.EventExpire, "demo--b")) == 1 })
 }
 
 func TestRunPass_KeepsAnExpiredForkWhoseLifetimeWasSetAgain(t *testing.T) {
@@ -480,16 +482,5 @@ func within(t *testing.T, what string, fn func()) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatalf("%s: not within 10 s", what)
-	}
-}
-
-// eventually waits up to 10 s for cond to hold and fails the test, naming
-// what, when it does not.
-func eventually(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	for deadline := time.Now().Add(10 * time.Second); !cond(); time.Sleep(5 * time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatalf("%s: not within 10 s", what)
-		}
 	}
 }

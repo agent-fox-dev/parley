@@ -234,7 +234,7 @@ func TestMCP_GivesACallThatOutlastsItsBoundAsAResult(t *testing.T) {
 	_, waiting, _ := h.held()
 	answered := h.sending(context.Background(), http.MethodPost, sandboxPath("ws", id)+"/mcp", h.key,
 		map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": map[string]any{"name": "execute"}}, mcpHeader)
-	eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
+	hubtest.Eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
 	h.clock.Advance(10 * 60 * 1e9)
 	a := rpcAnswer{answer: receive(t, answered)}
 	readRPC(&a)
@@ -303,7 +303,7 @@ func TestMCP_AnswersAFailedCallAndABusySandboxAsErrors(t *testing.T) {
 	t.Run("a sandbox that runs as many commands as it may", func(t *testing.T) {
 		release, waiting, _ := h.held()
 		first := h.sending(context.Background(), http.MethodPost, toolPath(id, "execute"), h.key, nil, nil)
-		eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
+		hubtest.Eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
 		a := h.mcpCall(t, id, h.key, "read_file", nil)
 		wantRPCError(t, a, -32000)
 		if a.rpcErr.Message != "sandbox busy" {

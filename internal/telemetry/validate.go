@@ -2,7 +2,6 @@ package telemetry
 
 import (
 	"bytes"
-	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -176,34 +175,10 @@ func (f fields) runID(path string) error {
 // normaliseUUID reports whether s is a UUID in the 8-4-4-4-12 hexadecimal
 // form, of any version and letter case, and returns it in lower case.
 func normaliseUUID(s string) (string, bool) {
-	if len(s) != 36 {
+	if !server.IsUUID(s) {
 		return "", false
 	}
-	for i := range len(s) {
-		c := s[i]
-		switch i {
-		case 8, 13, 18, 23:
-			if c != '-' {
-				return "", false
-			}
-		default:
-			if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F') {
-				return "", false
-			}
-		}
-	}
 	return strings.ToLower(s), true
-}
-
-// newID returns a random (version 4) UUID in lower case.
-func newID() string {
-	var b [16]byte
-	// crypto/rand.Read never returns an error; it ends the program when the
-	// system's random source fails.
-	_, _ = rand.Read(b[:])
-	b[6] = b[6]&0x0f | 0x40
-	b[8] = b[8]&0x3f | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 // parseTimestamp reads the client timestamp s, RFC 3339 with any offset,

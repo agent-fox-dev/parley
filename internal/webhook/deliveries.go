@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/store"
+
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
@@ -356,6 +358,6 @@ func scanRecord(row interface{ Scan(dest ...any) error }) (record, error) {
 		d.DurationMS = &duration.Int64
 	}
 	d.CreatedAt = time.Unix(0, createdAt).UTC()
-	d.LastAttemptAt, d.NextAttemptAt = timeOf(last), timeOf(next)
+	d.LastAttemptAt, d.NextAttemptAt = store.TimeOf(last), store.TimeOf(next)
 	return d, nil
 }

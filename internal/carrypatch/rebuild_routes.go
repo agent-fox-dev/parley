@@ -1,13 +1,11 @@
 package carrypatch
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"slices"
@@ -289,19 +287,12 @@ func errConcurrentRebuild(slug, id string) error {
 // from their lists or null; an empty string or null leaves the setting to
 // decide. Members the body does not define are ignored.
 func submitOptionsOf(r *http.Request) (RebuildOptions, error) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		return RebuildOptions{}, server.InvalidRequest("request body could not be read")
-	}
-	if len(bytes.TrimSpace(body)) == 0 {
-		return RebuildOptions{}, nil
-	}
-	r.Body = io.NopCloser(bytes.NewReader(body))
 	var members map[string]json.RawMessage
-	if err := server.DecodeJSON(r, &members); err != nil {
+	if err := server.DecodeOptionalJSON(r, &members); err != nil {
 		return RebuildOptions{}, err
 	}
 	var opts RebuildOptions
+	var err error
 	if opts.Strategy, err = enumMember(members, "strategy", strategyRebase, strategyMerge); err != nil {
 		return RebuildOptions{}, err
 	}

@@ -264,7 +264,7 @@ func TestReclone_WaitsOutASyncOrPushAlreadyRunning(t *testing.T) {
 			work := s.send(http.MethodPost, s.uKey, "/api/v1/workspaces/"+syncSlug+c.path, nil)
 			<-held
 			reclone := s.send(http.MethodPost, s.uKey, "/api/v1/workspaces/"+syncSlug+"/reclone", nil)
-			eventually(t, "the reclone sets its marker", func() bool {
+			hubtest.Eventually(t, "the reclone sets its marker", func() bool {
 				rec, _ := s.workspace(t, syncSlug)
 				return rec.Marker == workspace.MarkerReclone
 			})

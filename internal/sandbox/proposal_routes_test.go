@@ -427,7 +427,7 @@ func TestApprove_StoresTheDecisionOnceTheRuntimeHasTheRuleThoughTheCallerLeft(t 
 	if a := <-answered; a.status != 0 {
 		t.Fatalf("the caller got %d %s; want it gone before the answer", a.status, a.body)
 	}
-	eventually(t, "the approval to be stored", func() bool {
+	hubtest.Eventually(t, "the approval to be stored", func() bool {
 		stored, err := sandbox.GetProposal(context.Background(), h.Store.Main(), id, p.ID)
 		return err == nil && stored.State == sandbox.ProposalApproved
 	})
@@ -467,7 +467,7 @@ func TestApprove_DuringAStartReachesThePolicyTheSandboxStartsWith(t *testing.T) 
 	// ordered, answers while the start waits.
 	var a answer
 	got := false
-	eventually(t, "the approval to answer or to wait for the start", func() bool {
+	hubtest.Eventually(t, "the approval to answer or to wait for the start", func() bool {
 		select {
 		case a = <-answered:
 			got = true

@@ -14,9 +14,10 @@ import (
 	"testing"
 	"time"
 
+	"uuid"
+
 	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/webhook"
-	"github.com/google/uuid"
 )
 
 // seeded is a delivery record a test writes to the store as the loop or a
@@ -95,9 +96,9 @@ func TestDeliveries_ListsTheSubscriptionsRecordsNewestFirst(t *testing.T) {
 
 	t0 := w.clock.Now()
 	at := func(d time.Duration) time.Time { return t0.Add(d) }
-	pair := []string{uuid.NewString(), uuid.NewString()}
+	pair := []string{uuid.NewV4().String(), uuid.NewV4().String()}
 	sort.Sort(sort.Reverse(sort.StringSlice(pair)))
-	oldest, older, pending := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	oldest, older, pending := uuid.NewV4().String(), uuid.NewV4().String(), uuid.NewV4().String()
 	for _, d := range []seeded{
 		{id: oldest, typ: "parley.test.a", status: "succeeded", seq: 3, attempts: 1, createdAt: at(-5 * time.Minute), lastAttemptAt: at(-5 * time.Minute)},
 		{id: older, typ: "parley.test.a", status: "succeeded", seq: 4, attempts: 1, createdAt: at(-4 * time.Minute), lastAttemptAt: at(-4 * time.Minute)},
@@ -107,7 +108,7 @@ func TestDeliveries_ListsTheSubscriptionsRecordsNewestFirst(t *testing.T) {
 	} {
 		w.seed(t, id, d)
 	}
-	w.seed(t, otherID, seeded{id: uuid.NewString(), typ: "parley.test.a", status: "succeeded", seq: 3, attempts: 1, createdAt: t0, lastAttemptAt: t0})
+	w.seed(t, otherID, seeded{id: uuid.NewV4().String(), typ: "parley.test.a", status: "succeeded", seq: 3, attempts: 1, createdAt: t0, lastAttemptAt: t0})
 	newestFirst := []string{pending, pair[0], pair[1], older, oldest}
 
 	status, page, raw := w.deliveryList(t, id, nil)
@@ -301,12 +302,12 @@ func TestRedeliver_RefusesWhatCannotBeSentAgain(t *testing.T) {
 		errorType string
 	}{
 		{"not a UUID", "abc", false, http.StatusBadRequest, "invalid_request"},
-		{"an unknown id", uuid.NewString(), false, http.StatusNotFound, "delivery_not_found"},
+		{"an unknown id", uuid.NewV4().String(), false, http.StatusNotFound, "delivery_not_found"},
 		{"a delivery of another subscription", otherDelivery, false, http.StatusNotFound, "delivery_not_found"},
 		{"a pending delivery", pending.id, false, http.StatusConflict, "delivery_pending"},
 		{"a ping", pingID, false, http.StatusBadRequest, "invalid_request"},
 		{"an event that left the log", goneDelivery, false, http.StatusGone, "event_expired"},
-		{"an unknown id without a key", uuid.NewString(), true, http.StatusNotFound, "delivery_not_found"},
+		{"an unknown id without a key", uuid.NewV4().String(), true, http.StatusNotFound, "delivery_not_found"},
 		{"a ping without a key", pingID, true, http.StatusBadRequest, "invalid_request"},
 		{"a pending delivery without a key", pending.id, true, http.StatusServiceUnavailable, "secrets_unavailable"},
 		{"an event that left the log without a key", goneDelivery, true, http.StatusServiceUnavailable, "secrets_unavailable"},
@@ -360,7 +361,7 @@ func TestPruneDeliveries_DeletesEndedRecordsLastAttemptedOrCreatedBeforeTheTime(
 		{"parley.test.a", "failed", ago(8 * day), time.Time{}, false},
 		{"parley.test.a", "failed", ago(day), time.Time{}, true},
 	} {
-		did := uuid.NewString()
+		did := uuid.NewV4().String()
 		w.seed(t, id, seeded{id: did, typ: tc.typ, status: tc.status, seq: 1, attempts: 1, createdAt: tc.created, lastAttemptAt: tc.last})
 		if tc.keep {
 			kept = append(kept, did)

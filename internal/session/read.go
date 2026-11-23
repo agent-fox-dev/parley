@@ -42,7 +42,7 @@ func (c *Component) readRoute(w http.ResponseWriter, r *http.Request) error {
 // may not read (see canRead). The id is looked up in lower case, so it is
 // accepted in any letter case.
 func (c *Component) readableSession(ctx context.Context, caller access.Caller, pathID string) (row, error) {
-	if !isUUID(pathID) {
+	if !server.IsUUID(pathID) {
 		return row{}, server.InvalidRequest("the session id must be a UUID in the 8-4-4-4-12 form")
 	}
 	s, found, err := readRow(ctx, c.deps.Store.Main(), strings.ToLower(pathID))

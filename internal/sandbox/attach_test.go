@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+
 	"golang.org/x/net/websocket"
 
 	"github.com/agent-fox-dev/parley/internal/sandbox"
@@ -70,7 +72,7 @@ func TestAttach_ServesAShellOverAWebSocket(t *testing.T) {
 		term := h.terms.last(t, id)
 		want := []runtime.TerminalSize{{Cols: 100, Rows: 30}}
 		sendFrame(t, ws, `{"resize":{"cols":100,"rows":30}}`)
-		eventually(t, "the resize", func() bool { return slices.Equal(term.resized(), want) })
+		hubtest.Eventually(t, "the resize", func() bool { return slices.Equal(term.resized(), want) })
 		for _, text := range []string{"hello", `{"resize":{"cols":0,"rows":30}}`, `{"resize":{"cols":100,"rows":1001}}`, `{"resize":{}}`, `{"other":1}`} {
 			sendFrame(t, ws, text)
 			sendFrame(t, ws, []byte("x"))
@@ -136,7 +138,7 @@ func TestAttach_EndsOnlyItsShellWhenTheCallerLeavesOrTheHubStops(t *testing.T) {
 		cancel()
 		<-answered
 	}()
-	eventually(t, "the command to wait", func() bool { _, _, waiting, _ := h.cmds.counts(); return waiting == 1 })
+	hubtest.Eventually(t, "the command to wait", func() bool { _, _, waiting, _ := h.cmds.counts(); return waiting == 1 })
 
 	_ = ws1.Close()
 	within(t, time.Second, "the first terminal to close", func() bool { return first.closedByHub() && openTerminals(h.rt, id) == 1 })

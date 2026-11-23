@@ -9,6 +9,8 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/agent-fox-dev/parley/internal/store"
+
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
@@ -344,7 +346,7 @@ func parseList(r *http.Request) (listQuery, error) {
 		return listQuery{}, server.InvalidRequest("sort takes only number")
 	}
 	if query.Has("stack_of") {
-		n, ok := positive(query.Get("stack_of"))
+		n, ok := server.Positive(query.Get("stack_of"))
 		if !ok {
 			return listQuery{}, server.InvalidRequest("stack_of must be a positive integer")
 		}
@@ -362,7 +364,7 @@ func parseList(r *http.Request) (listQuery, error) {
 	}
 	// A stack is listed in every state.
 	if lq.stackOf == 0 {
-		lq.filter(`state IN (`+strings.TrimSuffix(strings.Repeat("?,", len(states)), ",")+`)`, anys(states)...)
+		lq.filter(`state IN (`+strings.TrimSuffix(strings.Repeat("?,", len(states)), ",")+`)`, store.Args(states)...)
 	}
 	for _, f := range []struct {
 		name, column string
@@ -412,13 +414,4 @@ func authorOf(r *http.Request, query url.Values) (string, error) {
 		return "", server.InvalidRequest("author=me names the caller's user, and the admin token has none")
 	}
 	return p.User.ID, nil
-}
-
-// anys is s as a list of query arguments.
-func anys(s []string) []any {
-	out := make([]any, len(s))
-	for i, v := range s {
-		out[i] = v
-	}
-	return out
 }

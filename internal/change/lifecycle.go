@@ -1,13 +1,11 @@
 package change
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"slices"
 
@@ -73,7 +71,7 @@ func (c *Component) abandonRoute(w http.ResponseWriter, r *http.Request) error {
 // abandoned.
 func (c *Component) parseAbandon(r *http.Request, abandoned *[]mergeKey) (operation, error) {
 	var body map[string]json.RawMessage
-	if err := decodeOptional(r, &body); err != nil {
+	if err := server.DecodeOptionalJSON(r, &body); err != nil {
 		return nil, err
 	}
 	reason, err := member[string](body, "reason", "a string")
@@ -353,18 +351,4 @@ func recreateBranch(ctx context.Context, repo *gitrepo.Repo, branch, head string
 		return "", false, server.Conflict(fmt.Sprintf("source branch %s is being written; try again", branch))
 	}
 	return now, false, nil
-}
-
-// decodeOptional is server.DecodeJSON for a body that may be absent: no
-// body, or one of white space only, leaves v as it is.
-func decodeOptional(r *http.Request, v any) error {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		return server.InvalidRequest("request body could not be read")
-	}
-	if len(bytes.TrimSpace(body)) == 0 {
-		return nil
-	}
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	return server.DecodeJSON(r, v)
 }

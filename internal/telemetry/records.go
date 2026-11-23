@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+	"uuid"
 
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
@@ -77,7 +78,7 @@ type trace struct {
 // the hub's time too.
 func (c *Component) readHead(f fields, t target) (head, error) {
 	now := c.deps.Now().UTC().Truncate(time.Second)
-	h := head{ID: newID(), Workspace: t.workspace, RunID: t.runID, Timestamp: clientTime(now), IngestedAt: timefmt.Time(now)}
+	h := head{ID: uuid.NewV4().String(), Workspace: t.workspace, RunID: t.runID, Timestamp: clientTime(now), IngestedAt: timefmt.Time(now)}
 	id, err := f.uuid("id")
 	if err != nil {
 		return head{}, err

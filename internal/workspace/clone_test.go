@@ -182,7 +182,7 @@ func (w *world) workerRounds(t *testing.T, rounds int, slugs []string) {
 		for _, slug := range slugs {
 			wk.Enqueue(slug)
 		}
-		eventually(t, fmt.Sprintf("worker round %d", round), func() bool {
+		hubtest.Eventually(t, fmt.Sprintf("worker round %d", round), func() bool {
 			_, finished, _ := runs.snapshot()
 			return len(finished) == round*len(slugs)
 		})

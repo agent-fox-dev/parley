@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/agent-fox-dev/parley/internal/store"
 )
 
 // The statuses of a delivery.
@@ -57,7 +59,7 @@ func pendingDelivery(ctx context.Context, q querier, id string) (delivery, bool,
 	if err != nil {
 		return delivery{}, false, fmt.Errorf("read the pending delivery of event webhook %s: %w", id, err)
 	}
-	d.FirstAttemptAt, d.NextAttemptAt = timeOf(first), timeOf(next)
+	d.FirstAttemptAt, d.NextAttemptAt = store.TimeOf(first), store.TimeOf(next)
 	return d, true, nil
 }
 

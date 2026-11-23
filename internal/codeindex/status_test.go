@@ -191,7 +191,7 @@ func TestStatus_ShowsAFailureScrubbedAndCut(t *testing.T) {
 	}}, s.adjust)
 	w.addWorkspace(t, "demo", map[string]string{"a.go": "package a\n"})
 	w.queue(t, "demo")
-	eventually(t, "the build to fail", func() bool { return w.record(t, "demo").Error != "" })
+	hubtest.Eventually(t, "the build to fail", func() bool { return w.record(t, "demo").Error != "" })
 
 	got := w.statusOf(t, "demo")
 	text := str(got.Error)
@@ -259,7 +259,7 @@ func TestMetrics_CountsTheBuildsAndMeasuresTheDisk(t *testing.T) {
 	})
 	w.addWorkspace(t, "broken", map[string]string{"a.go": "package a\n"})
 	w.queue(t, "broken")
-	eventually(t, "the build of broken to fail", func() bool { return w.builds(t)["failed"] >= 1 })
+	hubtest.Eventually(t, "the build of broken to fail", func() bool { return w.builds(t)["failed"] >= 1 })
 
 	text := w.metricsText(t)
 	// The failed build is retried after its delay, so it may have failed

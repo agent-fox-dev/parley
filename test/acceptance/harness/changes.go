@@ -76,6 +76,3 @@ func Num(v any) int {
 	}
 	return int(f)
 }
-
-// Str is v when it is a string, "" otherwise.
-func Str(v any) string { return str(v) }

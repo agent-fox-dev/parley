@@ -8,11 +8,12 @@ import (
 	"net/http"
 	"time"
 
+	"uuid"
+
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/server"
-	"github.com/google/uuid"
 )
 
 // EventPing is the type of the test delivery a ping sends. It is never
@@ -45,14 +46,14 @@ func (c *Component) ping(w http.ResponseWriter, r *http.Request, q request) erro
 	at := c.deps.Clock.Now().UTC().Truncate(time.Second)
 	actorType, actorID := actorOf(caller)
 	body, err := event.Record{
-		ID: uuid.NewString(), Type: EventPing, Time: at, Workspace: &sub.Workspace,
+		ID: uuid.NewV4().String(), Type: EventPing, Time: at, Workspace: &sub.Workspace,
 		ActorType: actorType, ActorID: actorID, ResourceType: resourceType, ResourceID: sub.ID,
 		Action: actionPing, Metadata: json.RawMessage("{}"),
 	}.MarshalJSON()
 	if err != nil {
 		return err
 	}
-	d := delivery{ID: uuid.NewString(), Type: EventPing}
+	d := delivery{ID: uuid.NewV4().String(), Type: EventPing}
 	// A caller that leaves does not end the attempt, bounded by
 	// [webhooks].timeout on its own, so that the record holds what the
 	// receiver answered rather than a failure the receiver never caused.

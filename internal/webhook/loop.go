@@ -8,9 +8,10 @@ import (
 	"sync"
 	"time"
 
+	"uuid"
+
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/secret"
-	"github.com/google/uuid"
 )
 
 // readBatch is how many events a loop reads from the log at a time.
@@ -306,7 +307,7 @@ func (c *Component) examine(ctx context.Context, l *loop, sub Subscription) (nex
 		if !ok {
 			continue
 		}
-		d := delivery{ID: uuid.NewString(), Seq: rec.Seq, Type: rec.Type}
+		d := delivery{ID: uuid.NewV4().String(), Seq: rec.Seq, Type: rec.Type}
 		var opened bool
 		err = c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
 			// A subscription has one pending delivery at a time: the next

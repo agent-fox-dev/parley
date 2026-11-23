@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
@@ -301,11 +303,11 @@ func TestProvision_FailureAtEachStep(t *testing.T) {
 			}
 			// The count and the forgetting of the values follow the commit
 			// of the failed record, which settled waited for.
-			eventually(t, "the failed provisioning to be counted once", func() bool { return creates("failed") >= before+1 })
+			hubtest.Eventually(t, "the failed provisioning to be counted once", func() bool { return creates("failed") >= before+1 })
 			if got := creates("failed"); got != before+1 {
 				t.Errorf("creates_total{failed} = %v; want %v", got, before+1)
 			}
-			eventually(t, "the hub credential's value to be forgotten", func() bool {
+			hubtest.Eventually(t, "the hub credential's value to be forgotten", func() bool {
 				_, kept := h.svc.HubCredential(id)
 				return !kept
 			})
@@ -341,12 +343,12 @@ func TestProvision_ReportsTheEndAfterItsCommit(t *testing.T) {
 		return nil
 	})
 	id := sandboxObject(t, h.post(t, "demo--t1", map[string]any{"profile": "full"}))["id"].(string)
-	eventually(t, "the failed provisioning to revoke its hub credential", func() bool {
+	hubtest.Eventually(t, "the failed provisioning to revoke its hub credential", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		return revokes > 0
 	})
-	eventually(t, "the provisioning to end", func() bool { return h.timers.live(sandbox.ProvisionBound) == 0 })
+	hubtest.Eventually(t, "the provisioning to end", func() bool { return h.timers.live(sandbox.ProvisionBound) == 0 })
 	if rec := storedRecord(t, h.Hub, id); rec.State != sandbox.StateProvisioning || rec.Marker != sandbox.MarkerCreate {
 		t.Fatalf("sandbox = %s, marker %q; want it still provisioning with its marker, the end rolled back", rec.State, rec.Marker)
 	}
@@ -361,14 +363,14 @@ func TestProvision_ReportsTheEndAfterItsCommit(t *testing.T) {
 	// returned, after the bound is stopped, and a pass that finds it still
 	// being provisioned leaves it: passes come until one provisions it again.
 	provisionings := h.timers.created(sandbox.ProvisionBound)
-	eventually(t, "a pass to provision the sandbox again", func() bool {
+	hubtest.Eventually(t, "a pass to provision the sandbox again", func() bool {
 		h.pass(t, sandbox.ProvisionInterval)
 		return h.timers.created(sandbox.ProvisionBound) > provisionings
 	})
 	if rec := h.settled(t, id); rec.State != sandbox.StateFailed {
 		t.Fatalf("sandbox = %s; want failed", rec.State)
 	}
-	eventually(t, "creates_total{failed} to count the end", func() bool {
+	hubtest.Eventually(t, "creates_total{failed} to count the end", func() bool {
 		return h.rec.values(sandbox.CreatesMetric)["result=failed"] == 1
 	})
 }
@@ -440,7 +442,7 @@ func TestProvision_RecordDeletedMeanwhile(t *testing.T) {
 	rec := storedRecord(t, h.Hub, id)
 	close(p.release)
 
-	eventually(t, "the provisioning's clean-up", func() bool {
+	hubtest.Eventually(t, "the provisioning's clean-up", func() bool {
 		tok, err := identity.PATByID(ctx, h.Store.Main(), rec.HubTokenID)
 		return err == nil && tok.RevokedAt != nil && len(h.runtimeLeft(t, id)) == 0
 	})
@@ -455,7 +457,7 @@ func TestProvision_RecordDeletedMeanwhile(t *testing.T) {
 	if got := h.rec.values(sandbox.CreatesMetric); !maps.Equal(got, creates) {
 		t.Errorf("creates_total = %v; want it unchanged from %v", got, creates)
 	}
-	eventually(t, "the provisioning to end", func() bool { return h.timers.live(sandbox.ProvisionBound) == 0 })
+	hubtest.Eventually(t, "the provisioning to end", func() bool { return h.timers.live(sandbox.ProvisionBound) == 0 })
 	if _, kept := h.svc.HubCredential(id); kept {
 		t.Error("the hub credential's value is still held after the provisioning found its sandbox deleted")
 	}

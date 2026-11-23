@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime/runtimetest"
@@ -229,7 +231,7 @@ func TestToolCall_RemovesItsRequestFileHoweverItEnds(t *testing.T) {
 	t.Run("a call that outlasts its bound", func(t *testing.T) {
 		_, waiting, _ := h.held()
 		answered := h.sending(context.Background(), http.MethodPost, toolPath(id, "execute"), h.key, map[string]any{"timeout": "10s"}, nil)
-		eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
+		hubtest.Eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
 		h.clock.Advance(10 * time.Second)
 		if a := receive(t, answered); a.status != http.StatusOK {
 			t.Fatalf("the call = %d %s; want 200", a.status, a.body)
@@ -278,7 +280,7 @@ func TestToolCall_EndsACallThatOutlastsItsBound(t *testing.T) {
 	id := h.tooled(t, nil)
 	_, waiting, killed := h.held()
 	answered := h.sending(context.Background(), http.MethodPost, toolPath(id, "execute"), h.key, map[string]any{"timeout": "10s"}, nil)
-	eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
+	hubtest.Eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
 	h.clock.Advance(9 * time.Second)
 	select {
 	case a := <-answered:
@@ -288,7 +290,7 @@ func TestToolCall_EndsACallThatOutlastsItsBound(t *testing.T) {
 	h.clock.Advance(time.Second)
 	o := decoded(t, receive(t, answered), http.StatusOK)
 	wantMembers(t, o, map[string]any{"ok": false, "error": "timeout", "data": map[string]any{}, "duration_ms": 10000.0})
-	eventually(t, "the tool server to be killed", func() bool { return killed.Load() == 1 })
+	hubtest.Eventually(t, "the tool server to be killed", func() bool { return killed.Load() == 1 })
 	h.tools.SetCall(nil)
 	if a := h.tool(t, id, h.key, "read_file", nil); a.status != http.StatusOK {
 		t.Errorf("the next call = %d %s; want 200: the first gave its place back", a.status, a.body)
@@ -313,7 +315,7 @@ func TestToolCall_CountsAmongTheSandboxesCommands(t *testing.T) {
 	t.Run("while a tool call runs", func(t *testing.T) {
 		release, waiting, _ := h.held()
 		first := h.sending(context.Background(), http.MethodPost, toolPath(id, "execute"), h.key, nil, nil)
-		eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
+		hubtest.Eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
 		uploads := h.opsOf(runtime.OpUpload, id)
 		busy(t, h.tool(t, id, h.key, "read_file", nil))
 		busy(t, h.exec(t, id, map[string]any{"command": []string{"true"}}, nil))
@@ -332,11 +334,11 @@ func TestToolCall_CountsAmongTheSandboxesCommands(t *testing.T) {
 	t.Run("while an exec runs", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		running := h.execing(ctx, id, map[string]any{"command": []string{"block"}}, nil)
-		eventually(t, "the command to wait", func() bool { _, _, w, _ := h.cmds.counts(); return w == 1 })
+		hubtest.Eventually(t, "the command to wait", func() bool { _, _, w, _ := h.cmds.counts(); return w == 1 })
 		busy(t, h.tool(t, id, h.key, "read_file", nil))
 		cancel()
 		<-running
-		eventually(t, "a call to be accepted", func() bool { return h.tool(t, id, h.key, "read_file", nil).status == http.StatusOK })
+		hubtest.Eventually(t, "a call to be accepted", func() bool { return h.tool(t, id, h.key, "read_file", nil).status == http.StatusOK })
 	})
 }
 
@@ -408,7 +410,7 @@ func TestToolCall_AnswersTheFirstCheckARequestFails(t *testing.T) {
 		t.Fatalf("GET tools = %d %s; want 200", a.status, a.body)
 	}
 	running := h.execing(t.Context(), ready, map[string]any{"command": []string{"block"}}, nil)
-	eventually(t, "the command to wait", func() bool { _, _, w, _ := h.cmds.counts(); return w == 1 })
+	hubtest.Eventually(t, "the command to wait", func() bool { _, _, w, _ := h.cmds.counts(); return w == 1 })
 	noScope := h.pat(t, h.owner, "git:read")
 	const bad, good = `[]`, `{}`
 	for _, row := range []struct {
@@ -516,7 +518,7 @@ func TestToolCall_LeavesOneEventForEveryCallThatStarted(t *testing.T) {
 		_, waiting, _ := h.held()
 		before := len(h.toolEvents(t, id))
 		answered := h.sending(context.Background(), http.MethodPost, toolPath(id, "execute"), h.key, map[string]any{"timeout": "10s"}, nil)
-		eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
+		hubtest.Eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
 		h.clock.Advance(10 * time.Second)
 		receive(t, answered)
 		evs := h.toolEvents(t, id)
@@ -642,7 +644,7 @@ func TestToolCall_RecordsNothingForARequestThatNeverRan(t *testing.T) {
 	t.Run("a call over the sandbox's limit", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		running := h.execing(ctx, id, map[string]any{"command": []string{"block"}}, nil)
-		eventually(t, "the command to wait", func() bool { _, _, w, _ := h.cmds.counts(); return w == 1 })
+		hubtest.Eventually(t, "the command to wait", func() bool { _, _, w, _ := h.cmds.counts(); return w == 1 })
 		if a := h.tool(t, id, h.key, "read_file", nil); a.status != http.StatusTooManyRequests {
 			t.Errorf("a call over REST = %d %s; want 429", a.status, a.body)
 		}
@@ -659,7 +661,7 @@ func TestToolCall_RecordsNothingForARequestThatNeverRan(t *testing.T) {
 		t.Errorf("the refused requests were counted as tool calls: %v", got)
 	}
 	// The counter is there to count the next call.
-	eventually(t, "a call to be accepted", func() bool { return h.tool(t, id, h.key, "read_file", nil).status == http.StatusOK })
+	hubtest.Eventually(t, "a call to be accepted", func() bool { return h.tool(t, id, h.key, "read_file", nil).status == http.StatusOK })
 	if got := h.toolCallSamples(t); len(got) != 1 {
 		t.Errorf("after one call the counter has the samples %v; want one", got)
 	}
@@ -698,13 +700,13 @@ func TestToolCall_EndsACallNobodyWaitsForAndRecordsItAsFailed(t *testing.T) {
 	t.Run("when its caller leaves", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		answered := h.sending(ctx, http.MethodPost, toolPath(id, "execute"), h.key, nil, nil)
-		eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
+		hubtest.Eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
 		cancel()
 		if a := <-answered; a.status != 0 {
 			t.Errorf("the caller got %d %s; want no answer", a.status, a.body)
 		}
-		eventually(t, "the tool server to be killed", func() bool { return killed.Load() == 1 })
-		eventually(t, "the call's event", func() bool { return len(h.toolEvents(t, id)) == 1 })
+		hubtest.Eventually(t, "the tool server to be killed", func() bool { return killed.Load() == 1 })
+		hubtest.Eventually(t, "the call's event", func() bool { return len(h.toolEvents(t, id)) == 1 })
 		wantEvents(t, "rest")
 		if left := h.requestFiles(id); len(left) != 0 {
 			t.Errorf("the sandbox still holds the request files %v", left)
@@ -714,11 +716,11 @@ func TestToolCall_EndsACallNobodyWaitsForAndRecordsItAsFailed(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		answered := h.sending(ctx, http.MethodPost, sandboxPath("ws", id)+"/mcp", h.key,
 			map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": map[string]any{"name": "execute"}}, mcpHeader)
-		eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
+		hubtest.Eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
 		cancel()
 		<-answered
-		eventually(t, "the tool server to be killed", func() bool { return killed.Load() == 2 })
-		eventually(t, "the call's event", func() bool { return len(h.toolEvents(t, id)) == 2 })
+		hubtest.Eventually(t, "the tool server to be killed", func() bool { return killed.Load() == 2 })
+		hubtest.Eventually(t, "the call's event", func() bool { return len(h.toolEvents(t, id)) == 2 })
 		wantEvents(t, "rest", "mcp")
 		if got, want := h.toolCallSamples(t), []string{`tool="execute",outcome="failed" 2`}; !slices.Equal(got, want) {
 			t.Errorf("the tool call counter has the samples %v; want %v", got, want)
@@ -728,7 +730,7 @@ func TestToolCall_EndsACallNobodyWaitsForAndRecordsItAsFailed(t *testing.T) {
 		overREST := h.sending(context.Background(), http.MethodPost, toolPath(id, "execute"), h.key, nil, nil)
 		overMCP := h.sending(context.Background(), http.MethodPost, sandboxPath("ws", id)+"/mcp", h.key,
 			map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": map[string]any{"name": "execute"}}, mcpHeader)
-		eventually(t, "the calls to run", func() bool { return waiting.Load() == 2 })
+		hubtest.Eventually(t, "the calls to run", func() bool { return waiting.Load() == 2 })
 		h.Stop()
 		if code := h.ExitCode(t, 10*time.Second); code != 0 {
 			t.Fatalf("the hub stopped with %d; want 0", code)

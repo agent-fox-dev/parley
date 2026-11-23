@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/agent-fox-dev/parley/internal/store"
 )
 
 // position is a record's place in the order of a per-run list: its
@@ -125,17 +127,17 @@ func (s Scope) sql() (string, []any) {
 	var ors []string
 	var args []any
 	if len(s.Workspaces) > 0 {
-		ors, args = append(ors, "workspace IN ("+marks(len(s.Workspaces))+")"), append(args, anys(s.Workspaces)...)
+		ors, args = append(ors, "workspace IN ("+marks(len(s.Workspaces))+")"), append(args, store.Args(s.Workspaces)...)
 	}
 	if len(s.ForkParents) > 0 {
 		// A fork's slug is its parent's, "--" and a name, and no
 		// repository's slug holds "--".
 		fork := "instr(workspace, '--') > 0 AND substr(workspace, 1, instr(workspace, '--') - 1) IN (" +
 			marks(len(s.ForkParents)) + ")"
-		args = append(args, anys(s.ForkParents)...)
+		args = append(args, store.Args(s.ForkParents)...)
 		if len(s.Except) > 0 {
 			fork += " AND workspace NOT IN (" + marks(len(s.Except)) + ")"
-			args = append(args, anys(s.Except)...)
+			args = append(args, store.Args(s.Except)...)
 		}
 		ors = append(ors, "("+fork+")")
 	}
@@ -271,13 +273,4 @@ func typesCondition(column string, types []string) (string, []any) {
 // marks are n comma-separated placeholders.
 func marks(n int) string {
 	return strings.TrimSuffix(strings.Repeat("?, ", n), ", ")
-}
-
-// anys are ss as query arguments.
-func anys(ss []string) []any {
-	out := make([]any, len(ss))
-	for i, s := range ss {
-		out[i] = s
-	}
-	return out
 }

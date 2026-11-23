@@ -177,7 +177,7 @@ func (h *Hub) Sandbox(credential, workspace string, body map[string]any) *Sandbo
 // it is deleted when the test ends like those the harness creates.
 func (h *Hub) AdoptSandbox(credential, workspace string, obj map[string]any) *Sandbox {
 	h.t.Helper()
-	s := &Sandbox{hub: h, ID: str(obj["id"]), Workspace: workspace, Credential: credential, Body: obj}
+	s := &Sandbox{hub: h, ID: Str(obj["id"]), Workspace: workspace, Credential: credential, Body: obj}
 	if s.ID == "" {
 		h.t.Fatalf("the sandbox object of %s has no id: %v", workspace, obj)
 	}
@@ -246,7 +246,7 @@ func (s *Sandbox) failure() string {
 		for _, e := range stream.All() {
 			if e.Record["resource_id"] == s.ID {
 				meta, _ := e.Record["metadata"].(map[string]any)
-				return str(meta["error"])
+				return Str(meta["error"])
 			}
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -283,5 +283,5 @@ func (s *Sandbox) Exec(command ...string) Exec {
 	h := s.hub
 	h.t.Helper()
 	r := h.Call(http.MethodPost, s.Path("/exec"), s.Credential, map[string]any{"command": command}).Want(h.t, http.StatusOK)
-	return Exec{ExitCode: Num(r.Body["exit_code"]), Stdout: str(r.Body["stdout"]), Stderr: str(r.Body["stderr"])}
+	return Exec{ExitCode: Num(r.Body["exit_code"]), Stdout: Str(r.Body["stdout"]), Stderr: Str(r.Body["stderr"])}
 }

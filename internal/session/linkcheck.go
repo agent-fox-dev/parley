@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/agent-fox-dev/parley/internal/server"
+
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/identity"
 )
@@ -29,7 +31,7 @@ import (
 // asked (the caller's access to the operation's workspace is the calling
 // package's to decide), and Check writes nothing.
 func (c *Component) Check(ctx context.Context, caller identity.Principal, sessionID, slug string) (string, error) {
-	if !isUUID(sessionID) {
+	if !server.IsUUID(sessionID) {
 		return "", ErrUnknownSession
 	}
 	id := strings.ToLower(sessionID)

@@ -51,7 +51,7 @@ func TestActivity_RecordsWhenASandboxWasLastUsed(t *testing.T) {
 				} else {
 					s = h.streaming(t, context.Background(), id, body)
 				}
-				eventually(t, "the command to run", func() bool { _, running, _, _ := h.cmds.counts(); return running == 1 })
+				hubtest.Eventually(t, "the command to run", func() bool { _, running, _, _ := h.cmds.counts(); return running == 1 })
 				if got := h.lastActivity(t, id); !got.Equal(start) {
 					t.Errorf("while the command runs last_activity_at = %v, want its start %v", got, start)
 				}
@@ -149,7 +149,7 @@ func TestActivity_RecordsAToolCallWhenItStartsAndWhenItEnds(t *testing.T) {
 	release, waiting, _ := h.held()
 	start := h.clock.Now()
 	answered := h.sending(context.Background(), http.MethodPost, toolPath(id, "execute"), h.key, map[string]any{"timeout": "30m"}, nil)
-	eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
+	hubtest.Eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
 	if got := h.lastActivity(t, id); !got.Equal(start) || !got.After(before) {
 		t.Errorf("while the call runs last_activity_at = %v; want its start %v", got, start)
 	}
@@ -202,7 +202,7 @@ func TestActivity_LeavesTheTimeAloneWhenNothingUsesTheSandbox(t *testing.T) {
 		{"a line of the policy log", func(t *testing.T) {
 			n := len(h.lines(t, id, sandbox.LogSourcePolicy))
 			h.rt.EmitPolicyLog("parley", id, runtime.LogEntry{Action: "deny", Program: "/usr/bin/curl", Host: "example.com", Port: 443})
-			eventually(t, "the policy line to be stored", func() bool { return len(h.lines(t, id, sandbox.LogSourcePolicy)) == n+1 })
+			hubtest.Eventually(t, "the policy line to be stored", func() bool { return len(h.lines(t, id, sandbox.LogSourcePolicy)) == n+1 })
 		}},
 		{"an hour in which the main process writes nothing", func(t *testing.T) {
 			h.clock.Advance(time.Hour)
@@ -248,7 +248,7 @@ func TestActivity_LeavesTheTimeAloneWhenNothingUsesTheSandbox(t *testing.T) {
 			cancel()
 			<-answered
 		}()
-		eventually(t, "the command to wait", func() bool { _, _, waiting, _ := h.cmds.counts(); return waiting == 1 })
+		hubtest.Eventually(t, "the command to wait", func() bool { _, _, waiting, _ := h.cmds.counts(); return waiting == 1 })
 		h.setLastActivity(t, id, before)
 		if a := h.exec(t, id, map[string]any{"command": []string{"true"}}, nil); a.status != http.StatusTooManyRequests {
 			t.Fatalf("exec = %d %s, want 429", a.status, a.body)
@@ -332,7 +332,7 @@ func TestObservers_HearOnceOfEachOperationThatPassedTheChecks(t *testing.T) {
 			}, execMembers, map[string]any{"kind": "exec", "result": "nonzero", "exit_code": 2.0, "timed_out": false}},
 			{"an exec that outlasts its timeout", func(t *testing.T) {
 				answered := h.execing(context.Background(), id, map[string]any{"command": []string{"block"}, "timeout": "2s"}, nil)
-				eventually(t, "the command to wait", func() bool { _, _, waiting, _ := h.cmds.counts(); return waiting == 1 })
+				hubtest.Eventually(t, "the command to wait", func() bool { _, _, waiting, _ := h.cmds.counts(); return waiting == 1 })
 				h.clock.Advance(2 * time.Second)
 				if a := receive(t, answered); a.status != http.StatusOK {
 					t.Fatalf("exec = %d %s, want 200", a.status, a.body)
@@ -369,7 +369,7 @@ func TestObservers_HearOnceOfEachOperationThatPassedTheChecks(t *testing.T) {
 				n := len(rec.records())
 				start := h.clock.Now()
 				row.do(t)
-				eventually(t, "a record", func() bool { return len(rec.records()) > n })
+				hubtest.Eventually(t, "a record", func() bool { return len(rec.records()) > n })
 				records := rec.records()
 				if len(records) != n+1 {
 					t.Fatalf("the observer got %d records, want 1", len(records)-n)
@@ -428,17 +428,17 @@ func TestObservers_HearOnceOfEachOperationThatPassedTheChecks(t *testing.T) {
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		answered := h.execing(ctx, id, block, nil)
-		eventually(t, "the command to wait", func() bool { _, _, waiting, _ := h.cmds.counts(); return waiting == 1 })
+		hubtest.Eventually(t, "the command to wait", func() bool { _, _, waiting, _ := h.cmds.counts(); return waiting == 1 })
 		if a := h.exec(t, id, cmd, nil); a.status != http.StatusTooManyRequests {
 			t.Errorf("an exec over the limit = %d %s, want 429", a.status, a.body)
 		}
 		cancel()
 		<-answered
-		eventually(t, "the record of the command that waited", func() bool { return len(rec.records()) > n })
+		hubtest.Eventually(t, "the record of the command that waited", func() bool { return len(rec.records()) > n })
 		if a := h.exec(t, id, cmd, nil); a.status != http.StatusOK {
 			t.Fatalf("exec = %d %s, want 200", a.status, a.body)
 		}
-		eventually(t, "the record of the last exec", func() bool { return len(rec.records()) > n+1 })
+		hubtest.Eventually(t, "the record of the last exec", func() bool { return len(rec.records()) > n+1 })
 		records := rec.records()[n:]
 		if len(records) != 2 || !slices.Equal(records[0].Command, []string{"block"}) || records[1].Result != sandbox.ExecResultOK {
 			t.Errorf("the observer got %+v, want the records of the command that waited and of the last exec alone", records)
@@ -464,8 +464,8 @@ func TestObservers_HearOnceOfEachOperationThatPassedTheChecks(t *testing.T) {
 				n := len(rec.records())
 				o := decoded(t, h.exec(t, id, map[string]any{"command": []string{"true"}}, nil), http.StatusOK)
 				wantMembers(t, o, map[string]any{"exit_code": 0.0, "stdout": "", "stderr": "", "timed_out": false})
-				eventually(t, "the second observer's record", func() bool { return len(rec.records()) == n+1 })
-				eventually(t, "a log line of the failure", func() bool { return strings.Count(h.Log.String(), "observer failed") == failures+1 })
+				hubtest.Eventually(t, "the second observer's record", func() bool { return len(rec.records()) == n+1 })
+				hubtest.Eventually(t, "a log line of the failure", func() bool { return strings.Count(h.Log.String(), "observer failed") == failures+1 })
 			})
 		}
 	})

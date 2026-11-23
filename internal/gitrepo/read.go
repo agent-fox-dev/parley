@@ -127,7 +127,7 @@ func (r *Repo) ReadTree(ctx context.Context, commit, path string, read TreeRead)
 	case path == "" || lines[1] == names[1]+" missing" || !strings.HasSuffix(lines[1], " "+ObjectTree):
 		return Tree{}, fmt.Errorf("tree %s: %w", names[0], ErrNotFound)
 	default:
-		siblings, err := r.lsTree(ctx, strings.TrimSuffix(lines[1], " "+ObjectTree), "", false)
+		siblings, err := r.lsTree(ctx, strings.TrimSuffix(lines[1], " "+ObjectTree), "")
 		if err != nil {
 			return Tree{}, err
 		}
@@ -150,7 +150,7 @@ func (r *Repo) ReadTree(ctx context.Context, commit, path string, read TreeRead)
 	if read.Recursive {
 		entries, err = r.treeAfter(ctx, commit, dir, prefix, read.After, need)
 	} else {
-		entries, err = r.lsTree(ctx, dir, prefix, false)
+		entries, err = r.lsTree(ctx, dir, prefix)
 		sortByPath(entries)
 		entries = slices.DeleteFunc(entries, func(e TreeEntry) bool { return read.After != "" && e.Path <= read.After })
 	}
@@ -229,7 +229,7 @@ func (r *Repo) treeAfter(ctx context.Context, commit, tree, prefix, after string
 // with tail byte by byte, x holding no "/". The contents of a directory
 // are listed only when they come next.
 func (r *Repo) entriesAfter(ctx context.Context, tree, prefix, tail string, need int, out *[]TreeEntry) error {
-	own, err := r.lsTree(ctx, tree, prefix, false)
+	own, err := r.lsTree(ctx, tree, prefix)
 	if err != nil {
 		return err
 	}
@@ -413,7 +413,7 @@ func (r *Repo) LookupFile(ctx context.Context, commit, path string) (TreeEntry, 
 	if parent != "" {
 		prefix = parent + "/"
 	}
-	entries, err := r.lsTree(ctx, tree, prefix, false)
+	entries, err := r.lsTree(ctx, tree, prefix)
 	if err != nil {
 		return TreeEntry{}, err
 	}
@@ -471,14 +471,9 @@ func treeName(commit, dir string) string {
 }
 
 // lsTree lists the entries of the tree of the full id tree, each path
-// prefixed with prefix, or with recursive every entry below it,
-// directories included, in git's order.
-func (r *Repo) lsTree(ctx context.Context, tree, prefix string, recursive bool) ([]TreeEntry, error) {
-	args := []string{"ls-tree", "-z", "-l"}
-	if recursive {
-		args = append(args, "-r", "-t")
-	}
-	out, err := r.git(ctx, append(args, tree)...)
+// prefixed with prefix, in git's order.
+func (r *Repo) lsTree(ctx context.Context, tree, prefix string) ([]TreeEntry, error) {
+	out, err := r.git(ctx, "ls-tree", "-z", "-l", tree)
 	if err != nil {
 		return nil, err
 	}

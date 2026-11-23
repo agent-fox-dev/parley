@@ -238,17 +238,5 @@ func (l *callLog) calls() []string {
 	return slices.Clone(l.names)
 }
 
-// eventually polls cond every few milliseconds for up to 5 s.
-func eventually(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("%s: not within 5 s", what)
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-}
-
 // itoa formats a port for a configuration file.
 func itoa(n int) string { return strconv.Itoa(n) }

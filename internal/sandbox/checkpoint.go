@@ -423,7 +423,7 @@ func (r *checkpointRun) dirtyCommit(ctx context.Context, heads map[string]string
 		}
 	}
 	index := r.file("index")
-	if _, err := r.run(ctx, []string{"cp", "--", path.Join(r.gitDir, "index"), index}); err != nil {
+	if err := r.run(ctx, []string{"cp", "--", path.Join(r.gitDir, "index"), index}); err != nil {
 		return "", nil, err
 	}
 	env := map[string]string{"GIT_INDEX_FILE": index}
@@ -590,7 +590,7 @@ func (r *checkpointRun) cleanup(ctx context.Context) {
 		errs = append(errs, err)
 	}
 	if len(r.made) > 0 {
-		_, err := r.run(ctx, append([]string{"rm", "-f", "--"}, r.made...))
+		err := r.run(ctx, append([]string{"rm", "-f", "--"}, r.made...))
 		errs = append(errs, err)
 	}
 	if err := errors.Join(errs...); err != nil {
@@ -630,15 +630,15 @@ func (r *checkpointRun) git(ctx context.Context, c gitCall) (string, error) {
 
 // run runs the command argv in the working directory; an exit code other
 // than 0 is an error holding its standard error.
-func (r *checkpointRun) run(ctx context.Context, argv []string) (string, error) {
+func (r *checkpointRun) run(ctx context.Context, argv []string) error {
 	res, err := r.client.Exec(ctx, r.rec.ID, runtime.ExecRequest{Command: argv, WorkDir: WorkDir})
 	if err != nil {
-		return "", err
+		return err
 	}
 	if res.ExitCode != 0 {
-		return "", exitError(argv[0], res)
+		return exitError(argv[0], res)
 	}
-	return string(res.Stdout), nil
+	return nil
 }
 
 // exitError is the failure of the command what that ended with res.

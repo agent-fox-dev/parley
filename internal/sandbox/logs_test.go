@@ -65,9 +65,9 @@ func TestLogCollector_StoresWhatASandboxLogs(t *testing.T) {
 		h.emit(id, runtime.Stderr, "two\n")
 		parts <- "no newline yet"
 		hubtest.WaitClosed(t, stored, "the collector to say that it stored lines")
-		eventually(t, "two lines", func() bool { return len(h.lines(t, id, "")) == 2 })
+		hubtest.Eventually(t, "two lines", func() bool { return len(h.lines(t, id, "")) == 2 })
 		parts <- " done\n"
-		eventually(t, "three lines", func() bool { return len(h.lines(t, id, "")) >= 3 })
+		hubtest.Eventually(t, "three lines", func() bool { return len(h.lines(t, id, "")) >= 3 })
 
 		lines := h.lines(t, id, "")
 		want := []struct{ stream, line string }{{"stdout", "one"}, {"stderr", "two"}, {"stdout", "no newline yet done"}}
@@ -96,7 +96,7 @@ func TestLogCollector_StoresWhatASandboxLogs(t *testing.T) {
 			Text: "allow POST api.vendor.test:443/v1/messages", Action: "allow", Program: "/usr/bin/agent",
 			Host: "api.vendor.test", Port: 443, Method: "POST", Path: "/v1/messages", Provider: "model",
 		})
-		eventually(t, "two policy lines", func() bool { return len(h.lines(t, id, sandbox.LogSourcePolicy)) == 2 })
+		hubtest.Eventually(t, "two policy lines", func() bool { return len(h.lines(t, id, sandbox.LogSourcePolicy)) == 2 })
 
 		lines := h.lines(t, id, "")
 		deny, allow := lines[0], lines[1]
@@ -129,7 +129,7 @@ func TestLogCollector_StoresWhatASandboxLogs(t *testing.T) {
 			Text: "allow GET registry.test/?t=" + value, Action: "allow", Program: "/bin/" + value,
 			Host: value + ".registry.test", Port: 443, Provider: value,
 		})
-		eventually(t, "three lines", func() bool { return len(h.lines(t, id, "")) == 3 })
+		hubtest.Eventually(t, "three lines", func() bool { return len(h.lines(t, id, "")) == 3 })
 
 		process := h.lines(t, id, sandbox.LogSourceProcess)
 		if len(process) != 2 || process[0].Line != "token=[redacted] again [redacted]" || process[1].Line != "pin=1234567" {
@@ -157,7 +157,7 @@ func TestLogCollector_StoresWhatASandboxLogs(t *testing.T) {
 			h.follow(t, id)
 			h.emit(id, runtime.Stdout, line+"\n")
 			pieces := (n + sandbox.MaxLogLine - 1) / sandbox.MaxLogLine
-			eventually(t, "the line's pieces", func() bool { return len(h.lines(t, id, "")) >= pieces })
+			hubtest.Eventually(t, "the line's pieces", func() bool { return len(h.lines(t, id, "")) >= pieces })
 			got := h.texts(t, id)
 			if len(got) != pieces {
 				t.Fatalf("the line is stored as %d lines, want %d", len(got), pieces)
@@ -179,18 +179,18 @@ func TestLogCollector_ReopensABrokenStreamAndResumesAfterARestart(t *testing.T) 
 	h := startLogHub(t, 0)
 	s, s2 := h.sandbox(t, nil), h.sandbox(t, nil)
 	h.follow(t, s)
-	eventually(t, "the collector to read both logs of "+s2, func() bool { return h.logStreams(s2) == 2 })
+	hubtest.Eventually(t, "the collector to read both logs of "+s2, func() bool { return h.logStreams(s2) == 2 })
 
 	h.emit(s, runtime.Stdout, "a\n")
 	h.emit(s, runtime.Stdout, "b\n")
-	eventually(t, "a and b", func() bool { return len(h.lines(t, s, "")) == 2 })
+	hubtest.Eventually(t, "a and b", func() bool { return len(h.lines(t, s, "")) == 2 })
 	h.breakLog(t, s)
-	eventually(t, "the collector to stop reading "+s, func() bool { return h.logStreams(s) == 0 })
+	hubtest.Eventually(t, "the collector to stop reading "+s, func() bool { return h.logStreams(s) == 0 })
 	h.emit(s, runtime.Stdout, "c\n")
 	h.emit(s2, runtime.Stdout, "x\n")
-	eventually(t, "x of the other sandbox, without a round", func() bool { return slices.Equal(h.texts(t, s2), []string{"x"}) })
+	hubtest.Eventually(t, "x of the other sandbox, without a round", func() bool { return slices.Equal(h.texts(t, s2), []string{"x"}) })
 	h.round(t)
-	eventually(t, "c after the stream was opened again", func() bool { return len(h.lines(t, s, "")) >= 3 })
+	hubtest.Eventually(t, "c after the stream was opened again", func() bool { return len(h.lines(t, s, "")) >= 3 })
 	if got := h.texts(t, s); !slices.Equal(got, []string{"a", "b", "c"}) {
 		t.Fatalf("after the break the lines are %q, want a, b, c", got)
 	}
@@ -202,7 +202,7 @@ func TestLogCollector_ReopensABrokenStreamAndResumesAfterARestart(t *testing.T) 
 	h.clock.Advance(time.Second)
 	h.emit(s, runtime.Stdout, "d\n")
 	h.Restart(t)
-	eventually(t, "d after the restart", func() bool { return len(h.lines(t, s, "")) >= 4 })
+	hubtest.Eventually(t, "d after the restart", func() bool { return len(h.lines(t, s, "")) >= 4 })
 	h.follow(t, s2)
 	if got := h.texts(t, s); !slices.Equal(got, []string{"a", "b", "c", "d"}) {
 		t.Errorf("after the restart the lines are %q, want a, b, c, d", got)
@@ -222,12 +222,12 @@ func TestLogCollector_StopsReadingASandboxThatLeavesReady(t *testing.T) {
 			id := h.sandbox(t, nil)
 			h.follow(t, id)
 			h.emit(id, runtime.Stdout, "kept\n")
-			eventually(t, "the line", func() bool { return len(h.lines(t, id, "")) == 1 })
+			hubtest.Eventually(t, "the line", func() bool { return len(h.lines(t, id, "")) == 1 })
 			if applied, err := h.svc.Transition(ctx, nil, id, sandbox.StateReady, state, "", nil); err != nil || !applied {
 				t.Fatalf("Transition to %s = %t, %v", state, applied, err)
 			}
 			h.round(t)
-			eventually(t, "the collector to stop reading "+id, func() bool { return h.logStreams(id) == 0 })
+			hubtest.Eventually(t, "the collector to stop reading "+id, func() bool { return h.logStreams(id) == 0 })
 			h.emit(id, runtime.Stdout, "late\n")
 			left = append(left, id)
 		})
@@ -258,7 +258,7 @@ func TestLogCollector_LogsARuntimeWithoutLogsOncePerSandbox(t *testing.T) {
 	}
 	// A round starts a follower only once the last one has stopped and
 	// logged, so four followers mean three have logged.
-	eventually(t, "four rounds to ask for the logs", func() bool {
+	hubtest.Eventually(t, "four rounds to ask for the logs", func() bool {
 		h.clock.Advance(sandbox.LogCollectInterval)
 		return asked() >= 8
 	})
@@ -485,7 +485,7 @@ func TestLogs_FollowsTheStoredLines(t *testing.T) {
 	waits := func() int { return h.timers.created(sandbox.LogFollowInterval) }
 	poll := func(n int) {
 		t.Helper()
-		eventually(t, "the stream to wait for new lines", func() bool { return waits() >= n })
+		hubtest.Eventually(t, "the stream to wait for new lines", func() bool { return waits() >= n })
 		h.clock.Advance(sandbox.LogFollowInterval)
 	}
 	wantFrame := func(t *testing.T, s *frameReader, line string) frame {
@@ -527,7 +527,7 @@ func TestLogs_FollowsTheStoredLines(t *testing.T) {
 		wantFrame(t, s, "p5")
 
 		// A line the collector stores reaches the stream without its timer.
-		eventually(t, "the stream to wait for new lines", func() bool { return waits() >= base+2 })
+		hubtest.Eventually(t, "the stream to wait for new lines", func() bool { return waits() >= base+2 })
 		h.follow(t, id)
 		h.emit(id, runtime.Stdout, "p6\n")
 		wantFrame(t, s, "p6")
@@ -547,13 +547,13 @@ func TestLogs_FollowsTheStoredLines(t *testing.T) {
 			wantFrame(t, s, line)
 		}
 
-		eventually(t, "the stream to wait for new lines", func() bool { return waits() >= base+1 })
+		hubtest.Eventually(t, "the stream to wait for new lines", func() bool { return waits() >= base+1 })
 		if applied, err := h.svc.Transition(ctx, nil, id, sandbox.StateReady, sandbox.StateStopped, "", nil); err != nil || !applied {
 			t.Fatalf("Transition to stopped = %t, %v", applied, err)
 		}
 		// The transition wakes the stream, which waits again once it read
 		// the record.
-		eventually(t, "the stream to wait again", func() bool { return waits() >= base+2 })
+		hubtest.Eventually(t, "the stream to wait again", func() bool { return waits() >= base+2 })
 		h.storeLines(t, id, processLine(5, "stdout", "p5"))
 		poll(base + 2)
 		wantFrame(t, s, "p5")

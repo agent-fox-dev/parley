@@ -91,7 +91,7 @@ func InsertPatch(ctx context.Context, tx *sql.Tx, p Patch) error {
 	_, err = tx.ExecContext(ctx, `INSERT INTO patches (`+patchColumns+`)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.ID, p.Workspace, p.BranchName, p.Position, p.Status, string(encoded), p.UpstreamPRURL, p.Description,
-		p.AddedAt.UnixNano(), p.UpdatedAt.UnixNano(), nanos(p.DeletedAt), p.OriginSyncState, p.OriginSHA, nanos(p.OriginSyncedAt))
+		p.AddedAt.UnixNano(), p.UpdatedAt.UnixNano(), store.Nanos(p.DeletedAt), p.OriginSyncState, p.OriginSHA, store.Nanos(p.OriginSyncedAt))
 	if isDuplicateBranch(err) {
 		return fmt.Errorf("insert the patch of %s in %s: %w", p.BranchName, p.Workspace, ErrPatchExists)
 	}
@@ -246,25 +246,8 @@ func scanPatch(scan func(dest ...any) error) (Patch, error) {
 		return Patch{}, fmt.Errorf("the conflict files of the patch %s: %w", p.ID, err)
 	}
 	p.AddedAt, p.UpdatedAt = time.Unix(0, added).UTC(), time.Unix(0, updated).UTC()
-	p.DeletedAt, p.OriginSyncedAt = fromNanos(deleted), fromNanos(synced)
+	p.DeletedAt, p.OriginSyncedAt = store.TimeOf(deleted), store.TimeOf(synced)
 	return p, nil
-}
-
-// nanos is *t as UnixNano, NULL for nil.
-func nanos(t *time.Time) sql.NullInt64 {
-	if t == nil {
-		return sql.NullInt64{}
-	}
-	return sql.NullInt64{Int64: t.UnixNano(), Valid: true}
-}
-
-// fromNanos is n as a UTC time, nil for NULL.
-func fromNanos(n sql.NullInt64) *time.Time {
-	if !n.Valid {
-		return nil
-	}
-	t := time.Unix(0, n.Int64).UTC()
-	return &t
 }
 
 // isDuplicateBranch reports whether err is SQLite refusing a duplicate of

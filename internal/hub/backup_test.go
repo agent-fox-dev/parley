@@ -17,6 +17,8 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/spawn"
 	"github.com/agent-fox-dev/parley/internal/store"
@@ -335,7 +337,7 @@ func TestRun_BacksUpOnlyWholeTransactionsWhileTheHubCommits(t *testing.T) {
 			}
 		})
 	}
-	eventually(t, "the writers commit", func() bool { return next.Load() > 55 })
+	hubtest.Eventually(t, "the writers commit", func() bool { return next.Load() > 55 })
 
 	target := filepath.Join(t.TempDir(), "snapshot")
 	res := d.backup(t, target)

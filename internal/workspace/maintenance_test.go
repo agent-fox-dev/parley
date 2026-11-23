@@ -440,7 +440,7 @@ func TestMaintenance_OneOperationAtATimeOnAWorkspace(t *testing.T) {
 	asked := a.Requests()
 
 	first := w.send(http.MethodPost, w.uKey, "/api/v1/workspaces/demo/archive", nil)
-	eventually(t, "the archive of demo asks origin", func() bool { return a.Requests() > asked })
+	hubtest.Eventually(t, "the archive of demo asks origin", func() bool { return a.Requests() > asked })
 
 	for _, op := range []string{"archive", "reclone", "delete"} {
 		if got := w.operate(t, op, w.uKey, "demo"); got.outcome(t) != "409 workspace_busy" {
@@ -510,7 +510,7 @@ func TestMaintenance_ACallerWhoDisconnectsDoesNotStopTheOperation(t *testing.T) 
 			w.sendAndLeave(t, op.method, w.uKey, "/api/v1/workspaces/"+c.slug+op.suffix, started)
 			release()
 
-			eventually(t, c.op+" ends as for a connected caller", func() bool {
+			hubtest.Eventually(t, c.op+" ends as for a connected caller", func() bool {
 				rec, found, err := workspace.BySlug(context.Background(), w.Store.Main(), c.slug)
 				return err == nil && c.done(rec, found)
 			})

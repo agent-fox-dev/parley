@@ -5,7 +5,6 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/server"
-	"github.com/google/uuid"
 )
 
 // The scopes a PAT needs on a webhook route: scopeRead on one that reads,
@@ -70,7 +69,7 @@ func (c *Component) guard(h handler) server.HandlerFunc {
 		}
 		m, _ := server.MatchedRoute(r)
 		for _, name := range []string{"id", "delivery_id"} {
-			if v, ok := m.Params[name]; ok && !isUUID(v) {
+			if v, ok := m.Params[name]; ok && !server.IsUUID(v) {
 				return server.InvalidRequest(name + " must be a UUID")
 			}
 		}
@@ -87,13 +86,6 @@ func (c *Component) guard(h handler) server.HandlerFunc {
 		}
 		return h(w, r, q)
 	}
-}
-
-// isUUID reports whether s is a UUID in its 36-character form, the one form
-// the hub writes its ids in.
-func isUUID(s string) bool {
-	_, err := uuid.Parse(s)
-	return len(s) == 36 && err == nil
 }
 
 // webhookNotFound is the answer for a subscription id the workspace does not

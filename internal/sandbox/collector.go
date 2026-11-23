@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"slices"
 	"sync"
 	"time"
 
@@ -341,23 +340,6 @@ func (c *PolicyCollector) Stop() {
 		<-f.done
 		delete(c.followers, id)
 	}
-}
-
-// following returns the ids of the sandboxes whose follower has not
-// stopped, sorted.
-func (c *PolicyCollector) following() []string {
-	c.pass.Lock()
-	defer c.pass.Unlock()
-	var out []string
-	for id, f := range c.followers {
-		select {
-		case <-f.done:
-		default:
-			out = append(out, id)
-		}
-	}
-	slices.Sort(out)
-	return out
 }
 
 // followDenials has the followers of the pass match the ready sandboxes.
