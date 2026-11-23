@@ -274,24 +274,69 @@ on:
 - Packages 27 `landing_policy` and 28 `approvals_and_checks` (active, all
   tasks done): the check the hub reports, the reserved name, and the new
   field of a land attempt.
+- agentkit-go `outline` at v0.11.0 (built): the declarations, the parse
+  verdict behind the `unparseable` reason, and the comments and string
+  literals of a Go file on a hub built without cgo. The repository's
+  `go.mod` requires v0.10.0, which has neither of the last two; it is
+  raised to v0.11.0 with this work.
 - ADR 09 (the job queue) and ADR 08 (the notice when a ref moves).
 
 ## Verified External API
 
-`github.com/agent-fox-dev/agentkit-go` v0.10.0, read with `go doc`:
+`github.com/agent-fox-dev/agentkit-go` v0.11.0 (tag at commit `e075393`),
+read in its source and exercised with a program built with and without
+cgo:
 
 - `outline.Outline(ctx context.Context, abs string, src []byte, opts outline.Options) (outline.File, error)`
-  and `outline.OutlineMany(ctx context.Context, srcs []outline.Source, opts outline.Options) ([]outline.File, error)`;
-  `Decl` has `Kind`, `Name`, `Container`, `Signature`, `Exported`,
-  `StartLine`, `EndLine`.
+  and `outline.OutlineMany(ctx context.Context, srcs []outline.Source, opts outline.Options) ([]outline.File, error)`,
+  which returns one `File` per source in order and reports a file it
+  could not read as not parsed instead of failing.
+- `Decl` has `Kind`, `Name`, `Container`, `Signature`, `Exported`,
+  `StartLine`, `EndLine` (both 1-based and inclusive).
+- `File` has, next to `Decls`, the verdict of the same parse: `Parsed`;
+  `NotParsed`, one of `NotParsedUnsupported`, `NotParsedTooLarge`,
+  `NotParsedBinary` and `NotParsedFailed`; `SyntaxErrors` (each `Line`,
+  `Column`, `Kind`, at most `Options.MaxSyntaxErrors`, 20 by default) and
+  `SyntaxErrorsTruncated`. Without cgo every language but Go is
+  `NotParsedUnsupported`. These give the reasons `unsupported_language`,
+  `too_large`, `binary` and `unparseable` of an unanalysed file.
 - `outline.CommentAndStringSpans(ctx context.Context, path string, src []byte) (spans [][2]int, ok bool)`:
-  byte ranges of comments and string literals; `ok` is false without a
-  grammar.
-- `outline.LangFor(path string, src []byte) string`.
+  byte ranges `[start, end)` of comments and string literals, in order.
+- `outline.LangFor(path string, src []byte) string`: the language by
+  extension, `""` when unknown; a `.h` file whose content is C++ is C++.
 
-**Unverified**: that `CommentAndStringSpans` answers for Go on a hub built
-without cgo (it is documented as tree-sitter's); if it does not, on such a
-hub mentions inside Go comments and strings are reported too.
+What the formerly unverified point turned out to be:
+
+- **`CommentAndStringSpans` answers for Go in every build**, from Go's own
+  tokens, with `ok` true whether or not the file has syntax errors
+  (observed with and without cgo: line and block comments, interpreted
+  and raw strings, rune literals). For the other fourteen languages `ok`
+  is false without cgo, where those files are not analysed anyway. So a
+  mention inside a Go comment or string is left out on every hub.
+
+What the same reading showed, and the spec has to take as given:
+
+- **A file with syntax errors is still outlined**, from a partial tree,
+  with `Parsed` true and `SyntaxErrors` not empty. In such a Go file a
+  declaration can have `EndLine` 0 (observed: a function whose closing
+  brace is missing). Whether `unparseable` means "has syntax errors" or
+  only "no tree at all" (`NotParsedFailed`) is to be settled in the spec;
+  a range with `EndLine` 0 cannot be tested against a diff.
+- **A declaration's range begins at the line of its name.** Its leading
+  comment, a decorator, annotation or attribute on a line of its own, and
+  a return type on the line above the name are outside it, in every
+  language. A changed line there counts under `outside_declarations`,
+  not as touching the declaration.
+- **`Signature` is the whole header only for Go** (printed without the
+  body, on one line). For the other fourteen languages it is the single
+  line the name is on (observed: `def greet(` for a Python function whose
+  parameters are on the following lines, `foo(int a,` for a C function).
+  There, a change to a parameter on a later line, or to a return type on
+  the line above, does not show as `signature_changed`, and so raises no
+  reference risk. Every signature is cut at 200 bytes.
+- Several Go names declared in one spec (`var x, y = 1, 2`) are separate
+  declarations with the same lines; a changed line there touches all of
+  them.
 
 ## Glossary
 
