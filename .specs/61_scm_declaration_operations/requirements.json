@@ -1,0 +1,592 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "61",
+  "spec_name": "scm_declaration_operations",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Read the declarations of a file by name",
+      "rationale": "An agent that wants one function should pay for that function, not for the file around it.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a caller requests GET /workspaces/:slug/scm/declaration with the path of a source file this hub can outline and a name one or more of its declarations have",
+          "action": "answer with every declaration of the file whose name equals the given name exactly and with case, in line order, each with the outline's fields and the file's lines from its first to its last line as content",
+          "contract": "HTTP 200 with {\"path\", \"resolved_sha\", \"blob_sha\", \"language\", \"declarations\": [{\"kind\", \"name\", \"container\", \"signature\", \"exported\", \"start_line\", \"end_line\", \"content\"}]}; content is the file's bytes of lines start_line to end_line, line endings as stored",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a workspace whose main holds svc.go as described, crlf.go with CRLF line endings and tail.go whose last line is a one-line function without a line ending"
+            ],
+            "pseudocode": "in a new internal/scm/declaration_test.go, with the world and repository helpers of internal/scm/helpers_test.go: on main, svc.go is a Go file with func Greet, the methods (*Reader).Close and (*Writer).Close, and a function greet. r = GET …/scm/declaration?path=svc.go&name=Greet; r.status == 200; r.path == \"svc.go\"; r.resolved_sha == head of main; r.blob_sha == the blob id git gives svc.go at main; r.language == \"Go\"; one declaration, its fields equal to that entry of GET …/scm/outline?path=svc.go, its content == lines start_line..end_line of the file, the doc comment above Greet not in it; name=Close answers both methods in line order; name=greet answers the lower-case function alone; a copy of the file with CRLF line endings answers content with CRLF; a declaration on the file's last line, which has no line ending, answers content without one"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "optional",
+          "condition": "the request names a container, a kind, or both",
+          "action": "answer only the declarations that also have that container and that kind, both compared exactly",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/declaration_test.go, on svc.go, a table over the query {name=Close&container=Writer -> the one method of Writer; name=Close&kind=method -> both; name=Close&container=Writer&kind=func -> 404 declaration_not_found; name=Greet&container= (empty) -> Greet, an empty container being no filter}"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "optional",
+          "condition": "the request names a ref",
+          "action": "read the file as it is at that ref: a branch, a tag, a full or abbreviated commit id or a hub-owned ref, on a repository or on a fork's own refs, and without a ref at the workspace's default branch, a fork's base branch",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/declaration_test.go, on the workspace of addOutline of internal/scm/outline_test.go, as TestOutline_ReadsTheCommitItsRefNames does for the outline route: a table over ref {absent, main, feat, v1, the first commit's id, its 8-character form} with the name the file declares there (NewRouter, Feat, Second, First): resolved_sha and content are those of that commit; on a fork, ref absent reads the fork's base branch and ref = the fork's own branch reads the fork's file"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "no declaration of the file has the name, with the container and the kind where they are given",
+          "action": "refuse the request",
+          "contract": "HTTP 404 with error_type declaration_not_found",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/declaration_test.go: GET …/scm/declaration?path=svc.go&name=Nope and name=GREET each answer 404 with error_type declaration_not_found and a message naming the name and the path"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "unwanted",
+          "condition": "the path names a file in a language this build of the hub has no backend for, a file of no known language, or a symbolic link",
+          "action": "refuse the request and name the file's language",
+          "contract": "HTTP 422 with error_type unsupported_language and details {\"language\"}, the language's name where the extension is known and \"\" otherwise",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/declaration_test.go, on the workspace of addOutline, a table over path {README.md, data.csv, Makefile, LICENSE, link.go (a symbolic link to router.go)} with name=x: 422 unsupported_language with details.language == \"\"; with scm.Deps.Outline replaced, through the adjust argument of newWorld, by one that answers Lang \"Python\" and NotParsed unsupported for app.py: 422 with details.language == \"Python\""
+          }
+        },
+        {
+          "id": "REQ-1.6",
+          "pattern": "unwanted",
+          "condition": "the query lacks path or name, its name is empty or longer than 200 characters, its kind is none of the outline's kinds, or the path names nothing, a directory, a submodule, a file over 1 MiB or a binary file",
+          "action": "refuse the request before parsing anything",
+          "contract": "HTTP 400 invalid_request for a malformed query, a directory and a submodule; 404 path_not_found; 413 payload_too_large with the file's size; 422 binary_file",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/declaration_test.go, on the workspace of addOutline, as TestOutline_RefusesWhatItCannotOutline does, a table over the query {no path -> 400 invalid_request; path=../x -> 400; no name -> 400; name= (empty) -> 400; a name of 201 characters -> 400, one of 200 -> 404 declaration_not_found; kind=function -> 400; path=nope.go -> 404 path_not_found; path=internal -> 400 invalid_request; path=vendor/sub -> 400; path=big.go -> 413 payload_too_large with size; path=edge.go (exactly 1 MiB) -> not 413; path=logo.png and path=blob.go -> 422 binary_file; ref=nope -> 404 ref_not_found}; for each refusal the fake of scm.Deps.Outline was not called"
+          }
+        },
+        {
+          "id": "REQ-1.7",
+          "pattern": "event_driven",
+          "condition": "the file has syntax errors",
+          "action": "answer the matching declarations as far as the file's outline goes, and a match whose last line is unknown with end_line 0 and content null",
+          "contract": "HTTP 200; a declaration whose end the outline does not know has \"end_line\": 0 and \"content\": null",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/declaration_test.go: broken.go on main is \"package a\\n\\nfunc Whole() {}\\n\\nfunc Open() string {\\n\\treturn \\\"x\\\"\\n\\nfunc Other() {}\\n\"; name=Whole answers 200 with its one line as content; name=Open answers 200 with one declaration, start_line 5, end_line 0, content JSON null"
+          }
+        },
+        {
+          "id": "REQ-1.8",
+          "pattern": "ubiquitous",
+          "action": "serve the declaration route under the rules of every source control read: git:read for a personal access token, read access to the workspace, the caching headers of the resolved commit, 503 scm_timeout at [scm].read_timeout, and one report per request to the recorder under the op declaration",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "add a Go file to the history that addHistory of internal/scm/helpers_test.go builds, since f.txt has no declaration to answer 200 with, and the row {\"declaration\", \"/declaration?path=<that file>&name=<its function>\", \"/declaration?path=nope.txt&name=x\"} to scmRoutes there, so that TestRead_ServesEveryReaderOnEveryReadableWorkspace, TestRead_RefusesACallerWhoMayNotReadWithoutOpeningTheRepository, the cache tests of cache_test.go, TestRead_EndsAReadThatOutlastsTheReadTimeout and TestRead_ReportsEachRequestOnceToTheRecorder cover the route; in internal/scm/timeout_test.go beside TestOutline_AnswersATimeoutWhenTheParseOutlastsTheReadTimeout, a parse that outlasts the read timeout answers 503 scm_timeout; in internal/metrics/catalogue_test.go the label op of parley_scm_requests_total has the value declaration"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Change a file through declaration operations",
+      "rationale": "Sending one function is cheaper than sending its file, and the hub can place it where the outline says the old one is.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a commit request holds a replace_declaration operation whose address matches exactly one declaration of the file and the file parses before and after it",
+          "action": "replace the file's lines from the declaration's first line to its last by the operation's content, leave every other byte of the file as it is, and commit the result",
+          "contract": "HTTP 201 with the commit route's answer; the file at the branch's new head is the old file with the lines start_line to end_line of the declaration replaced by content",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in a new internal/scm/declaration_commit_test.go, with newCommitWorld of internal/scm/commit_test.go and a workspace whose main holds the source files the test names: svc.go as in declaration_test.go. POST …/scm/commits {branch, expected_head_sha, message, operations: [{op: replace_declaration, path: svc.go, name: Greet, content: \"func Greet(name string) string {\\n\\treturn \\\"hi \\\" + name\\n}\\n\"}]}; status 201 with the route's answer (commit, branch, change, change_error); the file at the new head == the old file with Greet's lines replaced by content; the doc comment above Greet and every line after it are byte-identical; the commit has one parent, the expected head; the file's mode is unchanged for an executable source file too"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "a commit request holds a delete_declaration operation whose address matches exactly one declaration of the file and the file parses before and after it",
+          "action": "remove the file's lines from the declaration's first line to its last and commit the result",
+          "contract": "HTTP 201 with the commit route's answer",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/declaration_commit_test.go: {op: delete_declaration, path: svc.go, name: greet} answers 201; the file at the new head is the old file without the lines of greet, the blank lines around them kept; GET …/scm/outline of it lists greet no more"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "event_driven",
+          "condition": "a commit request holds an insert_declaration operation with exactly one of after and before, whose address matches exactly one declaration of the file, and the file parses before and after it",
+          "action": "insert the operation's content on the line after the last line of the declaration after names, or on the line of the first line of the declaration before names, adding no blank line, and commit the result",
+          "contract": "HTTP 201 with the commit route's answer",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/declaration_commit_test.go, a table over {after: {name: Greet}, before: {name: Greet}, after: {name: Close, container: Writer}} with content \"func Added() {}\\n\": 201; the new file == the old file's lines up to and including Greet's end_line (after) or up to before its start_line (before), then content, then the rest; with before, the doc comment above Greet stays above the inserted text"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "ubiquitous",
+          "action": "for any replacement or insertion whose content does not end in a line ending, end it with the file's own line ending, which is that of the file's first line and LF for a file with none, and take a content that ends in one as given",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scm/declaration_commit_test.go, on the function that splices content into a file's lines, a table over {LF file, content \"x\" -> \"x\\n\"; CRLF file, content \"x\" -> \"x\\r\\n\"; CRLF file, content \"x\\n\" -> as given; file of one line without a line ending, content \"x\" -> \"x\\n\"; replacing the last declaration of a file with no final line ending by content without one -> the file ends in LF; empty content on a replace -> the lines are removed}; for each row the lines outside the splice are byte-identical"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "event_driven",
+          "condition": "a commit request holds a declaration operation after other operations on the same file, declaration operations, a put or a move among them",
+          "action": "apply each declaration operation to the file as the operations before it in the request left it, resolving its address in that file",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/declaration_commit_test.go, a table of operation lists, each 201 with the expected file at the new head: {replace Greet by a version three lines longer, then replace greet below it -> both replaced, greet found at its moved lines}; {put new.go with a function F, then replace_declaration new.go#F}; {move svc.go to pkg/svc.go, then replace_declaration pkg/svc.go#Greet}; {replace Greet by func Hello, then insert after Hello}"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "ubiquitous",
+          "action": "accept any replacement whose resulting file parses, whether or not the file still declares the address's name",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/declaration_commit_test.go, a table over the content of replace_declaration svc.go#Greet {a function of another name; two functions; a comment line alone}: each 201 and the file at the new head holds the content in Greet's place"
+          }
+        },
+        {
+          "id": "REQ-2.7",
+          "pattern": "unwanted",
+          "condition": "a declaration operation lacks path, name or, for a replacement and an insertion, content, has a name that is empty or longer than 200 characters or a kind the outline does not have, or an insertion has neither or both of after and before",
+          "action": "refuse the request before reading the repository and name the operation's index",
+          "contract": "HTTP 400 with error_type invalid_request and a message naming the operation's index; no ref moves",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scm/commit_test.go, added to the table of \"refuses a malformed request and moves no ref\" of TestCommit: {replace_declaration without name; with name \"\"; with a name of 201 characters; without content; with kind \"function\"; without path; insert_declaration with neither after nor before; with both; with after: {} (no name); without content; replace_declaration with content_base64}: 400 invalid_request, the message naming the operation's index, refs unchanged"
+          }
+        },
+        {
+          "id": "REQ-2.8",
+          "pattern": "unwanted",
+          "condition": "a commit request holds more than 100 declaration operations",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with error_type invalid_request naming the limit of 100; no ref moves",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scm/commit_test.go beside the row of TestCommit for more than 1,000 operations: 101 delete_declaration operations -> 400 invalid_request naming the limit; 100 of them with 900 puts are not refused for their number"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Resolve an address to exactly one declaration",
+      "rationale": "A write to one of two declarations of a name is a guess; the caller must be able to correct it with one more request.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "unwanted",
+          "condition": "the address of a declaration operation, or of the after or before of an insertion, matches no declaration of the file",
+          "action": "refuse the whole request and name the operation",
+          "contract": "HTTP 404 with error_type declaration_not_found and details {\"index\", \"path\"}; no ref moves and no event is written",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/declaration_commit_test.go, a table over operations on svc.go {replace name Nope; replace name GREET; delete name Close container Nobody; replace name Greet kind method; insert after {name: Nope}; insert before {name: Nope}; a second operation naming Greet after a first that replaced Greet by func Hello -> index 1}: 404 declaration_not_found with details.index the operation's index and details.path; the head of the branch is the one before the request and no event was written after it"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "unwanted",
+          "condition": "the address of a declaration operation, or of the after or before of an insertion, matches more than one declaration of the file",
+          "action": "refuse the whole request, name the operation and list the declarations the address matches",
+          "contract": "HTTP 409 with error_type ambiguous_declaration and details {\"index\", \"path\", \"candidates\": [{\"kind\", \"name\", \"container\", \"signature\", \"start_line\", \"end_line\"}]}, the candidates in line order and at most 20; no ref moves and no event is written",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/declaration_commit_test.go: replace_declaration svc.go name Close -> 409 ambiguous_declaration, details.index 0, details.path svc.go, details.candidates == the two methods in line order, each {kind: method, name: Close, container: Reader | Writer, signature, start_line, end_line} as the outline answers them; the same for delete_declaration and for insert after {name: Close}; many.go with 25 functions init answers 20 candidates, the first 20 by line; the head of the branch is the one before the request and no event was written after it"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "optional",
+          "condition": "an address carries a container, a kind, or both",
+          "action": "count only the declarations with that container and that kind, so that an address ambiguous by its name alone resolves",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/declaration_commit_test.go: replace_declaration svc.go name Close container Writer -> 201 and only the method of Writer changed; a file with a type Close and a method Close: name Close kind type -> 201 and the type changed"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "unwanted",
+          "condition": "the path of a declaration operation names no file in the tree as the operations before it left it: nothing, a directory, a submodule or a file deleted earlier in the request",
+          "action": "refuse the whole request as an operation that does not apply",
+          "contract": "HTTP 400 with error_type invalid_operation and details {\"index\"}; no ref moves",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/commit_test.go, added to \"refuses an operation that does not apply and names it\" of TestCommit, a table {replace_declaration nope.go#F; replace_declaration docs (a directory); replace_declaration vendor/lib (the submodule); delete api/old.go then delete_declaration api/old.go#F -> index 1}: 400 invalid_operation with details.index; refs unchanged"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Refuse a file that cannot be judged and a result that does not parse",
+      "rationale": "The one thing the hub can decide from a file's bytes is whether they parse; a commit made by name should never break that.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "unwanted",
+          "condition": "the file a declaration operation addresses has a syntax error before the operation",
+          "action": "refuse the whole request, before the address is judged, and name the line of the file's first syntax error",
+          "contract": "HTTP 422 with error_type unparseable_file and details {\"index\", \"path\", \"line\"}; no ref moves and no event is written",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/declaration_commit_test.go: broken.go as in declaration_test.go; replace_declaration broken.go name Whole -> 422 unparseable_file with details {index: 0, path: \"broken.go\", line: the line of the first syntax error the outline reports}; name Nope on the same file -> 422 unparseable_file too, not 404; a put of a repaired broken.go followed by replace_declaration broken.go#Whole in one request -> 201; the head of the branch is the one before the request and no event was written after it for the refusals"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "unwanted",
+          "condition": "the file has a syntax error after a declaration operation",
+          "action": "refuse the whole request and name the positions of the syntax errors in the resulting file",
+          "contract": "HTTP 422 with error_type syntax_error and details {\"index\", \"path\", \"errors\": [{\"line\", \"column\"}]}, at most 20 errors, in position order; no ref moves and no event is written",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/declaration_commit_test.go, a table {replace Greet by \"func Greet() string {\\n\\treturn \\\"x\\\"\\n\" (no closing brace); insert after Greet the text \"func (\"; a first operation that is valid and a second whose result does not parse -> index 1}: 422 syntax_error with details.index, details.path and details.errors non-empty, each {line, column} 1-based in the resulting file and in position order; a replacement with 30 unbalanced lines answers at most 20 errors; deleting the type that a method's receiver names answers 201, the file still parsing; the head of the branch is the one before the request and no event was written after it"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "a declaration operation addresses a file in a language this build of the hub has no backend for, a file of no known language, or a symbolic link",
+          "action": "refuse the whole request and name the file's language",
+          "contract": "HTTP 422 with error_type unsupported_language and details {\"index\", \"path\", \"language\"}; no ref moves",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/declaration_commit_test.go, a table over the path of a replace_declaration {README.md; docs/guide.md; a symbolic link to a Go file} -> 422 unsupported_language with details {index, path, language: \"\"}; with scm.Deps.Outline replaced, through the adjust argument of newWriteWorld, by one answering Lang \"Python\" and NotParsed unsupported for app.py -> details.language \"Python\"; refs unchanged"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "the file a declaration operation addresses is binary, or is over 1 MiB before the operation or after it",
+          "action": "refuse the whole request",
+          "contract": "HTTP 422 with error_type binary_file, or HTTP 413 with error_type payload_too_large and the size in bytes; details {\"index\", \"path\"}; no ref moves",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/declaration_commit_test.go, a table {replace in a Go file with a NUL byte in its first 8,000 bytes -> 422 binary_file; replace in a Go file of 1 MiB + 1 byte -> 413 payload_too_large with the size; replace in a file of just under 1 MiB by a content that takes it over 1 MiB -> 413 with the resulting size; a file of exactly 1 MiB after the operation -> 201}: details.index and details.path name the operation; refs unchanged for the refusals"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "unwanted",
+          "condition": "the parses of a commit request's declaration operations, together, outlast [scm].read_timeout, or find no place among the parses the hub runs at once within it",
+          "action": "end the request without moving a ref",
+          "contract": "HTTP 503 with error_type scm_timeout; no ref moves and no event is written",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/timeout_test.go beside TestOutline_AnswersATimeoutWhenTheParseOutlastsTheReadTimeout: with [scm].read_timeout of 100ms and scm.Deps.Outline replaced by one that blocks until released, POST …/scm/commits with a replace_declaration answers 503 scm_timeout within a second; the branch's head is unchanged; with the four places of scm.DefaultMaxOutlines taken by blocked outline reads, the commit answers 503 scm_timeout as well; after release a commit of the same body answers 201"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Keep a declaration commit a commit like any other",
+      "rationale": "Everything that follows a commit, from push rules to changes, should neither know nor care how its tree was produced.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "a commit made with declaration operations moves its branch",
+          "action": "write the events and give the answer that a put of the resulting file gives, with nothing in them that says which kind of operation made the commit",
+          "contract": "the commit route's HTTP 201 answer; one parley.git.push and one parley.scm.commit event, the latter naming the changed paths; no member of the answer, the commit or the events names a declaration operation",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/commit_events_test.go, added to TestCommitConsequences beside \"emits a push and a commit event for the moved branch\": on two branches at the same head, commit A = replace_declaration svc.go#Greet and commit B = put of svc.go with the bytes A produced; both 201; the commits have the same tree; after each, the events are parley.git.push then parley.scm.commit, with metadata files == [\"svc.go\"]; A's events and answer equal B's apart from ids, shas, the branch and times; the ref-updated stage and the post-push listener were called once for each"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "unwanted",
+          "condition": "the declaration operations of a request leave the tree as it is",
+          "action": "refuse the request as a commit that changes nothing, unless allow_empty is set",
+          "contract": "HTTP 400 with error_type empty_commit; no ref moves",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/commit_test.go, added to \"refuses a commit that changes nothing\" of TestCommit: replace_declaration svc.go#Greet with content equal to Greet's lines -> 400 empty_commit, refs unchanged; the same with allow_empty true -> 201 with the parent's tree"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "unwanted",
+          "condition": "the caller's token is scoped to paths that do not include the file a declaration operation changes",
+          "action": "refuse the commit as the push rules refuse a put of that file",
+          "contract": "HTTP 403 with error_type path_not_allowed and the path; no ref moves",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/rules_test.go, added to \"holds a path-scoped token to its paths and names the first outside them\" of TestPushRules_WithTheHubsEngine: with a token of paths docs/**, replace_declaration src/b.go#F -> 403 path_not_allowed with error.path src/b.go and the refs unchanged; with a token of paths src/** the same request -> 201"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "unwanted",
+          "condition": "a commit request with declaration operations names an expected_head_sha that is not the branch's head, or none for an existing branch",
+          "action": "refuse the request with the head to retry from, before any declaration operation is judged",
+          "contract": "HTTP 409 with error_type ref_moved and details {\"current_sha\"}",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/commit_test.go, added to \"refuses a head the caller has not seen\" of TestCommit: a request with expected_head_sha m1 on a branch at m2 and a replace_declaration naming Nope -> 409 ref_moved with details.current_sha m2, not 404"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "event_driven",
+          "condition": "a commit made with declaration operations moves a branch that is the source of a draft or open change",
+          "action": "record a new version of that change, as for any commit to the branch",
+          "check": {
+            "same_as": "PATH-1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Read and change declarations from the shell and as tools",
+      "rationale": "Agents reach the hub through parley and parley mcp; a route without a command is a route they do not use.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a user runs parley scm declaration <slug> <path> <name>, with --container, --kind or --ref or without",
+          "action": "send one GET …/scm/declaration with path and name, and container, kind and ref where their flags are given, and print the hub's answer",
+          "contract": "exit status 0 and the route's JSON answer on stdout; an error of the hub as its envelope on stderr with exit status 1",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/scm_test.go, rows added to the table of TestSCM_ReadsSendOneGetAndPrintTheAnswer: {scm declaration demo api/greeting.go Greet -> /scm/declaration, name=Greet&path=api%2Fgreeting.go}; {… --container Writer --kind method --ref v1 -> container=Writer&kind=method&name=Close&path=…&ref=v1}; and to TestSCM_RefusesABadCommandLineBeforeAnyRequest: scm declaration demo a.go (no name) and --kind function -> usage_error, exit 2, no request"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "event_driven",
+          "condition": "a user runs parley scm commit with --replace-declaration <repo-path>#<name>=<local-file>, --delete-declaration <repo-path>#<name>, --insert-after <repo-path>#<name>=<local-file> or --insert-before <repo-path>#<name>=<local-file>, each given once or more",
+          "action": "send the declaration operations among the others in the order of the command line, each with the address split at its last # into path and name, a name holding a dot split at its last dot into container and name, and the local file's text as content",
+          "contract": "one POST …/scm/commits whose operations hold {\"op\": \"replace_declaration\" | \"delete_declaration\" | \"insert_declaration\", \"path\", \"name\", \"container\"?, \"content\"?, \"after\"? | \"before\"?} in command-line order",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/scm_write_test.go, as TestSCMCommit_SendsTheOperationsInCommandLineOrder: scm commit w --branch b --expected-head <sha> --message m --put a.go=<f> --replace-declaration api/g.go#Greet=<f> --delete-declaration svc.go#Writer.Close --insert-after api/g.go#Greet=<f> --insert-before \"docs/a#b.go#ns::Widget.draw=<f>\" sends one POST whose operations are, in that order, the put, {op: replace_declaration, path: api/g.go, name: Greet, content: <text of f>}, {op: delete_declaration, path: svc.go, name: Close, container: Writer}, {op: insert_declaration, path: api/g.go, content, after: {name: Greet}}, {op: insert_declaration, path: \"docs/a#b.go\", content, before: {name: draw, container: \"ns::Widget\"}}; no kind is sent; a local file name holding = is read whole, the value being split at its first = after the address"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "the value of a declaration flag has no #, an empty path, name or container, lacks its =<local-file> where one is needed, or names a local file that cannot be read or is not valid UTF-8",
+          "action": "end with a usage error before reading a setting or sending a request",
+          "contract": "exit status 2 and one error envelope with error_type usage_error on stderr; nothing on stdout; no request is sent",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/scm_write_test.go, rows added to the table of TestSCMWrite_RefusesABadCommandLineBeforeAnyRequest: {--replace-declaration a.go=f (no #); a.go#=f (no name); #Greet=f (no path); a.go#Greet (no =); a.go#Greet= (no file); a.go#Greet=<a file that does not exist>; a.go#Greet=<a file holding the bytes ff fe 00>; --delete-declaration a.go; --delete-declaration a.go#; --insert-after a.go#Greet; a.go#.Greet (empty container)}: exit 2, a usage_error envelope on stderr, nothing on stdout, no request"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "unwanted",
+          "condition": "the hub refuses a commit with declaration operations",
+          "action": "print the hub's error envelope as received and send no second request",
+          "contract": "exit status 1 and the hub's envelope, its details included, on stderr",
+          "check": {
+            "same_as": "PATH-2"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "ubiquitous",
+          "system": "parley mcp",
+          "action": "serve parley scm declaration as the tool scm_declaration in every selection that holds the scm group, a read-only one included, and give the tool scm_commit the four declaration flags as array parameters",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/mcp_test.go, as TestMCPList_ServesTheOutlineOfAFileAsAReadingTool: for the arguments {--no-code-mode} and {--no-code-mode, --read-only} the tool scm_declaration is listed, requires slug, path and name, and has the string parameters container, kind and ref; in the table of TestMCPList_GivesEachToolItsCommandsArgumentsAndFlagsAsParameters the row of scm_commit gains replace_declaration, delete_declaration, insert_after and insert_before of type array"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "An agent changes one function without a clone",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "runs parley scm outline on api/greeting.go of its fork, then parley scm declaration <fork> api/greeting.go Greet --ref greeting"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends GET …/scm/declaration with path, name and ref and prints the function's lines"
+        },
+        {
+          "actor": "agent",
+          "action": "writes the new function to greet.go and runs parley scm commit <fork> --branch greeting --message … --replace-declaration api/greeting.go#Greet=greet.go"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "reads the head of greeting and sends POST …/scm/commits with one replace_declaration operation and that head"
+        },
+        {
+          "actor": "parleyd",
+          "action": "reads the file at the head, outlines it, replaces the lines of Greet, checks that the result parses, writes the commit and moves the branch through the push rules"
+        },
+        {
+          "actor": "parleyd",
+          "action": "emits parley.git.push and parley.scm.commit and records a new version of the change whose source the branch is"
+        },
+        {
+          "actor": "agent",
+          "action": "reads the declaration again and receives the new function"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the parley CLI's command tree",
+          "HTTP router and pipeline",
+          "the source control component with a real repository",
+          "agentkit-go's outline package",
+          "the push rule engine and the ref writer",
+          "the change component",
+          "the event log"
+        ],
+        "setup": [
+          "the fork hub of test/e2e/scm_write_test.go (startForkHub), a fork of demo with auto_change on and a token with git:read and git:write",
+          "the branch greeting of the fork holds api/greeting.go with a doc comment, func Greet and a second function, committed with a put, which opened a change in demo"
+        ],
+        "end_state": [
+          "parley scm declaration printed one declaration named Greet whose content is the function's lines without its doc comment",
+          "the commit command exited 0 and greeting's head is the commit it printed",
+          "api/greeting.go at that head is the old file with Greet's lines replaced by greet.go's text, every other line unchanged",
+          "one more parley.git.push event via api and one more parley.scm.commit event exist for the fork",
+          "the change of the branch has a second version whose head is the new commit",
+          "the second read of the declaration printed the new function"
+        ],
+        "pseudocode": "a new test in test/e2e/scm_write_test.go beside TestSCMWrite_AnAgentCommitsToItsForkWithoutACloneAndIsToldTheBranchMoved, with its helpers refHead, gitPushEvents and h.events: run the commands through the CLI as the fork's token and assert the end state; read the change's versions through the change routes as test/e2e/change_test.go does"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "An agent corrects a replacement the hub refused",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "runs parley scm commit with --replace-declaration svc.go#Close=close.go, where close.go lacks its closing brace"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends the commit and prints the hub's envelope on stderr, exit status 1"
+        },
+        {
+          "actor": "parleyd",
+          "action": "finds two methods named Close and answers 409 ambiguous_declaration with both candidates, moving nothing"
+        },
+        {
+          "actor": "agent",
+          "action": "repeats the command with svc.go#Writer.Close"
+        },
+        {
+          "actor": "parleyd",
+          "action": "resolves the one method, finds that the resulting file does not parse and answers 422 syntax_error with the position, moving nothing"
+        },
+        {
+          "actor": "agent",
+          "action": "adds the brace to close.go and repeats the command"
+        },
+        {
+          "actor": "parleyd",
+          "action": "commits the file and moves the branch"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the parley CLI's command tree",
+          "HTTP router and pipeline",
+          "the source control component with a real repository",
+          "agentkit-go's outline package",
+          "the push rule engine and the ref writer"
+        ],
+        "setup": [
+          "the hub and workspace of TestSCMWrite_ADeveloperCommitsALocalFileAndRebasesTheBranchFromTheShell in test/e2e/scm_write_test.go, with a branch work holding svc.go, a Go file with the methods (*Reader).Close and (*Writer).Close"
+        ],
+        "end_state": [
+          "the first command exited 1 with error_type ambiguous_declaration and two candidates, of the containers Reader and Writer, on stderr",
+          "the second exited 1 with error_type syntax_error, the path svc.go and at least one error with a line and a column",
+          "after each of the two the head of work was the one before, and no parley.scm.commit event was added",
+          "the third exited 0, work's head is the commit it printed, and svc.go there holds the new Close of Writer and the old Close of Reader"
+        ],
+        "pseudocode": "a new test in test/e2e/scm_write_test.go: run the three commands through the CLI as the developer, reading stderr's envelope and refHead after each"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/agent-fox-dev/agentkit-go",
+      "version": "v0.11.0",
+      "verified": true,
+      "symbols": [
+        {
+          "name": "Outline",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/outline",
+          "signature": "func Outline(ctx context.Context, abs string, src []byte, opts Options) (File, error)"
+        },
+        {
+          "name": "File",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/outline",
+          "signature": "type File struct { Path string; Lang string; Backend Backend; Decls []Decl; Parsed bool; NotParsed NotParsedReason; SyntaxErrors []SyntaxError; SyntaxErrorsTruncated bool }"
+        },
+        {
+          "name": "Decl",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/outline",
+          "signature": "type Decl struct { Kind Kind; Name string; Container string; Signature string; Exported bool; StartLine int; EndLine int }"
+        },
+        {
+          "name": "Options",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/outline",
+          "signature": "type Options struct { Root string; MaxFileBytes int64; MaxSyntaxErrors int }"
+        },
+        {
+          "name": "SyntaxError",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/outline",
+          "signature": "type SyntaxError struct { Line int; Column int; Kind SyntaxErrorKind }"
+        },
+        {
+          "name": "NotParsedUnsupported, NotParsedTooLarge, NotParsedBinary, NotParsedFailed",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/outline",
+          "signature": "const NotParsedUnsupported NotParsedReason = \"unsupported\"; NotParsedTooLarge NotParsedReason = \"too_large\"; NotParsedBinary NotParsedReason = \"binary\"; NotParsedFailed NotParsedReason = \"failed\""
+        },
+        {
+          "name": "Kind constants",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/outline",
+          "signature": "const KindFunc Kind = \"func\"; KindMethod = \"method\"; KindType = \"type\"; KindClass = \"class\"; KindInterface = \"interface\"; KindEnum = \"enum\"; KindTrait = \"trait\"; KindConst = \"const\"; KindVar = \"var\"; KindModule = \"module\"; KindMacro = \"macro\""
+        },
+        {
+          "name": "BackendNone",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/outline",
+          "signature": "const BackendNone Backend = \"none\""
+        }
+      ]
+    }
+  ]
+}

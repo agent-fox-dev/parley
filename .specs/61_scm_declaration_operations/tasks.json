@@ -1,0 +1,149 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "61",
+  "spec_name": "scm_declaration_operations",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/scm/... ./internal/cli/... ./internal/metrics/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "58",
+      "reason": "reads declarations with the outline route's file lookup, limits and bounded parse, and addresses a declaration by the fields that route reports"
+    },
+    {
+      "spec": "21",
+      "reason": "adds operations to POST …/scm/commits and relies on its parent check, tree builder, push rules, events and answer unchanged"
+    },
+    {
+      "spec": "20",
+      "reason": "adds a read route to the source control component and uses its route helper, resolver, caching, read timeout and recorder"
+    },
+    {
+      "spec": "57",
+      "reason": "parley mcp serves the new command as the tool scm_declaration and the new flags of scm_commit, which tests of its listing assert"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Serve GET …/scm/declaration",
+      "criteria": [
+        "REQ-1"
+      ],
+      "steps": [
+        "Raise github.com/agent-fox-dev/agentkit-go to v0.11.0 in go.mod (go get, go mod tidy), leaving its modules codesearch and mcpserve as they are unless the build asks for more, and confirm the existing suite still builds and the outline tests pass: the outline's ranges are unchanged, and a file with a NUL byte between byte 8,000 and byte 8,192 is now reported as not parsed for being binary",
+        "Write the route's behaviours in a new internal/scm/declaration_test.go, add a Go file to the history of addHistory and the route's row to scmRoutes in internal/scm/helpers_test.go, add the timeout case to internal/scm/timeout_test.go, and confirm they fail",
+        "Declare GET /workspaces/:slug/scm/declaration with the component's read route helper under the new op declaration, and add declaration to the values of the label op of parley_scm_requests_total in the metrics catalogue and its test",
+        "Check the query before the repository is opened: path with the file route's path check, name present and of 1 to 200 characters, kind absent or one of the outline's eleven kinds, container free; each failure is 400 invalid_request",
+        "Resolve ref as the outline route does, give the answer its caching headers from the resolved commit before the file is read, and look the path up as the outline route does: 404 path_not_found, 400 for a directory or a submodule, 413 payload_too_large with the size over 1 MiB, 422 binary_file by blame's probe",
+        "Put the reading of a file's bytes and their outline behind one function of the component that the commit route can use in the next task: it parses through the component's bounded parse, and reports a symbolic link, a file the outline answers as not parsed for being unsupported, and one of no known language as 422 unsupported_language with details.language; a file the outline answers as binary or too large is binary_file or payload_too_large as above",
+        "Select the declarations whose name equals the query's exactly, and whose container and kind equal the query's where given and not empty; none is 404 declaration_not_found naming the name and the path",
+        "Answer 200 with path, resolved_sha, blob_sha (the file's blob id), language and the matches in line order, each with the outline's seven fields and content: the file's bytes from the start of line start_line to the end of line end_line, the line endings as stored; a match whose end_line is 0 or below its start_line is answered with end_line 0 and content null",
+        "Document the route in docs/api.md: its row in the source control route table and the table of questions, and a section beside the outline route's with the query, the answer, the errors and the note that the leading comment and what stands on the lines above the name are outside a declaration"
+      ],
+      "touches": [
+        "go.mod",
+        "go.sum",
+        "internal/scm/declaration.go",
+        "internal/scm/declaration_test.go",
+        "internal/scm/handler.go",
+        "internal/scm/helpers_test.go",
+        "internal/scm/timeout_test.go",
+        "internal/metrics/catalogue.go",
+        "internal/metrics/catalogue_test.go",
+        "docs/api.md"
+      ],
+      "done_when": [
+        "`go test ./internal/scm/... ./internal/metrics/... -count=1` passes with CGO_ENABLED=1 and with CGO_ENABLED=0"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Apply declaration operations in a commit",
+      "criteria": [
+        "REQ-2",
+        "REQ-3"
+      ],
+      "steps": [
+        "Write the behaviours in a new internal/scm/declaration_commit_test.go and add the malformed, limit and does-not-apply rows to the tables of TestCommit in internal/scm/commit_test.go, and confirm they fail",
+        "Accept the ops replace_declaration, delete_declaration and insert_declaration in a commit request's operations, with the members name, container, kind, content, after and before; check their shape with the other operations, before the repository is read: a missing path, name or content, a name outside 1 to 200 characters, an unknown kind, content_base64 on one, and an insertion with neither or both of after and before are 400 invalid_request naming the operation's index; more than 100 declaration operations in one request are 400 invalid_request naming the limit, within the route's 1,000",
+        "Once the parent is resolved, turn the request's operations, in order, into the tree builder's operations: a declaration operation becomes a put of the file's new bytes with the file's mode kept. Keep, for the paths the request touches, the bytes and mode each file has after the operations so far (a put's content, a move's source under its new path, a delete's absence), reading a file not yet touched from the parent's tree, so that a declaration operation sees the file as the operations before it left it",
+        "A declaration operation whose path is no file in that state (nothing, a directory, a submodule, deleted earlier in the request) is 400 invalid_operation with details.index, as an operation that does not apply",
+        "Resolve the address with the function of task 1 that outlines a file's bytes: the declarations whose name equals the address's exactly, and whose container and kind equal it where given. None is 404 declaration_not_found with details index and path; more than one is 409 ambiguous_declaration with details index, path and candidates, each kind, name, container, signature, start_line and end_line, in line order and at most 20. The after or before of an insertion resolves the same way",
+        "Splice by lines: a replacement puts content in place of the lines start_line to end_line, a deletion removes them, an insertion puts content after line end_line (after) or before line start_line (before), with no blank line added. A content that does not end in a line ending gets the file's own, that of its first line and LF for a file with none; every byte outside the splice stays as it is",
+        "Ask nothing of the result but what the next task adds: the file need not declare the address's name any more",
+        "Document the three operations in docs/api.md in the section of POST …/scm/commits: their members, the order rule, the address, the line-ending rule, and the errors declaration_not_found and ambiguous_declaration with their details"
+      ],
+      "touches": [
+        "internal/scm/commit.go",
+        "internal/scm/declaration.go",
+        "internal/scm/declaration_commit_test.go",
+        "internal/scm/commit_test.go",
+        "docs/api.md"
+      ],
+      "done_when": [
+        "`go test ./internal/scm/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Refuse what does not parse and keep the commit's consequences",
+      "criteria": [
+        "REQ-4",
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the refusals to internal/scm/declaration_commit_test.go, the timeout case to internal/scm/timeout_test.go, the event comparison to TestCommitConsequences in internal/scm/commit_events_test.go, the empty-commit and moved-head rows to TestCommit in internal/scm/commit_test.go and the path-scoped token rows to TestPushRules_WithTheHubsEngine in internal/scm/rules_test.go, and confirm the new ones fail",
+        "Before an address is judged, refuse a file that cannot be judged, each with details index and path: a symbolic link or a file the outline cannot parse in this build as 422 unsupported_language with details.language; a binary file as 422 binary_file; a file over 1 MiB as 413 payload_too_large with its size; a file whose outline reports a syntax error as 422 unparseable_file with details.line, the line of the first error",
+        "After the splice, outline the resulting bytes: over 1 MiB is 413 payload_too_large with the resulting size; a syntax error is 422 syntax_error with details index, path and errors, each line and column of the resulting file, in position order and at most 20, which is what the outline answers by default",
+        "Bound the parses of one commit request together by [scm].read_timeout and run each through the component's bounded parse, so that they take their places among the DefaultMaxOutlines: a request whose parses outlast the timeout, or find no place within it, is 503 scm_timeout",
+        "Keep every refusal ahead of the first write of a ref: the head of the branch and the event log are as before the request, also when an earlier operation of the same request was valid",
+        "Confirm, by the tests, what needs no code of its own: the moved-head check answers before the operations are looked at; a splice that reproduces the file is 400 empty_commit unless allow_empty; the push rules see the changed paths, so a path-scoped token is held to them; the events and the answer are those of a put of the resulting file, and nothing in the commit, the answer or the events names the kind of operation",
+        "Document in docs/api.md, in the section of POST …/scm/commits, the errors unparseable_file, syntax_error, unsupported_language, binary_file, payload_too_large and scm_timeout for declaration operations with their details, that put is the way to repair a file that does not parse or that a lagging grammar refuses, and the limit of 100; add the error types to the document's table of error types where it keeps one"
+      ],
+      "touches": [
+        "internal/scm/commit.go",
+        "internal/scm/declaration.go",
+        "internal/scm/declaration_commit_test.go",
+        "internal/scm/timeout_test.go",
+        "internal/scm/commit_events_test.go",
+        "internal/scm/commit_test.go",
+        "internal/scm/rules_test.go",
+        "docs/api.md"
+      ],
+      "done_when": [
+        "`go test ./internal/scm/... -count=1` passes with CGO_ENABLED=1 and with CGO_ENABLED=0"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Add parley scm declaration and the declaration flags of parley scm commit",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the rows to the tables of internal/cli/scm_test.go and internal/cli/scm_write_test.go, the order test beside TestSCMCommit_SendsTheOperationsInCommandLineOrder and the tool tests in internal/cli/mcp_test.go, and confirm they fail",
+        "Declare parley scm declaration <slug> <path> <name> among the scm reads, with path and name sent as query parameters and the flags --container, --kind (one of the outline's kinds, any other value a usage error) and --ref; it prints the route's answer as the other reads do",
+        "Give parley scm commit the repeatable flags --replace-declaration <repo-path>#<name>=<local-file>, --delete-declaration <repo-path>#<name>, --insert-after and --insert-before <repo-path>#<name>=<local-file>, appending to the one list --put, --delete and --move append to, so that the operations are sent in the order of the command line",
+        "Parse a value as the flag is parsed, so that a bad one is a usage error before any setting is read (ADR 02): for the flags with a file, split at the first = that follows the last #, the rest being the local file's name; split the address at its last # into path and name; split a name holding a dot at its last dot into container and name; refuse an empty path, name or container, a missing #, a missing or empty file name, a file that cannot be read and one that is not valid UTF-8",
+        "Send a replacement as {op, path, name, container?, content}, a deletion as {op, path, name, container?}, and an insertion as {op: insert_declaration, path, content, after | before: {name, container?}}, content being the local file's text; send no kind",
+        "Check that parley mcp serves scm_declaration in its default and read-only selections and that scm_commit lists the four flags as array parameters; adjust the tests of internal/cli/mcp_test.go that list or count the tools",
+        "Document both in docs/cli.md: the command in the table and the examples of parley scm, the four flags with the address form and its limits (no kind; an address still ambiguous with its container goes through the REST route), and the new tool where the document lists the tools of parley mcp"
+      ],
+      "touches": [
+        "internal/cli/scm.go",
+        "internal/cli/scm_test.go",
+        "internal/cli/scm_write_test.go",
+        "internal/cli/mcp_test.go",
+        "test/e2e/scm_write_test.go",
+        "docs/cli.md"
+      ],
+      "done_when": [
+        "`go test ./internal/cli/... -count=1` passes"
+      ]
+    }
+  ]
+}
