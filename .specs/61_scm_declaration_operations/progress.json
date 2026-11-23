@@ -3,7 +3,7 @@
   "spec_id": "61",
   "spec_name": "scm_declaration_operations",
   "schema_version": 3,
-  "updated_at": "2026-11-23T12:16:34Z",
+  "updated_at": "2026-11-23T12:23:40Z",
   "tasks": [
     {
       "id": 1,
@@ -672,7 +672,35 @@
     },
     {
       "id": 5,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "PATH-1",
+          "no_red": "a smoke test of the finished path, written after the tasks that build it",
+          "tests": [
+            {
+              "test": "./test/e2e:TestSCMWrite_AnAgentChangesOneFunctionWithoutAClone",
+              "passed": {
+                "at": "2026-11-23T12:23:37Z",
+                "tree": "ae21e48c275b2868353a33a41fa8e15b12188e37"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "PATH-2",
+          "no_red": "a smoke test of the finished path, written after the tasks that build it",
+          "tests": [
+            {
+              "test": "./test/e2e:TestSCMWrite_AnAgentCorrectsAReplacementTheHubRefused",
+              "passed": {
+                "at": "2026-11-23T12:23:37Z",
+                "tree": "ae21e48c275b2868353a33a41fa8e15b12188e37"
+              }
+            }
+          ]
+        }
+      ]
     }
   ]
 }
