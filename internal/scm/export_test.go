@@ -29,3 +29,29 @@ func SetRebaseHook(c *Component, hook func()) {
 	defer c.mu.Unlock()
 	c.replayed = hook
 }
+
+// ReplaceLines is src with its lines start to end, 1-based and inclusive,
+// replaced by content as a replace_declaration replaces them; ok is false
+// when they are not lines of src.
+func ReplaceLines(src string, start, end int, content string) (string, bool) {
+	from, to, ok := lineSpan([]byte(src), start, end)
+	if !ok {
+		return "", false
+	}
+	return string(spliceLines([]byte(src), from, to, []byte(content))), true
+}
+
+// InsertLines is src with content inserted after its line line, 1-based,
+// or before it, as an insert_declaration inserts it; ok is false when line
+// is not a line of src.
+func InsertLines(src string, line int, after bool, content string) (string, bool) {
+	from, to, ok := lineSpan([]byte(src), line, line)
+	if !ok {
+		return "", false
+	}
+	at := from
+	if after {
+		at = to
+	}
+	return string(spliceLines([]byte(src), at, at, []byte(content))), true
+}

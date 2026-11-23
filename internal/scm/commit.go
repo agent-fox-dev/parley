@@ -82,7 +82,9 @@ type commitAuthor struct {
 	Email *string `json:"email"`
 }
 
-// fileOperation is one file operation of a commit request.
+// fileOperation is one operation of a commit request: a file operation,
+// or a declaration operation, which changes a file through the address of
+// one of its declarations.
 type fileOperation struct {
 	Op            *string `json:"op"`
 	Path          *string `json:"path"`
@@ -91,6 +93,21 @@ type fileOperation struct {
 	Content       *string `json:"content"`
 	ContentBase64 *string `json:"content_base64"`
 	Mode          *string `json:"mode"`
+	// Name, Container and Kind are the address of a replacement or a
+	// deletion; After or Before that of the declaration an insertion is
+	// placed beside.
+	Name      *string      `json:"name"`
+	Container *string      `json:"container"`
+	Kind      *string      `json:"kind"`
+	After     *addressBody `json:"after"`
+	Before    *addressBody `json:"before"`
+}
+
+// addressBody is the address of a declaration as a request gives it.
+type addressBody struct {
+	Name      *string `json:"name"`
+	Container *string `json:"container"`
+	Kind      *string `json:"kind"`
 }
 
 // commitAnswer is the answer to a commit request: the new commit, with its
@@ -143,7 +160,7 @@ func (c *Component) createCommit(w http.ResponseWriter, r *http.Request, wr *wri
 	if err := server.DecodeJSON(r, &body); err != nil {
 		return err
 	}
-	branch, ops, err := body.check()
+	branch, planned, err := body.check()
 	if err != nil {
 		return err
 	}
@@ -163,12 +180,15 @@ func (c *Component) createCommit(w http.ResponseWriter, r *http.Request, wr *wri
 	if err != nil {
 		return err
 	}
+	ops, index, err := c.resolveDeclarations(ctx, t.git, parent, planned)
+	if err != nil {
+		return err
+	}
 	tree, err := t.git.ApplyOperations(ctx, parent, ops)
 	if err != nil {
 		var opErr *gitrepo.OperationError
 		if errors.As(err, &opErr) {
-			return server.NewError("invalid_operation", http.StatusBadRequest, opErr.Error()).
-				WithDetails(map[string]any{"index": opErr.Index})
+			return operationRefusal(opErr, index)
 		}
 		return err
 	}
@@ -342,9 +362,10 @@ func (c *Component) checkChangeSource(ctx context.Context, wr *write, branch str
 }
 
 // check is the full name of the branch the request names and its
-// operations as the tree builder takes them, or 400 invalid_request for a
-// body or an operation of the wrong shape.
-func (b *commitRequest) check() (string, []gitrepo.Operation, error) {
+// operations, each a file operation as the tree builder takes it or a
+// declaration operation, or 400 invalid_request for a body or an operation
+// of the wrong shape.
+func (b *commitRequest) check() (string, []plannedOperation, error) {
 	if b.Branch == nil {
 		return "", nil, server.InvalidRequest("branch is required")
 	}
@@ -364,11 +385,18 @@ func (b *commitRequest) check() (string, []gitrepo.Operation, error) {
 	if len(b.Operations) > maxOperations {
 		return "", nil, server.InvalidRequest(fmt.Sprintf("a commit takes at most %d operations, not %d", maxOperations, len(b.Operations)))
 	}
-	ops := make([]gitrepo.Operation, len(b.Operations))
+	ops := make([]plannedOperation, len(b.Operations))
+	declarations := 0
 	for i, o := range b.Operations {
-		if ops[i], err = o.operation(); err != nil {
+		if ops[i], err = o.plan(); err != nil {
 			return "", nil, server.InvalidRequest(fmt.Sprintf("operation %d: %v", i, err))
 		}
+		if ops[i].decl != nil {
+			declarations++
+		}
+	}
+	if declarations > maxDeclarationOperations {
+		return "", nil, server.InvalidRequest(fmt.Sprintf("a commit takes at most %d declaration operations, not %d", maxDeclarationOperations, declarations))
 	}
 	return branch, ops, nil
 }
@@ -431,7 +459,7 @@ func (o fileOperation) operation() (gitrepo.Operation, error) {
 	case "":
 		return op, errors.New("op is required")
 	default:
-		return op, fmt.Errorf("op %q is none of put, delete, move and chmod", op.Op)
+		return op, fmt.Errorf("op %q is none of put, delete, move, chmod, replace_declaration, delete_declaration and insert_declaration", op.Op)
 	}
 	for _, p := range paths {
 		if !gitrepo.ValidPath(p) {

@@ -60,6 +60,15 @@ func (w *commitWorld) head(t *testing.T, name string) string {
 	return gitrepotest.Refs(t, w.dir, "refs/heads/")[name]
 }
 
+// declarationOps are n delete_declaration operations.
+func declarationOps(n int) []any {
+	ops := make([]any, n)
+	for i := range ops {
+		ops[i] = map[string]any{"op": "delete_declaration", "path": "api/old.go", "name": "F" + strconv.Itoa(i)}
+	}
+	return ops
+}
+
 // put is a put operation writing content to path.
 func put(path, content string) map[string]any {
 	return map[string]any{"op": "put", "path": path, "content": content}
@@ -222,6 +231,11 @@ func TestCommit(t *testing.T) {
 				t.Errorf("%s: the recorder saw %q, want [commit ref_moved]", tc.name, seen)
 			}
 		}
+		r := w.sendJSON(t, http.MethodPost, w.path, w.ownerKey, map[string]any{"branch": "stale", "expected_head_sha": w.m1, "message": "m",
+			"operations": []any{map[string]any{"op": "replace_declaration", "path": "api/old.go", "name": "Nope", "content": "x\n"}}})
+		if r.status != http.StatusConflict || r.errorType() != "ref_moved" || errorDetails(r)["current_sha"] != head {
+			t.Errorf("a declaration operation on a stale head: %d %s, want 409 ref_moved with current_sha %s before the address is judged", r.status, r.body, head)
+		}
 	})
 
 	t.Run("refuses a malformed request and moves no ref", func(t *testing.T) {
@@ -295,11 +309,31 @@ func TestCommit(t *testing.T) {
 			{"chmod mode 120000", on(op("op", "chmod", "path", "README.md", "mode", "120000")), 400, "invalid_request"},
 			{"move without to", on(op("op", "move", "from", "README.md")), 400, "invalid_request"},
 			{"delete without path", on(op("op", "delete")), 400, "invalid_request"},
+			{"replace_declaration without name", on(op("op", "replace_declaration", "path", "a.go", "content", "x")), 400, "invalid_request"},
+			{"replace_declaration with an empty name", on(op("op", "replace_declaration", "path", "a.go", "name", "", "content", "x")), 400, "invalid_request"},
+			{"replace_declaration with a name of 201 characters", on(op("op", "replace_declaration", "path", "a.go", "name", strings.Repeat("n", 201), "content", "x")), 400, "invalid_request"},
+			{"replace_declaration without content", on(op("op", "replace_declaration", "path", "a.go", "name", "F")), 400, "invalid_request"},
+			{"replace_declaration with an unknown kind", on(op("op", "replace_declaration", "path", "a.go", "name", "F", "kind", "function", "content", "x")), 400, "invalid_request"},
+			{"replace_declaration without path", on(op("op", "replace_declaration", "name", "F", "content", "x")), 400, "invalid_request"},
+			{"replace_declaration with content_base64", on(op("op", "replace_declaration", "path", "a.go", "name", "F", "content_base64", "eA==")), 400, "invalid_request"},
+			{"delete_declaration without name", on(op("op", "delete_declaration", "path", "a.go")), 400, "invalid_request"},
+			{"insert_declaration with neither after nor before", on(op("op", "insert_declaration", "path", "a.go", "content", "x")), 400, "invalid_request"},
+			{"insert_declaration with both after and before", on(op("op", "insert_declaration", "path", "a.go", "content", "x",
+				"after", map[string]any{"name": "F"}, "before", map[string]any{"name": "G"})), 400, "invalid_request"},
+			{"insert_declaration after no name", on(op("op", "insert_declaration", "path", "a.go", "content", "x", "after", map[string]any{})), 400, "invalid_request"},
+			{"insert_declaration without content", on(op("op", "insert_declaration", "path", "a.go", "after", map[string]any{"name": "F"})), 400, "invalid_request"},
+			{"101 declaration operations", on(declarationOps(101)...), 400, "invalid_request"},
 		} {
 			refs, seq := gitrepotest.Git(t, w.dir, "for-each-ref"), w.lastSeq(t)
 			r := w.sendJSON(t, http.MethodPost, w.path, w.ownerKey, tc.body)
 			if r.status != tc.status || r.errorType() != tc.errorType {
 				t.Errorf("%s: %d %s, want %d %s", tc.name, r.status, r.body, tc.status, tc.errorType)
+			}
+			if strings.Contains(tc.name, "declaration") && !strings.Contains(tc.name, "101") && !strings.Contains(r.message(), "operation 0") {
+				t.Errorf("%s: message %q does not name the operation's index", tc.name, r.message())
+			}
+			if strings.Contains(tc.name, "101") && !strings.Contains(r.message(), "100") {
+				t.Errorf("%s: message %q does not name the limit of 100", tc.name, r.message())
 			}
 			if after := gitrepotest.Git(t, w.dir, "for-each-ref"); after != refs {
 				t.Errorf("%s: refs are\n%s\nwant them unchanged\n%s", tc.name, after, refs)
@@ -312,6 +346,12 @@ func TestCommit(t *testing.T) {
 			"expected_head_sha": head, "message": "m", "operations": puts(1000)})
 		if r.status != http.StatusCreated {
 			t.Errorf("1000 operations: %d %s, want 201", r.status, r.body)
+		}
+		// 100 declaration operations among 1,000 are not refused for their
+		// number: the stale head is what the request is refused for.
+		r = w.sendJSON(t, http.MethodPost, w.path, w.ownerKey, on(append(declarationOps(100), puts(900)...)...))
+		if r.status != http.StatusConflict || r.errorType() != "ref_moved" {
+			t.Errorf("100 declaration operations and 900 puts: %d %.300s, want 409 ref_moved", r.status, r.body)
 		}
 	})
 
@@ -331,6 +371,9 @@ func TestCommit(t *testing.T) {
 			{"put onto a submodule", put("vendor/lib", "x")},
 			{"delete of a submodule", map[string]any{"op": "delete", "path": "vendor/lib"}},
 			{"put under a submodule", put("vendor/lib/x", "x")},
+			{"replace_declaration of a missing path", map[string]any{"op": "replace_declaration", "path": "nope.go", "name": "F", "content": "x\n"}},
+			{"replace_declaration of a directory", map[string]any{"op": "replace_declaration", "path": "docs", "name": "F", "content": "x\n"}},
+			{"replace_declaration of a submodule", map[string]any{"op": "replace_declaration", "path": "vendor/lib", "name": "F", "content": "x\n"}},
 		} {
 			seq := w.lastSeq(t)
 			r := w.sendJSON(t, http.MethodPost, w.path, w.ownerKey, map[string]any{"branch": "ops",
@@ -343,6 +386,39 @@ func TestCommit(t *testing.T) {
 			}
 			if types, _ := w.eventsAfter(t, seq); len(types) != 0 {
 				t.Errorf("%s: events %q, want none", tc.name, types)
+			}
+		}
+	})
+
+	t.Run("refuses a declaration operation on a file an earlier operation deleted", func(t *testing.T) {
+		head := w.branch(t, "gone")
+		r := w.sendJSON(t, http.MethodPost, w.path, w.ownerKey, map[string]any{"branch": "gone", "expected_head_sha": head, "message": "m",
+			"operations": []any{map[string]any{"op": "delete", "path": "api/old.go"},
+				map[string]any{"op": "delete_declaration", "path": "api/old.go", "name": "F"}}})
+		if index, ok := errorDetails(r)["index"].(float64); r.status != http.StatusBadRequest || r.errorType() != "invalid_operation" || !ok || index != 1 {
+			t.Errorf("%d %s, want 400 invalid_operation with details.index 1", r.status, r.body)
+		}
+		if got := w.head(t, "gone"); got != head {
+			t.Errorf("gone moved to %s", got)
+		}
+
+		// An earlier file operation that does not apply is the answer, not
+		// the declaration operation after it.
+		for _, tc := range []struct {
+			name string
+			ops  []any
+		}{
+			{"a chmod of a missing path", []any{map[string]any{"op": "chmod", "path": "nope.go", "mode": "100755"},
+				map[string]any{"op": "replace_declaration", "path": "nope.go", "name": "F", "content": "x\n"}}},
+			{"a move onto an existing file", []any{map[string]any{"op": "move", "from": "api/old.go", "to": "README.md"},
+				map[string]any{"op": "replace_declaration", "path": "README.md", "name": "F", "content": "x\n"}}},
+			{"a move onto itself", []any{map[string]any{"op": "move", "from": "api/old.go", "to": "api/old.go"},
+				map[string]any{"op": "replace_declaration", "path": "api/old.go", "name": "F", "content": "x\n"}}},
+		} {
+			r := w.sendJSON(t, http.MethodPost, w.path, w.ownerKey, map[string]any{"branch": "gone", "expected_head_sha": head, "message": "m",
+				"operations": tc.ops})
+			if index, ok := errorDetails(r)["index"].(float64); r.status != http.StatusBadRequest || r.errorType() != "invalid_operation" || !ok || index != 0 {
+				t.Errorf("%s: %d %s, want 400 invalid_operation with details.index 0", tc.name, r.status, r.body)
 			}
 		}
 	})
@@ -374,6 +450,26 @@ func TestCommit(t *testing.T) {
 			"message": "m", "operations": []any{put("README.md", "readme2\n"), put("new.txt", "x")}})
 		if r.status != http.StatusCreated {
 			t.Errorf("one operation that changes the tree: %d %s, want 201", r.status, r.body)
+		}
+
+		const g = "package api\n\nfunc G() {}\n"
+		r = w.sendJSON(t, http.MethodPost, w.path, w.ownerKey, map[string]any{"branch": "same", "base_ref": "main",
+			"message": "m", "operations": []any{put("api/g.go", g)}})
+		same, _ := answerCommit(r)["sha"].(string)
+		if r.status != http.StatusCreated {
+			t.Fatalf("a commit adding api/g.go: %d %s, want 201", r.status, r.body)
+		}
+		replace := map[string]any{"op": "replace_declaration", "path": "api/g.go", "name": "G", "content": "func G() {}\n"}
+		r = w.sendJSON(t, http.MethodPost, w.path, w.ownerKey, map[string]any{"branch": "same", "expected_head_sha": same,
+			"message": "m", "operations": []any{replace}})
+		if r.status != http.StatusBadRequest || r.errorType() != "empty_commit" || w.head(t, "same") != same {
+			t.Errorf("a replacement by the same lines: %d %s, want 400 empty_commit and the branch where it was", r.status, r.body)
+		}
+		r = w.sendJSON(t, http.MethodPost, w.path, w.ownerKey, map[string]any{"branch": "same", "expected_head_sha": same,
+			"message": "m", "operations": []any{replace}, "allow_empty": true})
+		tree := strings.TrimSpace(gitrepotest.Git(t, w.dir, "rev-parse", same+"^{tree}"))
+		if r.status != http.StatusCreated || answerCommit(r)["tree_sha"] != tree {
+			t.Errorf("the same with allow_empty: %d %s, want 201 with the parent's tree %s", r.status, r.body, tree)
 		}
 	})
 

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -253,4 +254,180 @@ func TestSCMWrite_TheOwnerPushesDirectlyToTheProtectedBranchAndOtherCredentialsC
 	if got := gitrepotest.Git(t, h.repo("demo"), "rev-parse", "refs/heads/main"); strings.TrimSpace(got) != sha {
 		t.Errorf("refs/heads/main on disk = %s, want %s", got, sha)
 	}
+}
+
+// greetingFile is api/greeting.go as the agent of the declaration flow
+// first commits it: a doc comment, Greet and a second function.
+const greetingFile = "package api\n\n// Greet greets.\nfunc Greet() string {\n\treturn \"hello\"\n}\n\nfunc Farewell() string {\n\treturn \"bye\"\n}\n"
+
+// stderrError is the error envelope parley printed on stderr.
+func stderrError(t *testing.T, r ran) map[string]any {
+	t.Helper()
+	var doc struct {
+		Error map[string]any `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(r.stderr), &doc); err != nil || doc.Error == nil {
+		t.Fatalf("stderr is not an error envelope (%v): %q", err, r.stderr)
+	}
+	return doc.Error
+}
+
+// An agent without a clone reads the outline of a file of its fork, reads
+// one function, replaces it by name from the shell, and reads it again;
+// the commit has the consequences of any other: the branch moves, the push
+// and commit events are written, and the change of the branch has a new
+// version.
+func TestSCMWrite_AnAgentChangesOneFunctionWithoutAClone(t *testing.T) {
+	parallel(t)
+	h := startForkHub(t)
+	r := h.runAs(t, h.memberKey, "fork", "create", "demo", "--name", "decl", "--token-permissions", "git:read,git:write")
+	if r.code != 0 {
+		t.Fatalf("fork create exited %d: %s", r.code, r.stderr)
+	}
+	f := r.json(t)
+	slug, pat := str(f, "workspace", "slug"), str(f, "token", "token")
+	first := scmWrite(t, h.workspaceHub, http.MethodPost, "/api/v1/workspaces/"+slug+"/scm/commits", pat, map[string]any{
+		"branch": "greeting", "base_ref": "main", "message": "Add a greeting",
+		"operations": []map[string]any{{"op": "put", "path": "api/greeting.go", "content": greetingFile}},
+		"change":     map[string]any{"target_branch": "main", "title": "Greet", "intent": "say hello"},
+	})
+	change, _ := first.json["change"].(map[string]any)
+	number, _ := change["number"].(float64)
+	if first.status != http.StatusCreated || number == 0 {
+		t.Fatalf("the first commit = %d %s, want 201 opening a change", first.status, first.body)
+	}
+
+	if o := h.runAs(t, pat, "scm", "outline", slug, "api/greeting.go", "--ref", "greeting"); o.code != 0 || !strings.Contains(o.stdout, `"Greet"`) {
+		t.Fatalf("scm outline exited %d: %s %s, want Greet among the declarations", o.code, o.stdout, o.stderr)
+	}
+	read := func(want string) {
+		t.Helper()
+		d := h.runAs(t, pat, "scm", "declaration", slug, "api/greeting.go", "Greet", "--ref", "greeting")
+		if d.code != 0 {
+			t.Fatalf("scm declaration exited %d: %s", d.code, d.stderr)
+		}
+		decls, _ := d.json(t)["declarations"].([]any)
+		if len(decls) != 1 || decls[0].(map[string]any)["content"] != want {
+			t.Errorf("scm declaration printed %s, want one declaration whose content is %q", d.stdout, want)
+		}
+	}
+	read("func Greet() string {\n\treturn \"hello\"\n}\n")
+
+	const greet = "func Greet(name string) string {\n\treturn \"hello \" + name\n}\n"
+	local := filepath.Join(t.TempDir(), "greet.go")
+	if err := os.WriteFile(local, []byte(greet), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pushesBefore, commitsBefore := len(gitPushEvents(t, h.workspaceHub, slug, "refs/heads/greeting")), len(h.events(t, "parley.scm.commit", slug))
+	c := h.runAs(t, pat, "scm", "commit", slug, "--branch", "greeting", "--message", "Greet by name",
+		"--replace-declaration", "api/greeting.go#Greet="+local)
+	if c.code != 0 {
+		t.Fatalf("scm commit exited %d: %s", c.code, c.stderr)
+	}
+	commit, _ := c.json(t)["commit"].(map[string]any)
+	sha, _ := commit["sha"].(string)
+	if head := refHead(t, h.workspaceHub, slug, "greeting", pat); head != sha || len(sha) != 40 {
+		t.Fatalf("greeting is at %s, want the commit printed, %q", head, sha)
+	}
+	want := strings.Replace(greetingFile, "func Greet() string {\n\treturn \"hello\"\n}\n", greet, 1)
+	if file := scmGet(t, h.workspaceHub, "/api/v1/workspaces/"+slug+"/scm/file?ref=greeting&path=api/greeting.go", pat); string(file.body) != want {
+		t.Errorf("api/greeting.go at the new head = %q, want %q", file.body, want)
+	}
+	pushes := gitPushEvents(t, h.workspaceHub, slug, "refs/heads/greeting")
+	if len(pushes) != pushesBefore+1 || pushes[len(pushes)-1].Via != "api" || *pushes[len(pushes)-1].After != sha {
+		t.Errorf("push events of greeting = %+v, want one more, via api, after %s", pushes, sha)
+	}
+	if n := len(h.events(t, "parley.scm.commit", slug)); n != commitsBefore+1 {
+		t.Errorf("%d parley.scm.commit events, want %d", n, commitsBefore+1)
+	}
+	n := strconv.Itoa(int(number))
+	status, body := h.Call(t, http.MethodGet, "/api/v1/workspaces/demo/changes/"+n+"/versions", h.memberKey, nil)
+	var versions struct {
+		Items []map[string]any `json:"items"`
+	}
+	if status != http.StatusOK || json.Unmarshal(body, &versions) != nil || len(versions.Items) != 2 || versions.Items[len(versions.Items)-1]["head_sha"] != sha {
+		t.Errorf("GET the change's versions = %d %s, want two, the second at %s", status, body, sha)
+	}
+	read(greet)
+}
+
+// An agent's replacement is refused twice, for an ambiguous name and then
+// for a result that does not parse, the branch staying where it was, and
+// is accepted once the agent names the method by its type and closes the
+// brace.
+func TestSCMWrite_AnAgentCorrectsAReplacementTheHubRefused(t *testing.T) {
+	parallel(t)
+	h := startForkHub(t)
+	const svc = "package svc\n\ntype Reader struct{}\n\ntype Writer struct{}\n\nfunc (r *Reader) Close() error {\n\treturn nil\n}\n\nfunc (w *Writer) Close() error {\n\treturn nil\n}\n"
+	work := scmWrite(t, h.workspaceHub, http.MethodPost, "/api/v1/workspaces/demo/scm/commits", h.key, map[string]any{
+		"branch": "work", "base_ref": "main", "message": "Add svc",
+		"operations": []map[string]any{{"op": "put", "path": "svc.go", "content": svc}},
+	})
+	if work.status != http.StatusCreated {
+		t.Fatalf("the commit of svc.go = %d %s, want 201", work.status, work.body)
+	}
+	local := filepath.Join(t.TempDir(), "close.go")
+	write := func(text string) {
+		if err := os.WriteFile(local, []byte(text), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	commit := func(address string) ran {
+		return h.runAs(t, h.key, "scm", "commit", "demo", "--branch", "work", "--message", "Flush on close", "--replace-declaration", address+"="+local)
+	}
+	refused := func(what string, r ran, head string, commits int) map[string]any {
+		t.Helper()
+		if r.code != 1 {
+			t.Fatalf("%s: exited %d, stdout %q; want 1", what, r.code, r.stdout)
+		}
+		if got := refHead(t, h.workspaceHub, "demo", "work", h.key); got != head {
+			t.Errorf("%s: work moved to %s", what, got)
+		}
+		if n := len(h.events(t, "parley.scm.commit", "demo")); n != commits {
+			t.Errorf("%s: %d parley.scm.commit events, want %d", what, n, commits)
+		}
+		return stderrError(t, r)
+	}
+	head, commits := refHead(t, h.workspaceHub, "demo", "work", h.key), len(h.events(t, "parley.scm.commit", "demo"))
+
+	write("func (w *Writer) Close() error {\n\treturn w.flush()\n")
+	e := refused("svc.go#Close", commit("svc.go#Close"), head, commits)
+	details, _ := e["details"].(map[string]any)
+	candidates, _ := details["candidates"].([]any)
+	var containers []string
+	for _, c := range candidates {
+		containers = append(containers, c.(map[string]any)["container"].(string))
+	}
+	if e["error_type"] != "ambiguous_declaration" || strings.Join(containers, ",") != "Reader,Writer" {
+		t.Errorf("svc.go#Close printed %s, want ambiguous_declaration with the candidates of Reader and Writer", r2s(e))
+	}
+
+	e = refused("svc.go#Writer.Close", commit("svc.go#Writer.Close"), head, commits)
+	details, _ = e["details"].(map[string]any)
+	errs, _ := details["errors"].([]any)
+	if e["error_type"] != "syntax_error" || details["path"] != "svc.go" || len(errs) == 0 {
+		t.Errorf("svc.go#Writer.Close printed %s, want syntax_error on svc.go with its positions", r2s(e))
+	} else if pos := errs[0].(map[string]any); pos["line"] == nil || pos["column"] == nil {
+		t.Errorf("the first error is %v, want a line and a column", pos)
+	}
+
+	write("func (w *Writer) Close() error {\n\treturn w.flush()\n}\n")
+	c := commit("svc.go#Writer.Close")
+	if c.code != 0 {
+		t.Fatalf("the corrected commit exited %d: %s", c.code, c.stderr)
+	}
+	sha, _ := c.json(t)["commit"].(map[string]any)["sha"].(string)
+	if got := refHead(t, h.workspaceHub, "demo", "work", h.key); got != sha {
+		t.Errorf("work is at %s, want the commit printed, %s", got, sha)
+	}
+	want := strings.Replace(svc, "func (w *Writer) Close() error {\n\treturn nil\n}\n", "func (w *Writer) Close() error {\n\treturn w.flush()\n}\n", 1)
+	if file := scmGet(t, h.workspaceHub, "/api/v1/workspaces/demo/scm/file?ref=work&path=svc.go", h.key); string(file.body) != want {
+		t.Errorf("svc.go at work = %q, want the new Close of Writer and the old Close of Reader", file.body)
+	}
+}
+
+// r2s is an error envelope as text, for a message.
+func r2s(e map[string]any) string {
+	b, _ := json.Marshal(e)
+	return string(b)
 }

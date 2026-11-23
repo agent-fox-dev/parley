@@ -240,6 +240,22 @@ func TestMCPList_ServesTheOutlineOfAFileAsAReadingTool(t *testing.T) {
 	}
 }
 
+func TestMCPList_ServesTheDeclarationsOfAFileAsAReadingTool(t *testing.T) {
+	for _, args := range [][]string{{"--no-code-mode"}, {"--no-code-mode", "--read-only"}} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			in := toolNamed(t, mcpList(t, defaultOptions(), args...), "scm_declaration").InputSchema
+			if required := slices.Sorted(slices.Values(in.Required)); !slices.Equal(required, []string{"name", "path", "slug"}) {
+				t.Errorf("required = %v, want name, path and slug", in.Required)
+			}
+			for _, param := range []string{"slug", "path", "name", "container", "kind", "ref"} {
+				if in.Properties[param]["type"] != "string" {
+					t.Errorf("the parameter %s is %v, want a string", param, in.Properties[param])
+				}
+			}
+		})
+	}
+}
+
 func TestMCPList_ServesTheStateOfTheCodeIndexAsAReadingTool(t *testing.T) {
 	in := toolNamed(t, mcpList(t, defaultOptions(), "--no-code-mode", "--read-only"), "scm_code_index").InputSchema
 	if !slices.Equal(in.Required, []string{"slug"}) || in.Properties["slug"]["type"] != "string" {
@@ -471,7 +487,8 @@ func TestMCPList_GivesEachToolItsCommandsArgumentsAndFlagsAsParameters(t *testin
 	}{
 		{"change_land", []param{{"slug", "string"}, {"number", "string"}, {"wait", "boolean"}, {"stack", "boolean"}, {"timeout", "string"}, {"expected_version", "string"}},
 			[]string{"number", "slug"}},
-		{"scm_commit", []param{{"slug", "string"}, {"put", "array"}, {"delete", "array"}, {"move", "array"}, {"message", "string"}, {"draft", "boolean"}},
+		{"scm_commit", []param{{"slug", "string"}, {"put", "array"}, {"delete", "array"}, {"move", "array"}, {"message", "string"}, {"draft", "boolean"},
+			{"replace_declaration", "array"}, {"delete_declaration", "array"}, {"insert_after", "array"}, {"insert_before", "array"}},
 			[]string{"branch", "message", "slug"}},
 		{"sandbox_upload", []param{{"workspace_slug", "string"}, {"id", "string"}, {"local_path", "string"}, {"sandbox_path", "string"}},
 			[]string{"id", "local_path", "sandbox_path", "workspace_slug"}},

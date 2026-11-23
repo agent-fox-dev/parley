@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -159,6 +160,18 @@ func newSCMCommand() *cobra.Command {
 			command: command{Name: "outline", Description: "Show the declarations of a source file: kinds, names, signatures and lines", Path: "/workspaces/:slug/scm/outline", Args: []argSpec{slugArg, {Name: "path", Required: true}}},
 			params:  map[string]string{"path": "path"},
 			query:   []queryFlag{refFlag("file is outlined")},
+		}.build(),
+		scmRead{
+			command: command{
+				Name: "declaration", Description: "Show the declarations of a source file that have a name, with their lines", Path: "/workspaces/:slug/scm/declaration",
+				Args: []argSpec{slugArg, {Name: "path", Required: true}, {Name: "name", Required: true}},
+			},
+			params: map[string]string{"path": "path", "name": "name"},
+			query: []queryFlag{
+				{name: "container", param: "container", usage: "only the declarations of this container, such as the type of a method"},
+				{name: "kind", param: "kind", oneOf: declarationKinds, usage: "only the declarations of this kind"},
+				refFlag("file is read"),
+			},
 		}.build(),
 		scmRead{
 			command: command{Name: "code-index", Description: "Show which commit a workspace's code index holds and what state it is in", Path: "/workspaces/:slug/scm/code-index", Args: slugOnly},
@@ -431,6 +444,9 @@ func conflictIn(result []byte) (bool, string) {
 	return true, "head does not rebase onto base without a conflict: mergeable is conflict"
 }
 
+// declarationKinds are the kinds of declaration an outline reports.
+var declarationKinds = []string{"func", "method", "type", "class", "interface", "enum", "trait", "const", "var", "module", "macro"}
+
 // fileOperation is one member of the operations of a commit's body.
 type fileOperation struct {
 	Op   string `json:"op"`
@@ -439,11 +455,35 @@ type fileOperation struct {
 	ContentBase64 *string `json:"content_base64,omitempty"`
 	From          string  `json:"from,omitempty"`
 	To            string  `json:"to,omitempty"`
+	// Name and Container address the declaration a replacement or a
+	// deletion changes; After or Before the one an insertion is placed
+	// beside. Content is the text of a replacement or an insertion.
+	Name      string              `json:"name,omitempty"`
+	Container string              `json:"container,omitempty"`
+	Content   *string             `json:"content,omitempty"`
+	After     *declarationAddress `json:"after,omitempty"`
+	Before    *declarationAddress `json:"before,omitempty"`
 }
 
-// operationFlag is one of --put, --delete and --move of parley scm commit.
-// The three append to one list, because the operations are sent in the
-// order of the command line and pflag keeps the order only within one flag.
+// declarationAddress is the address of a declaration in a commit's body.
+type declarationAddress struct {
+	Name      string `json:"name"`
+	Container string `json:"container,omitempty"`
+}
+
+// The flags of parley scm commit that change a file through a declaration,
+// by the op each sends.
+var declarationFlags = map[string]string{
+	"replace-declaration": "replace_declaration",
+	"delete-declaration":  "delete_declaration",
+	"insert-after":        "insert_declaration",
+	"insert-before":       "insert_declaration",
+}
+
+// operationFlag is one of the operation flags of parley scm commit: --put,
+// --delete, --move and the declaration flags. They append to one list,
+// because the operations are sent in the order of the command line and
+// pflag keeps the order only within one flag.
 // A value is checked, and a --put file read, as the flag is parsed, so that
 // a bad one is a usage error before any setting is read or any request sent
 // (ADR 02).
@@ -473,6 +513,9 @@ func (f *operationFlag) String() string { return "[" + strings.Join(f.given, ","
 // the local file's bytes. A pair is split at its first =, so a local file's
 // name may hold one.
 func parseOperation(op, value string) (fileOperation, error) {
+	if _, ok := declarationFlags[op]; ok {
+		return parseDeclarationOperation(op, value)
+	}
 	if op == "delete" {
 		return fileOperation{Op: op, Path: value}, nil
 	}
@@ -492,6 +535,72 @@ func parseOperation(op, value string) (fileOperation, error) {
 	}
 	content := base64.StdEncoding.EncodeToString(data)
 	return fileOperation{Op: op, Path: left, ContentBase64: &content}, nil
+}
+
+// parseDeclarationOperation is the operation of the declaration flag
+// --<flag> given value: <repo-path>#<name>, followed by =<local-file> for
+// every flag but --delete-declaration, the local file's text as the
+// content. The local file's name follows the first = after the last #, so
+// a name may hold one; the address is split at its last #, and a name
+// holding a dot at its last dot into a container and a name.
+func parseDeclarationOperation(flag, value string) (fileOperation, error) {
+	address, file := value, ""
+	if flag != "delete-declaration" {
+		hash := strings.LastIndex(value, "#")
+		eq := strings.Index(value[hash+1:], "=")
+		if hash < 0 || eq < 0 {
+			return fileOperation{}, errors.New("want <repo-path>#<name>=<local-file>")
+		}
+		address, file = value[:hash+1+eq], value[hash+2+eq:]
+		if file == "" {
+			return fileOperation{}, errors.New("want <repo-path>#<name>=<local-file>, the local file not empty")
+		}
+	}
+	path, name, found := cutLast(address, "#")
+	if !found || path == "" || name == "" {
+		return fileOperation{}, errors.New("want the address <repo-path>#<name>, neither side empty")
+	}
+	container := ""
+	if c, n, dotted := cutLast(name, "."); dotted {
+		if c == "" || n == "" {
+			return fileOperation{}, errors.New("want the name <container>.<name>, neither side empty")
+		}
+		container, name = c, n
+	}
+	op := fileOperation{Op: declarationFlags[flag], Path: path}
+	if flag == "insert-after" || flag == "insert-before" {
+		at := &declarationAddress{Name: name, Container: container}
+		if flag == "insert-after" {
+			op.After = at
+		} else {
+			op.Before = at
+		}
+	} else {
+		op.Name, op.Container = name, container
+	}
+	if file == "" {
+		return op, nil
+	}
+	data, err := os.ReadFile(file)
+	if err != nil {
+		return fileOperation{}, fmt.Errorf("cannot read the local file: %v", err)
+	}
+	if !utf8.Valid(data) {
+		return fileOperation{}, errors.New("the local file is not UTF-8 text, which a declaration operation takes")
+	}
+	text := string(data)
+	op.Content = &text
+	return op, nil
+}
+
+// cutLast is s cut around the last instance of sep, as strings.Cut cuts
+// around the first.
+func cutLast(s, sep string) (before, after string, found bool) {
+	i := strings.LastIndex(s, sep)
+	if i < 0 {
+		return s, "", false
+	}
+	return s[:i], s[i+len(sep):], true
 }
 
 // commitBody is the body of POST /workspaces/:slug/scm/commits. A member
@@ -539,6 +648,14 @@ func newSCMCommitCommand() *cobra.Command {
 			fs.Var(&operationFlag{op: "put", list: &operations}, "put", "write <repo-path>=<local-file>, the local file's bytes, repeatable")
 			fs.Var(&operationFlag{op: "delete", list: &operations}, "delete", "delete <repo-path>, repeatable")
 			fs.Var(&operationFlag{op: "move", list: &operations}, "move", "move <from>=<to>, repeatable")
+			fs.Var(&operationFlag{op: "replace-declaration", list: &operations}, "replace-declaration",
+				"replace the declaration <repo-path>#<name> by the text of <local-file>, written <repo-path>#<name>=<local-file>; <container>.<name> names a method, repeatable")
+			fs.Var(&operationFlag{op: "delete-declaration", list: &operations}, "delete-declaration",
+				"delete the declaration <repo-path>#<name>; <container>.<name> names a method, repeatable")
+			fs.Var(&operationFlag{op: "insert-after", list: &operations}, "insert-after",
+				"insert the text of <local-file> after the declaration <repo-path>#<name>, written <repo-path>#<name>=<local-file>, repeatable")
+			fs.Var(&operationFlag{op: "insert-before", list: &operations}, "insert-before",
+				"insert the text of <local-file> before the declaration <repo-path>#<name>, written <repo-path>#<name>=<local-file>, repeatable")
 			fs.String("session", "", "the id of the agent session the commit belongs to")
 			fs.String("change-target", "", "open a change of the branch into this branch")
 			fs.String("title", "", "the title of the change opened")

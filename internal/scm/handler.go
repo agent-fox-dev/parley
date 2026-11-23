@@ -1,6 +1,6 @@
 // Package scm serves the source control API: the reads of the refs,
-// commits, trees, files, diffs, comparisons, blame, content search and file
-// outlines of a workspace's repository, each answer computed from commits
+// commits, trees, files, diffs, comparisons, blame, content search, file
+// outlines and declarations of a workspace's repository, each answer computed from commits
 // named by their full ids, and the writes to it.
 //
 // Every write route is built by one wrapper (writeRoute), which needs, for a
@@ -75,6 +75,8 @@ const (
 	opBlame   = "blame"
 	opSearch  = "search"
 	opOutline = "outline"
+
+	opDeclaration = "declaration"
 )
 
 // DefaultReadTimeout is how long a read may run when Deps sets no read
@@ -274,6 +276,7 @@ func (c *Component) Routes() []server.Route {
 		c.route("/blame", opBlame, c.getBlame),
 		c.route("/search", opSearch, c.search),
 		c.route("/outline", opOutline, c.getOutline),
+		c.route("/declaration", opDeclaration, c.getDeclaration),
 	}
 }
 

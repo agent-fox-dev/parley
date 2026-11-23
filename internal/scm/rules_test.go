@@ -311,6 +311,29 @@ func TestPushRules_WithTheHubsEngine(t *testing.T) {
 		if p, _ := errorMember(r, "path"); r.status != http.StatusForbidden || r.errorType() != "path_not_allowed" || p != "guide.md" {
 			t.Errorf("a commit moving docs/guide.md to guide.md: %d %s, want 403 path_not_allowed with error.path guide.md", r.status, r.body)
 		}
+
+		// A declaration operation changes its file as a put would.
+		r = w.sendJSON(t, http.MethodPost, path, w.ownerKey, map[string]any{"branch": "work", "expected_head_sha": head,
+			"message": "m", "operations": []any{put("src/b.go", "package b\n\nfunc F() {}\n")}})
+		if r.status != http.StatusCreated {
+			t.Fatalf("the owner's commit of src/b.go: %d %s, want 201", r.status, r.body)
+		}
+		head, _ = answerCommit(r)["sha"].(string)
+		replace := map[string]any{"op": "replace_declaration", "path": "src/b.go", "name": "F", "content": "func F() { _ = 1 }\n"}
+		refs = gitrepotest.Git(t, dir, "for-each-ref")
+		r = commitOn(head, replace)
+		if p, _ := errorMember(r, "path"); r.status != http.StatusForbidden || r.errorType() != "path_not_allowed" || p != "src/b.go" {
+			t.Errorf("a replacement in src/b.go with a token of docs/**: %d %s, want 403 path_not_allowed with error.path src/b.go", r.status, r.body)
+		}
+		if after := gitrepotest.Git(t, dir, "for-each-ref"); after != refs {
+			t.Errorf("the refused replacement changed the refs")
+		}
+		src := w.IssuePAT(t, identity.PATSpec{UserID: w.owner, Permissions: []string{"git:write"}, Paths: []string{"src/**"}})
+		r = w.sendJSON(t, http.MethodPost, path, src, map[string]any{"branch": "work", "expected_head_sha": head, "message": "m",
+			"operations": []any{replace}})
+		if r.status != http.StatusCreated {
+			t.Errorf("the same replacement with a token of src/**: %d %s, want 201", r.status, r.body)
+		}
 	})
 
 	t.Run("keeps a fork's tracking branches read-only and names its base", func(t *testing.T) {

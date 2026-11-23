@@ -4,7 +4,7 @@ go 1.27
 
 require (
 	github.com/BurntSushi/toml v1.6.0
-	github.com/agent-fox-dev/agentkit-go v0.10.0
+	github.com/agent-fox-dev/agentkit-go v0.11.0
 	github.com/agent-fox-dev/agentkit-go/codesearch v0.9.1-0.20261120191049-20c16c905540
 	github.com/agent-fox-dev/agentkit-go/mcpserve v0.10.0
 	github.com/ai-openshell/sdk-go v0.1.9
@@ -39,6 +39,7 @@ require (
 	github.com/grafana/regexp v0.0.0-20240607082908-2cb410fa05da // indirect
 	github.com/grpc-ecosystem/go-grpc-middleware/v2 v2.3.3 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
+	github.com/klauspost/compress v1.18.3 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
@@ -81,6 +82,7 @@ require (
 	github.com/wasilibs/go-re2 v1.10.0 // indirect
 	github.com/wasilibs/wazero-helpers v0.0.0-20240620070341-3dff1577cd52 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
+	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.54.0 // indirect
 	go.starlark.net v0.0.0-20261005163335-bcb1a1a55bf9 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
