@@ -754,7 +754,9 @@ workspace behind `GET …/scm/code-search` and `GET …/scm/symbols`.
   [Background work](#background-work)): it survives a restart and is
   retried. It always takes the head as it is when it starts, and at most
   one more waits beside the one running. A build stopped by its size or
-  time bounds leaves a **partial** index, which answers and says so.
+  time bounds leaves a **partial** index, which answers and says so. The
+  library that builds it cannot load a partial index from disk, so after
+  a restart a partial index is behind and is built again as a job.
 - **How it learns a head moved.** That head is written in several places:
   the ref writer, a clone, a sync and a carry-patch rebuild. Each tells
   the index

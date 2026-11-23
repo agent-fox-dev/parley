@@ -78,8 +78,10 @@ type Component struct {
 	// building is the commit of the last build of each workspace this
 	// process began, by slug.
 	building map[string]string
-	// open are the indexes loaded for use, by slug.
-	open map[string]*openIndex
+	// open are the indexes loaded for use, by slug, and built the indexes
+	// of partial builds whose settlement has not made them loaded yet.
+	open  map[string]*openIndex
+	built map[string]*openIndex
 	// pins counts the queries that load or read the index of a build, by
 	// slug/commit, and removing holds the builds whose directory the sweep
 	// is taking: a pinned build's directory stays, and one being removed
@@ -91,6 +93,9 @@ type Component struct {
 	// changed is closed, and replaced, whenever the settlement of a build
 	// has committed: what a query that waits for the index waits on.
 	changed chan struct{}
+	// stopped says that the hub has stopped: a build that settles now
+	// leaves nothing loaded.
+	stopped bool
 }
 
 // Bind gives the component its dependencies, the defaults in place of the

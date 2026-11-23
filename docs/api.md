@@ -3804,7 +3804,7 @@ when the feature or the setting is off, takes no parameter and carries no
 | `state` | Meaning |
 |---|---|
 | `off` | `enabled` is `false` |
-| `queued` | the index is behind the head and a build is waiting |
+| `queued` | the index is behind the head and a build is waiting; a partial index is behind after the hub restarts, since it is built again |
 | `building` | a build is running |
 | `ready` | the index holds the head |
 | `failed` | the last build of the head failed; the hub retries with growing delays, and at once when the head moves |

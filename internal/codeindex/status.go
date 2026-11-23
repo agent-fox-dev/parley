@@ -139,7 +139,7 @@ func (c *Component) Status(ctx context.Context, ws Workspace) (Status, error) {
 	switch {
 	case len(running) > 0:
 		st.State = StateBuilding
-	case head != "" && rec.IndexedSHA == head && c.stored(ws.Slug, head):
+	case head != "" && c.current(ws.Slug, head, rec):
 		st.State = StateReady
 	case head != "" && rec.FailedSHA == head:
 		st.State = StateFailed

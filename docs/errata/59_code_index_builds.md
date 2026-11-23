@@ -25,9 +25,17 @@ for every workspace before it serves. The start checks only that the
 directory the record names is there, and queues a build where it is not;
 the index is loaded when it is first used (`Component.Files`). One that
 cannot be loaded then is treated as none: its directory is removed and its
-build queued. A partial index is not stored whole by `codesearch`, so its
-first use after a restart builds it again within its bounds; this is not a
-build job and is not counted.
+build queued.
+
+A partial index is the exception: `codesearch` stores it but will not load
+it, and building it again is the only way to have it. A build that ends
+partial therefore keeps its index open and hands it to the component in
+its settlement, before the record commits, and the index is used from
+there; one is never loaded. After a restart no build of the process left
+it open, so the index counts as behind: the start (and every maintenance
+pass) queues its build as a job like any other, bounded by `workers`,
+counted, shown as `queued` and then `building`, and a search waits for it
+and is answered `503 code_index_not_ready` when the wait runs out.
 
 ## Whether an index is partial comes from its search tool
 
