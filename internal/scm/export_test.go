@@ -29,3 +29,14 @@ func SetRebaseHook(c *Component, hook func()) {
 	defer c.mu.Unlock()
 	c.replayed = hook
 }
+
+// ReplaceLines is src with its lines start to end, 1-based and inclusive,
+// replaced by content as a replace_declaration replaces them; ok is false
+// when they are not lines of src.
+func ReplaceLines(src string, start, end int, content string) (string, bool) {
+	from, to, ok := lineSpan([]byte(src), start, end)
+	if !ok {
+		return "", false
+	}
+	return string(spliceLines([]byte(src), from, to, []byte(content))), true
+}

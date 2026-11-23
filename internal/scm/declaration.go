@@ -292,3 +292,267 @@ func lineSpan(src []byte, start, end int) (from, to int, ok bool) {
 		line++
 	}
 }
+
+// spliceLines is src with its bytes [from, to), whole lines or the empty
+// range between two, replaced by content, which is ended by the file's own
+// line ending (lineEnding) when it is not empty and has none. Content put
+// after a last line that has no line ending starts on a line of its own.
+func spliceLines(src []byte, from, to int, content []byte) []byte {
+	eol := lineEnding(src)
+	out := make([]byte, 0, len(src)-(to-from)+len(content)+2*len(eol))
+	out = append(out, src[:from]...)
+	if len(content) > 0 && from > 0 && src[from-1] != '\n' {
+		out = append(out, eol...)
+	}
+	out = append(out, content...)
+	if len(content) > 0 && content[len(content)-1] != '\n' {
+		out = append(out, eol...)
+	}
+	return append(out, src[to:]...)
+}
+
+// lineEnding is the line ending of the first line of src, CRLF or LF, and
+// LF for a file with no line ending.
+func lineEnding(src []byte) []byte {
+	if i := bytes.IndexByte(src, '\n'); i > 0 && src[i-1] == '\r' {
+		return []byte("\r\n")
+	}
+	return []byte("\n")
+}
+
+// The ops of the declaration operations of a commit request.
+const (
+	opReplaceDeclaration = "replace_declaration"
+	opDeleteDeclaration  = "delete_declaration"
+	opInsertDeclaration  = "insert_declaration"
+)
+
+// maxDeclarationOperations is the most declaration operations one commit
+// request may hold, among its maxOperations.
+const maxDeclarationOperations = 100
+
+// maxCandidates is the most declarations an ambiguous address's refusal
+// lists.
+const maxCandidates = 20
+
+// plannedOperation is one operation of a commit request once its shape is
+// checked: a file operation as the tree builder takes it, or, when decl is
+// set, a declaration operation, which becomes a put of the file it changes
+// once the file is read.
+type plannedOperation struct {
+	op   gitrepo.Operation
+	decl *declarationOperation
+}
+
+// declarationOperation is a replacement, a deletion or an insertion of a
+// file's lines, placed by an address.
+type declarationOperation struct {
+	op      string
+	path    string
+	addr    address
+	content []byte
+	// after places an insertion after the declaration addr names rather
+	// than before it.
+	after bool
+}
+
+// plan is o checked, or why it is malformed.
+func (o fileOperation) plan() (plannedOperation, error) {
+	op := ""
+	if o.Op != nil {
+		op = *o.Op
+	}
+	switch op {
+	case opReplaceDeclaration, opDeleteDeclaration, opInsertDeclaration:
+	default:
+		fileOp, err := o.operation()
+		return plannedOperation{op: fileOp}, err
+	}
+	d := &declarationOperation{op: op, path: str(o.Path)}
+	if !gitrepo.ValidPath(d.path) {
+		return plannedOperation{}, fmt.Errorf("path %q is missing, absolute, or has an empty, ., .. or .git segment (in any form a file system reads as .git)", d.path)
+	}
+	if o.ContentBase64 != nil {
+		return plannedOperation{}, fmt.Errorf("a %s takes its text as content, not content_base64", op)
+	}
+	if op != opDeleteDeclaration {
+		if o.Content == nil {
+			return plannedOperation{}, fmt.Errorf("a %s takes content", op)
+		}
+		d.content = []byte(*o.Content)
+	}
+	if op == opInsertDeclaration {
+		if (o.After == nil) == (o.Before == nil) {
+			return plannedOperation{}, errors.New("an insert_declaration takes exactly one of after and before")
+		}
+		at := o.Before
+		if o.After != nil {
+			at, d.after = o.After, true
+		}
+		d.addr = address{Name: str(at.Name), Container: str(at.Container), Kind: str(at.Kind)}
+	} else {
+		d.addr = address{Name: str(o.Name), Container: str(o.Container), Kind: str(o.Kind)}
+	}
+	if why := d.addr.check(); why != "" {
+		return plannedOperation{}, errors.New(why)
+	}
+	return plannedOperation{decl: d}, nil
+}
+
+// str is the string p points at, "" for nil.
+func str(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
+// stagedSource is a file as the operations of a commit request so far have
+// left it: its bytes and mode once read or written, or the path of the
+// parent's file they are still to be read from.
+type stagedSource struct {
+	gone    bool
+	loaded  bool
+	from    string
+	content []byte
+	mode    string
+}
+
+// resolveDeclarations is the operations of a commit request on top of the
+// commit parent, as the tree builder takes them: every file operation as it
+// is, and every declaration operation as a put of its file's new bytes,
+// with the file's mode. Each declaration operation reads its file as the
+// operations before it left it, a put's content or a move's source among
+// them, and the parent's file otherwise.
+//
+// A declaration operation on a path that is no file there is 400
+// invalid_operation; an address that names no declaration is 404
+// declaration_not_found and one that names several 409
+// ambiguous_declaration, each naming the operation's index and path.
+func (c *Component) resolveDeclarations(ctx context.Context, git *gitrepo.Repo, parent string, planned []plannedOperation) ([]gitrepo.Operation, error) {
+	ops := make([]gitrepo.Operation, 0, len(planned))
+	staged := map[string]*stagedSource{}
+	current := func(path string) *stagedSource {
+		if f, ok := staged[path]; ok {
+			return f
+		}
+		return &stagedSource{from: path}
+	}
+	for i, p := range planned {
+		if p.decl == nil {
+			op := p.op
+			switch op.Op {
+			case gitrepo.OpPut:
+				mode := op.Mode
+				if mode == "" {
+					mode = gitrepo.ModeFile
+				}
+				staged[op.Path] = &stagedSource{loaded: true, content: op.Content, mode: mode}
+			case gitrepo.OpDelete:
+				staged[op.Path] = &stagedSource{gone: true}
+			case gitrepo.OpChmod:
+				f := *current(op.Path)
+				f.mode = op.Mode
+				staged[op.Path] = &f
+			case gitrepo.OpMove:
+				f := *current(op.From)
+				staged[op.To] = &f
+				staged[op.From] = &stagedSource{gone: true}
+			}
+			ops = append(ops, op)
+			continue
+		}
+		d := p.decl
+		f := current(d.path)
+		if err := c.load(ctx, git, parent, f); err != nil {
+			if errors.Is(err, errNoFile) {
+				return nil, server.NewError("invalid_operation", http.StatusBadRequest,
+					fmt.Sprintf("operation %d: %s is no file to change by its declarations", i, d.path)).
+					WithDetails(map[string]any{"index": i})
+			}
+			return nil, err
+		}
+		content, err := c.applyDeclaration(ctx, i, d, f)
+		if err != nil {
+			return nil, err
+		}
+		staged[d.path] = &stagedSource{loaded: true, content: content, mode: f.mode}
+		ops = append(ops, gitrepo.Operation{Op: gitrepo.OpPut, Path: d.path, Content: content, Mode: f.mode})
+	}
+	return ops, nil
+}
+
+// errNoFile is load's report of a path that is no file.
+var errNoFile = errors.New("no file")
+
+// load reads the bytes and the mode of f from the commit parent when they
+// are not read yet, or returns errNoFile for a file that is gone or a path
+// that is no file at parent.
+func (c *Component) load(ctx context.Context, git *gitrepo.Repo, parent string, f *stagedSource) error {
+	if f.gone {
+		return errNoFile
+	}
+	if f.loaded {
+		return nil
+	}
+	entry, err := git.LookupFile(ctx, parent, f.from)
+	if errors.Is(err, gitrepo.ErrNotFound) || errors.Is(err, gitrepo.ErrNotFile) {
+		return errNoFile
+	}
+	if err != nil {
+		return err
+	}
+	var buf bytes.Buffer
+	if err := git.WriteBlob(ctx, entry.ID, &buf); err != nil {
+		return err
+	}
+	if f.mode == "" {
+		f.mode = entry.Mode
+	}
+	f.content, f.loaded = buf.Bytes(), true
+	return nil
+}
+
+// applyDeclaration is the bytes of the file f once the declaration
+// operation d, the request's operation index, has changed them.
+func (c *Component) applyDeclaration(ctx context.Context, index int, d *declarationOperation, f *stagedSource) ([]byte, error) {
+	where := map[string]any{"index": index, "path": d.path}
+	src, refused, err := c.outlineSource(ctx, d.path, f.mode, f.content)
+	if err != nil {
+		return nil, fmt.Errorf("outline %q: %w", d.path, err)
+	}
+	if refused != nil {
+		return nil, refused.apiError(nil)
+	}
+	found := d.addr.find(src.file.Decls)
+	switch {
+	case len(found) == 0:
+		return nil, server.NewError("declaration_not_found", http.StatusNotFound,
+			fmt.Sprintf("operation %d: %s declares nothing named %q", index, d.path, d.addr.Name)+d.addr.qualifiers()).WithDetails(where)
+	case len(found) > 1:
+		candidates := make([]map[string]any, 0, min(len(found), maxCandidates))
+		for _, decl := range found[:min(len(found), maxCandidates)] {
+			candidates = append(candidates, map[string]any{"kind": string(decl.Kind), "name": decl.Name, "container": decl.Container,
+				"signature": decl.Signature, "start_line": decl.StartLine, "end_line": decl.EndLine})
+		}
+		where["candidates"] = candidates
+		return nil, server.NewError("ambiguous_declaration", http.StatusConflict,
+			fmt.Sprintf("operation %d: %s declares %d declarations named %q%s; give a container or a kind to name one", index, d.path, len(found), d.addr.Name, d.addr.qualifiers())).
+			WithDetails(where)
+	}
+	from, to, ok := lineSpan(f.content, found[0].StartLine, found[0].EndLine)
+	if !ok {
+		return nil, server.NewError("unparseable_file", http.StatusUnprocessableEntity,
+			fmt.Sprintf("operation %d: the end of %q in %s is not known", index, d.addr.Name, d.path))
+	}
+	switch d.op {
+	case opDeleteDeclaration:
+		return spliceLines(f.content, from, to, nil), nil
+	case opInsertDeclaration:
+		if d.after {
+			return spliceLines(f.content, to, to, d.content), nil
+		}
+		return spliceLines(f.content, from, from, d.content), nil
+	}
+	return spliceLines(f.content, from, to, d.content), nil
+}

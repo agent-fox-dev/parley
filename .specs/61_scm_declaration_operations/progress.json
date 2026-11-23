@@ -3,7 +3,7 @@
   "spec_id": "61",
   "spec_name": "scm_declaration_operations",
   "schema_version": 3,
-  "updated_at": "2026-11-23T11:45:41Z",
+  "updated_at": "2026-11-23T11:55:46Z",
   "tasks": [
     {
       "id": 1,
@@ -207,7 +207,212 @@
     },
     {
       "id": 2,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-2.1",
+          "tests": [
+            {
+              "test": "./internal/scm:TestDeclarationCommit/replaces_a_declaration's_lines_and_leaves_every_other_byte",
+              "failed": {
+                "at": "2026-11-23T11:48:29Z",
+                "tree": "5f3ac6e8307ac88c91dffde0e5d0607ba220df18"
+              },
+              "passed": {
+                "at": "2026-11-23T11:55:42Z",
+                "tree": "f6caa75ec293295fa4f83c7600195e24bac876e2"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.2",
+          "tests": [
+            {
+              "test": "./internal/scm:TestDeclarationCommit/deletes_a_declaration's_lines",
+              "failed": {
+                "at": "2026-11-23T11:48:29Z",
+                "tree": "5f3ac6e8307ac88c91dffde0e5d0607ba220df18"
+              },
+              "passed": {
+                "at": "2026-11-23T11:55:42Z",
+                "tree": "f6caa75ec293295fa4f83c7600195e24bac876e2"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.3",
+          "tests": [
+            {
+              "test": "./internal/scm:TestDeclarationCommit/inserts_after_or_before_a_declaration",
+              "failed": {
+                "at": "2026-11-23T11:48:29Z",
+                "tree": "5f3ac6e8307ac88c91dffde0e5d0607ba220df18"
+              },
+              "passed": {
+                "at": "2026-11-23T11:55:42Z",
+                "tree": "f6caa75ec293295fa4f83c7600195e24bac876e2"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.4",
+          "tests": [
+            {
+              "test": "./internal/scm:TestReplaceLines_EndsTheContentWithTheFilesOwnLineEnding",
+              "failed": {
+                "at": "2026-11-23T11:48:29Z",
+                "tree": "5f3ac6e8307ac88c91dffde0e5d0607ba220df18"
+              },
+              "passed": {
+                "at": "2026-11-23T11:55:42Z",
+                "tree": "f6caa75ec293295fa4f83c7600195e24bac876e2"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.5",
+          "tests": [
+            {
+              "test": "./internal/scm:TestDeclarationCommit/applies_each_operation_to_the_file_as_the_operations_before_it_left_it",
+              "failed": {
+                "at": "2026-11-23T11:48:29Z",
+                "tree": "5f3ac6e8307ac88c91dffde0e5d0607ba220df18"
+              },
+              "passed": {
+                "at": "2026-11-23T11:55:42Z",
+                "tree": "f6caa75ec293295fa4f83c7600195e24bac876e2"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.6",
+          "tests": [
+            {
+              "test": "./internal/scm:TestDeclarationCommit/accepts_a_replacement_that_no_longer_declares_the_name",
+              "failed": {
+                "at": "2026-11-23T11:48:29Z",
+                "tree": "5f3ac6e8307ac88c91dffde0e5d0607ba220df18"
+              },
+              "passed": {
+                "at": "2026-11-23T11:55:42Z",
+                "tree": "f6caa75ec293295fa4f83c7600195e24bac876e2"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.7",
+          "tests": [
+            {
+              "test": "./internal/scm:TestCommit/refuses_a_malformed_request_and_moves_no_ref",
+              "failed": {
+                "at": "2026-11-23T11:48:29Z",
+                "tree": "5f3ac6e8307ac88c91dffde0e5d0607ba220df18"
+              },
+              "passed": {
+                "at": "2026-11-23T11:55:42Z",
+                "tree": "f6caa75ec293295fa4f83c7600195e24bac876e2"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.8",
+          "tests": [
+            {
+              "test": "./internal/scm:TestCommit/refuses_a_malformed_request_and_moves_no_ref",
+              "failed": {
+                "at": "2026-11-23T11:48:29Z",
+                "tree": "5f3ac6e8307ac88c91dffde0e5d0607ba220df18"
+              },
+              "passed": {
+                "at": "2026-11-23T11:55:42Z",
+                "tree": "f6caa75ec293295fa4f83c7600195e24bac876e2"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.1",
+          "tests": [
+            {
+              "test": "./internal/scm:TestDeclarationCommit/refuses_an_address_that_matches_no_declaration",
+              "failed": {
+                "at": "2026-11-23T11:48:29Z",
+                "tree": "5f3ac6e8307ac88c91dffde0e5d0607ba220df18"
+              },
+              "passed": {
+                "at": "2026-11-23T11:55:42Z",
+                "tree": "f6caa75ec293295fa4f83c7600195e24bac876e2"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.2",
+          "tests": [
+            {
+              "test": "./internal/scm:TestDeclarationCommit/refuses_an_address_that_matches_more_than_one_declaration_and_lists_them",
+              "failed": {
+                "at": "2026-11-23T11:48:29Z",
+                "tree": "5f3ac6e8307ac88c91dffde0e5d0607ba220df18"
+              },
+              "passed": {
+                "at": "2026-11-23T11:55:42Z",
+                "tree": "f6caa75ec293295fa4f83c7600195e24bac876e2"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.3",
+          "tests": [
+            {
+              "test": "./internal/scm:TestDeclarationCommit/resolves_an_ambiguous_name_by_its_container_or_its_kind",
+              "failed": {
+                "at": "2026-11-23T11:48:29Z",
+                "tree": "5f3ac6e8307ac88c91dffde0e5d0607ba220df18"
+              },
+              "passed": {
+                "at": "2026-11-23T11:55:42Z",
+                "tree": "f6caa75ec293295fa4f83c7600195e24bac876e2"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.4",
+          "tests": [
+            {
+              "test": "./internal/scm:TestCommit/refuses_an_operation_that_does_not_apply_and_names_it",
+              "failed": {
+                "at": "2026-11-23T11:48:29Z",
+                "tree": "5f3ac6e8307ac88c91dffde0e5d0607ba220df18"
+              },
+              "passed": {
+                "at": "2026-11-23T11:55:42Z",
+                "tree": "f6caa75ec293295fa4f83c7600195e24bac876e2"
+              }
+            },
+            {
+              "test": "./internal/scm:TestCommit/refuses_a_declaration_operation_on_a_file_an_earlier_operation_deleted",
+              "failed": {
+                "at": "2026-11-23T11:48:29Z",
+                "tree": "5f3ac6e8307ac88c91dffde0e5d0607ba220df18"
+              },
+              "passed": {
+                "at": "2026-11-23T11:55:42Z",
+                "tree": "f6caa75ec293295fa4f83c7600195e24bac876e2"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 3,
