@@ -34,9 +34,12 @@ is unchanged.
 - Addressing syntax nodes below a declaration (a statement, an expression,
   a parameter). The unit is the declaration the outline route reports.
 - Line-range or patch operations in `POST …/scm/commits`.
-- Editing a declaration's leading comment through its address. The
-  declaration is the lines the outline reports, which for some languages
-  leave the comment out; a caller that changes both uses `put`.
+- Editing what stands in front of a declaration through its address. The
+  declaration is the lines the outline reports, which begin at the line of
+  the declaration's name: its leading comment is outside them in every
+  language, and so is a decorator, annotation or attribute on a line of
+  its own, or a return type written on the line above the name. A caller
+  that changes those too uses `put`.
 - Formatting, linting, type checking or any check that needs a build. The
   only check is that the file parses.
 - Stable identities for declarations across renames.
@@ -182,14 +185,18 @@ At most 100 declaration operations in one request; one more is
 4. **Syntax is the only check.** It is what the hub can decide from the
    file's bytes alone, as the outline does.
 5. **The leading comment is outside the address** in this PRD, because the
-   outline's ranges leave it out for some languages.
+   outline's ranges leave it out in every language, with whatever else
+   stands on the lines above the declaration's name.
 6. **No new event and no mark on the commit**: consumers of commits should
    not care how the tree was produced.
 7. **Replace, delete and insert** (owner's decision). Without insert,
    adding a function would still mean sending the whole file.
-8. **The syntax verdict comes from agentkit-go, which gains it** (owner's
-   decision). Consequence stated plainly: this cannot be built before
-   that addition exists upstream.
+8. **The syntax verdict comes from agentkit-go** (owner's decision), which
+   has it from v0.11.0: the parse that gives a file's declarations also
+   gives its syntax errors, so a file is never outlined by one parser and
+   checked by another. A grammar can lag its language, and a file that
+   uses newer syntax is then refused although the language accepts it;
+   `put` is the way past the verdict.
 9. **Constraint (from PRD 20): declarations come from agentkit-go's
    `outline`**, so the read, the address and the outline route can never
    disagree about where a declaration is.
@@ -202,34 +209,58 @@ At most 100 declaration operations in one request; one more is
   this extends. Its intent is unchanged; this adds operations.
 - Package 20 `scm_read_api` (active, all tasks done): read conventions.
 - Package 57 `cli_mcp_server` (active, all tasks done): serves the new command as a tool.
-- agentkit-go `outline` (built) and an addition to it that is **not
-  built**: a report of the syntax errors of a file's bytes, for the
-  languages it outlines. Goal 4 and the two parse rules need it; the read
-  route does not.
+- agentkit-go `outline` at v0.11.0 (built): the declarations, and the
+  report of the syntax errors of a file's bytes for the languages it
+  outlines, which goal 4 and the two parse rules need. The repository's
+  `go.mod` requires v0.10.0, which has no such report; it is raised to
+  v0.11.0 with this work.
 
 ## Verified External API
 
-`github.com/agent-fox-dev/agentkit-go` v0.10.0, read in the module cache
-with `go doc`:
+`github.com/agent-fox-dev/agentkit-go` v0.11.0 (tag at commit `e075393`),
+read in its source and exercised with a program that outlines files with
+and without syntax errors, built with and without cgo:
 
-- `outline.Outline(ctx context.Context, abs string, src []byte, opts outline.Options) (outline.File, error)`;
-  `File` has `Path`, `Lang`, `Backend`, `Decls`; `Decl` has `Kind`, `Name`,
-  `Container`, `Signature`, `Exported`, `StartLine` (1-based, inclusive),
-  `EndLine` (1-based, inclusive; 0 when unknown).
-- `outline.BackendNone` marks a file with no backend.
+- `outline.Outline(ctx context.Context, abs string, src []byte, opts outline.Options) (outline.File, error)`.
+  `Options` has `Root`, `MaxFileBytes` (0 means 1 MiB) and
+  `MaxSyntaxErrors` (0 or negative means 20).
+- `File` has `Path`, `Lang`, `Backend`, `Decls` and the verdict of the
+  same parse: `Parsed bool`; `NotParsed`, empty when `Parsed`, otherwise
+  one of `NotParsedUnsupported` (unknown extension, or no backend in this
+  build: every language but Go without cgo), `NotParsedTooLarge`,
+  `NotParsedBinary` (a NUL in the first 8 KiB) and `NotParsedFailed`;
+  `SyntaxErrors []SyntaxError`, in position order, never nil, at most
+  `MaxSyntaxErrors`; `SyntaxErrorsTruncated bool`. Size is decided before
+  binary.
+- `SyntaxError` has `Line` (1-based), `Column` (1-based, in bytes) and
+  `Kind` (`SyntaxErrorUnexpected` or `SyntaxErrorMissing`); it carries no
+  message. Go is reported in every build, the other fourteen languages
+  with cgo. An empty Go file has one error, at 1:1.
+- `Decl` has `Kind`, `Name`, `Container`, `Signature`, `Exported`,
+  `StartLine` (1-based, inclusive), `EndLine` (1-based, inclusive; 0 when
+  unknown). The ranges are computed as in v0.10.0, so they are the ranges
+  the outline route reports today.
+- `outline.BackendNone` marks a file with no backend; `Parsed` is then
+  false.
 
-**NOT FOUND**: any report of syntax errors. `outline` builds its
-declarations from a partial tree when the file has errors (`goast.go`:
-"Even if err != nil (syntax errors), we use the partial AST") and exports
-neither the errors nor the tree. Assumed of the addition: given a path and
-a file's bytes it says whether a backend exists for the language and, if
-so, the position (line and column) of every syntax error, for Go without
-cgo and for the other fourteen languages with it.
+What the two formerly unverified points turned out to be:
 
-**Unverified**: for which languages a declaration's `StartLine` leaves out
-its leading comment; that `EndLine` is never 0 for the fifteen languages.
-A declaration whose `EndLine` is 0 cannot be addressed for a write
-(`422 unsupported_language`).
+- **`StartLine` is the line of the declaration's name in all fifteen
+  languages.** For Go it is the line of `func`, `type`, `const` or `var`
+  (of the name itself inside a parenthesised group), never the doc
+  comment. For the tree-sitter languages it is the line the name is on:
+  observed, a Python decorator, a Java annotation, a Rust attribute and a
+  C return type on the line above the name are all outside the range, as
+  is the leading comment.
+- **`EndLine` is 0 only in a Go file with syntax errors** (observed: a
+  function whose closing brace is missing is reported with `EndLine` 0).
+  In a file without syntax errors it is at least `StartLine` for every
+  language. A write therefore never meets it: the file is refused as
+  `unparseable_file` first. The read has no parse rule and can meet it;
+  what it answers for such a declaration is to be settled in the spec.
+- Several Go names declared in one spec (`var x, y = 1, 2`) are separate
+  declarations with the same lines; an operation addressed to one of them
+  acts on the lines of all.
 
 ## Glossary
 
