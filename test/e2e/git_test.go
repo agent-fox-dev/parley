@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -17,6 +16,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/gitserver"
 	"github.com/agent-fox-dev/parley/internal/hub"
+	"github.com/agent-fox-dev/parley/internal/spawn"
 )
 
 // gitClient runs stock git as a developer's machine would against the hub,
@@ -88,7 +88,7 @@ func newGitClient(t *testing.T, hubURL, credential string) *gitClient {
 // git runs git with args in dir, the test's working directory when dir is
 // "", and returns its output, stdout and stderr together.
 func (g *gitClient) git(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", append([]string{"-c", g.helper}, args...)...)
+	cmd := spawn.Command("git", append([]string{"-c", g.helper}, args...)...)
 	cmd.Dir, cmd.Env = dir, g.env
 	out, err := cmd.CombinedOutput()
 	return string(out), err

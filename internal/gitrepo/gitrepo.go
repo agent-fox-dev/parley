@@ -1,7 +1,8 @@
 // Package gitrepo runs the git command for the hub, as a subprocess and with
 // no git library: against an origin (list its refs, clone it) and on a bare
 // copy on disk (its branches, its configuration and the origin heads kept as
-// the refs refs/remotes/origin/<name>). It imports nothing of the project.
+// the refs refs/remotes/origin/<name>). It imports nothing of the project
+// but internal/spawn, which starts its git processes.
 //
 // Every git process runs with a fixed minimal environment, away from the
 // configuration, credential stores and keys of the account that runs the
@@ -29,6 +30,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/agent-fox-dev/parley/internal/spawn"
 )
 
 // waitDelay is how long a git process whose context ended may take to give
@@ -451,11 +454,11 @@ func (g Git) runOutput(ctx context.Context, a access, stdin []byte, args ...stri
 // directory of the private directory dir, with the minimal environment, Env
 // and a's credential, and that is killed with every process it started when
 // ctx ends.
-func (g Git) command(ctx context.Context, dir string, a access, args []string) *exec.Cmd {
+func (g Git) command(ctx context.Context, dir string, a access, args []string) *spawn.Cmd {
 	if g.Trace != nil {
 		g.Trace(append([]string(nil), args...))
 	}
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := spawn.CommandContext(ctx, "git", args...)
 	cmd.Dir = homePath(dir)
 	cmd.Env = append(append(append([]string{
 		"PATH=" + os.Getenv("PATH"),
@@ -479,7 +482,7 @@ func (g Git) command(ctx context.Context, dir string, a access, args []string) *
 		"GIT_CONFIG_PARAMETERS='maintenance.autoDetach=false' 'gc.autoDetach=false'",
 	}, textEncodingEnv()...), g.Env...), remoteEnv(dir, a)...)
 	cmd.WaitDelay = waitDelay
-	killGroupOnCancel(cmd)
+	killGroupOnCancel(cmd.Cmd)
 	return cmd
 }
 

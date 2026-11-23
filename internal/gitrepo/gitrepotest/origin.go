@@ -27,6 +27,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/agent-fox-dev/parley/internal/spawn"
 )
 
 // repoName is the origin's URL path, without its leading slash, unless
@@ -569,7 +571,7 @@ func Refs(t testing.TB, dir, prefix string) map[string]string {
 // receiver has: the bytes a client sends to push them.
 func Pack(t testing.TB, dir string, revs ...string) string {
 	t.Helper()
-	cmd := exec.Command("git", "pack-objects", "--stdout", "--revs", "--quiet")
+	cmd := spawn.Command("git", "pack-objects", "--stdout", "--revs", "--quiet")
 	cmd.Env = append(os.Environ(), "GIT_DIR="+dir, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull)
 	cmd.Stdin = strings.NewReader(strings.Join(revs, "\n") + "\n")
 	out, err := cmd.Output()
@@ -658,7 +660,7 @@ func Blob(t testing.TB, dir, rev string) []byte {
 
 // run is Run with git's standard output as it is.
 func run(dir, stdin string, args ...string) ([]byte, error) {
-	cmd := exec.Command("git", args...)
+	cmd := spawn.Command("git", args...)
 	cmd.Env = append(os.Environ(),
 		"GIT_DIR="+dir,
 		"GIT_CONFIG_NOSYSTEM=1",

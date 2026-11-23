@@ -7,10 +7,11 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"regexp"
 	"slices"
 	"strings"
+
+	"github.com/agent-fox-dev/parley/internal/spawn"
 )
 
 // RefUpdate is one ref of a ref transaction: Ref, a full ref name, moves
@@ -42,7 +43,7 @@ func (e *RefError) Unwrap() error { return e.Err }
 // every other writer of those refs fails as for a moved ref. It is used
 // from one goroutine.
 type RefTx struct {
-	cmd    *exec.Cmd
+	cmd    *spawn.Cmd
 	stdin  io.WriteCloser
 	out    *bufio.Reader
 	stderr *limitedBuffer

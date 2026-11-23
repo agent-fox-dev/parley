@@ -43,6 +43,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime/runtimetest"
 	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/server"
+	"github.com/agent-fox-dev/parley/internal/spawn"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -4040,7 +4041,7 @@ func workStatus(t *testing.T, dir string) []string {
 // workOutput is workGit's output as git wrote it.
 func workOutput(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command("git", args...)
+	cmd := spawn.Command("git", args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Dana", "GIT_AUTHOR_EMAIL=dana@example.invalid",
 		"GIT_COMMITTER_NAME=Dana", "GIT_COMMITTER_EMAIL=dana@example.invalid")

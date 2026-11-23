@@ -6,7 +6,6 @@ import (
 	"maps"
 	"net/http"
 	"os"
-	"os/exec"
 	"reflect"
 	"slices"
 	"strconv"
@@ -14,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/spawn"
 )
 
 // files are the file changes of a diff answer, by path, and their paths in
@@ -150,7 +150,7 @@ func checkApplies(t *testing.T, repo, commit string, patch []byte) {
 	t.Helper()
 	work := t.TempDir()
 	for _, args := range [][]string{{"clone", "--quiet", "--no-checkout", repo, "."}, {"checkout", "--quiet", "--detach", commit}, {"apply", "--check"}} {
-		cmd := exec.Command("git", args...)
+		cmd := spawn.Command("git", args...)
 		cmd.Dir, cmd.Stdin = work, bytes.NewReader(patch)
 		cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull)
 		if out, err := cmd.CombinedOutput(); err != nil {

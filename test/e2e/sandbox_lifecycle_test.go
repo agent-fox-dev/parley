@@ -20,6 +20,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime/runtimetest"
+	"github.com/agent-fox-dev/parley/internal/spawn"
 )
 
 // lifecycleProfile is the profile agent of the lifecycle scenarios: four
@@ -196,7 +197,7 @@ func hostGitEnv() []string {
 // of h and returns what it printed, trimmed.
 func inSandbox(t *testing.T, h *sandboxCreateHub, id string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command("git", args...)
+	cmd := spawn.Command("git", args...)
 	cmd.Dir = workDirOf(h, id)
 	cmd.Env = hostGitEnv()
 	out, err := cmd.CombinedOutput()

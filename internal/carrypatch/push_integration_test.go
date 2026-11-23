@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -25,6 +24,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
+	"github.com/agent-fox-dev/parley/internal/spawn"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -591,7 +591,7 @@ func (f *pushFixture) push(t *testing.T, credential string, refspecs ...string) 
 		t.Fatal(err)
 	}
 	u.User = url.UserPassword("x", credential)
-	cmd := exec.Command("git", append([]string{"push", u.String()}, refspecs...)...)
+	cmd := spawn.Command("git", append([]string{"push", u.String()}, refspecs...)...)
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir(), "GIT_DIR=" + f.client,
 		"GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0", "LC_ALL=C"}
 	out, err := cmd.CombinedOutput()

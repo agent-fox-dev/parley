@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -22,6 +21,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
+	"github.com/agent-fox-dev/parley/internal/spawn"
 	"github.com/agent-fox-dev/parley/internal/store"
 
 	_ "modernc.org/sqlite"
@@ -58,7 +58,7 @@ func git(t *testing.T, dir string, args ...string) string {
 // error that holds the output; it is git for a goroutine, which cannot fail
 // the test itself.
 func runGit(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	cmd := spawn.Command("git", append([]string{"-C", dir}, args...)...)
 	cmd.Env = append(os.Environ(),
 		"GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1",
 		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@x", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@x")

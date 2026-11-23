@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -32,6 +31,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
+	"github.com/agent-fox-dev/parley/internal/spawn"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -507,7 +507,7 @@ func (w *world) extendHistory(t *testing.T) history {
 // returns what it wrote to its standard output and error.
 func clientGit(t *testing.T, dir string, env []string, args ...string) (string, error) {
 	t.Helper()
-	cmd := exec.Command("git", args...)
+	cmd := spawn.Command("git", args...)
 	cmd.Dir = dir
 	cmd.Env = append([]string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir(), "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0", "LC_ALL=C"}, env...)
 	out, err := cmd.CombinedOutput()

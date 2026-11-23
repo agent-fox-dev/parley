@@ -26,6 +26,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/secret"
+	"github.com/agent-fox-dev/parley/internal/spawn"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -1059,7 +1060,7 @@ func (h *swapHook) count(branch string) int {
 // goroutine, and the output is "" then.
 func gitFrom(t *testing.T, dir, stdin string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command("git", args...)
+	cmd := spawn.Command("git", args...)
 	cmd.Env = append(os.Environ(), "GIT_DIR="+dir, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull,
 		"GIT_AUTHOR_NAME=Writer", "GIT_AUTHOR_EMAIL=writer@example.invalid",
 		"GIT_COMMITTER_NAME=Writer", "GIT_COMMITTER_EMAIL=writer@example.invalid")
