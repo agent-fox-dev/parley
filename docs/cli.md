@@ -865,7 +865,12 @@ first; a fork's slug works too.
 # orient yourself
 parley scm code-search demo 'greeting handler' --limit 10
 parley scm outline demo api/server.go
+parley scm declaration demo api/server.go NewServer
 parley scm cat demo api/server.go --ref main
+
+# replace one function by name, without sending the whole file
+parley scm commit demo--greeting --branch greeting \
+    --message "Greet by name" --replace-declaration api/greeting.go#Greet=./greet.go
 
 # commit a file to a branch and open a change for it, in one call
 parley scm commit demo--greeting --branch greeting --base main \
@@ -887,6 +892,7 @@ parley scm compare demo main greeting --fail-on-conflict
 | `parley scm compare <slug> <base> <head>` | tell whether `head` still rebases onto `base`, with the conflict as data |
 | `parley scm blame <slug> <path>` | show which commit last changed each line |
 | `parley scm outline <slug> <path>` | show a source file's declarations: kinds, names, signatures, lines |
+| `parley scm declaration <slug> <path> <name>` | show the declarations of a file that have a name, with their lines |
 | `parley scm search <slug> <query>` | search the file contents of any revision, exactly |
 | `parley scm code-search <slug> <query>` | search the default branch's code, ranked, from the code index |
 | `parley scm symbols <slug> <name>` | find the declarations on the default branch whose name starts with `<name>` |
@@ -918,6 +924,7 @@ which commit the index holds.
 | `compare` | `--fail-on-conflict` | exit `3` when `head` does not rebase onto `base` cleanly |
 | `blame` | `--ref <rev>`, `--lines <start>:<end>` | the revision; only this line range |
 | `outline` | `--ref <rev>` | the revision |
+| `declaration` | `--container <c>`, `--kind <kind>`, `--ref <rev>` | only this container (such as a method's type) and kind; the revision |
 | `search` | `--ref <rev>`, `--path <glob>` (repeatable) | where to search |
 | `search` | `--regex`, `--ignore-case` | read the query as a regular expression; ignore case |
 | `code-search` | `--limit <n>` | the most results |
@@ -939,13 +946,29 @@ only if the branch is still where it was.
 | `commit` | `--put <repo-path>=<local-file>` | write the local file's content at this path; repeatable |
 | `commit` | `--delete <repo-path>` | delete this path; repeatable |
 | `commit` | `--move <from>=<to>` | rename a path; repeatable |
+| `commit` | `--replace-declaration <repo-path>#<name>=<local-file>` | replace one declaration by the local file's text; repeatable |
+| `commit` | `--delete-declaration <repo-path>#<name>` | delete one declaration; repeatable |
+| `commit` | `--insert-after <repo-path>#<name>=<local-file>`, `--insert-before …` | insert the local file's text after or before one declaration; repeatable |
 | `commit` | `--expected-head <sha>` | commit only if the branch is at this commit |
 | `commit` | `--session <id>` | the agent session the commit belongs to |
 | `commit` | `--change-target <b>`, `--title <t>`, `--intent <i>`, `--draft` | also open a change of the branch, into this target branch, with this title and intent, as a draft when asked |
 | `rebase` | `--onto <rev>` | required: the revision to rebase onto |
 | `rebase` | `--expected-head <sha>` | rebase only if the branch is at this commit |
 
-`--put`, `--delete` and `--move` are applied in the order you give them.
+`--put`, `--delete`, `--move` and the declaration flags are applied in the
+order you give them, each to the files as the ones before left them.
+
+A declaration flag names a declaration as `<repo-path>#<name>`, split at
+the last `#`; a method is `<container>.<name>`, split at the last dot
+(`svc.go#Writer.Close`). The local file must be UTF-8 text, and follows the
+first `=` after the address, so its name may hold one. The flags carry no
+kind: a name that is still ambiguous with its container is sent through
+[the REST route](api.md#post-apiv1workspacesslugscmcommits) with `kind`.
+The hub refuses an address that matches nothing (`declaration_not_found`)
+or several (`ambiguous_declaration`, with the candidates), and a change
+that leaves the file with a syntax error (`syntax_error`, with the
+positions); nothing is committed then. A file that does not parse at all
+is written with `--put`.
 Without `--expected-head`, `commit` reads the branch's head first and
 commits only onto that head. If the branch moved in between, the hub answers
 `ref_moved` with the current head: look at what arrived, then run the
@@ -1802,8 +1825,8 @@ starts. A session may serve at most 150 tools.
 
 `--read-only` means the session sends the hub nothing but reads. It does
 not confine the machine `parley mcp` runs on: tools that take a local path
-(`scm_cat` with `output`, `sandbox_download`, `scm_commit` with `put`, and
-others) read and write files there as the user who started it. Start it as
+(`scm_cat` with `output`, `sandbox_download`, `scm_commit` with `put` or
+a declaration flag, and others) read and write files there as the user who started it. Start it as
 a user, and in a directory, that the agent may read and write.
 
 ### What a call returns

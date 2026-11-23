@@ -711,10 +711,16 @@ one with `503 scm_timeout`, files over `[scm].max_file_size` are refused,
 and large diffs and listings are cut and paged. Two reads do what would
 otherwise need a checkout: **compare** tries the rebase of one revision
 onto another and returns a conflict report if it does not apply, and
-**outline** returns the declarations of one file at any revision.
+**outline** returns the declarations of one file at any revision;
+**declaration** returns the lines of the declarations of one name.
 
 The **write** routes create a commit from a list of file operations,
-create, move and delete refs, and rebase a branch on the server. None of
+create, move and delete refs, and rebase a branch on the server. A
+commit's operations may also address a declaration by name (replace,
+delete, insert beside it): before the tree is built, each becomes a `put`
+of its file's new bytes, placed by the outline of the file as the
+operations before it left it and refused unless the file parses before
+and after, so everything after sees an ordinary commit. None of
 them writes refs itself: each goes through the ref writer (see
 [One place where refs are written](#one-place-where-refs-are-written)), so
 the same push rules decide, a commit to a change's source branch records a

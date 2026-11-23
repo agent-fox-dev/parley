@@ -729,7 +729,7 @@ What to rely on when you write queries and alerts:
 | `parley_http_requests_total` | counter | `method`, `path`, `status` | every HTTP request the hub answered, on every surface. `path` is the route's template (`/api/v1/workspaces/{slug}/sync`), never the request's own path, and `unmatched` when no route matched. Watch the rate of `5xx` and of `429` |
 | `parley_http_request_duration_seconds` | histogram | `method`, `path` | how long answers take, per route |
 | `parley_git_requests_total` | counter | `service` (`info-refs`, `upload-pack`, `receive-pack`), `result` (`ok`, `refused`, `error`) | fetches and pushes over git, and how many are refused or fail |
-| `parley_scm_requests_total` | counter | `op` (`refs`, `commits`, `tree`, `file`, `diff`, `compare`, `blame`, `search`, `outline`, `code_index`, `code_search`, `symbols`, `commit`, `ref_create`, `ref_move`, `ref_delete`, `rebase`), `result` (`ok`, `ref_moved`, `refused`, `error`) | use of the source control API by operation. `ref_moved` counts writes that lost a race for a ref |
+| `parley_scm_requests_total` | counter | `op` (`refs`, `commits`, `tree`, `file`, `diff`, `compare`, `blame`, `search`, `outline`, `declaration`, `code_index`, `code_search`, `symbols`, `commit`, `ref_create`, `ref_move`, `ref_delete`, `rebase`), `result` (`ok`, `ref_moved`, `refused`, `error`) | use of the source control API by operation. `ref_moved` counts writes that lost a race for a ref |
 
 #### Changes, landing and forks
 
@@ -3071,6 +3071,7 @@ fits.
 |---|---|---|---|
 | What files are there? | [`…/scm/tree`](#get-apiv1workspacesslugscmtree) | any revision | no |
 | What does this file declare? | [`…/scm/outline`](#get-apiv1workspacesslugscmoutline) | any revision | no |
+| What are the lines of the declaration `X` in this file? | [`…/scm/declaration`](#get-apiv1workspacesslugscmdeclaration) | any revision | no |
 | Where is the thing called `X` declared? | [`…/scm/symbols`](#get-apiv1workspacesslugscmsymbols) | head of the default branch | yes |
 | Which files are about `X`? | [`…/scm/code-search`](#get-apiv1workspacesslugscmcode-search) | head of the default branch | yes |
 | Which lines hold exactly this text? | [`…/scm/search`](#get-apiv1workspacesslugscmsearch) | any revision | no |
@@ -3224,6 +3225,7 @@ checks, the error envelope, lists, idempotency) are in
 | [`GET …/scm/blame`](#get-apiv1workspacesslugscmblame) | `git:read` | answers who last changed each line of a file |
 | [`GET …/scm/search`](#get-apiv1workspacesslugscmsearch) | `git:read` | exact search of file contents at any revision |
 | [`GET …/scm/outline`](#get-apiv1workspacesslugscmoutline) | `git:read` | answers the declarations of one source file |
+| [`GET …/scm/declaration`](#get-apiv1workspacesslugscmdeclaration) | `git:read` | answers the declarations of one file that have a name, with their lines |
 | [`GET …/scm/code-index`](#get-apiv1workspacesslugscmcode-index) | `git:read` | answers the state of the code index |
 | [`GET …/scm/code-search`](#get-apiv1workspacesslugscmcode-search) | `git:read` | ranked search of the default branch |
 | [`GET …/scm/symbols`](#get-apiv1workspacesslugscmsymbols) | `git:read` | finds declarations of the default branch by name |
@@ -3741,6 +3743,45 @@ without cgo outlines Go alone and answers the others with `supported`
 {"path":"router.go","resolved_sha":"3d0c5a1f0b6e2d5c8a7f4e9b1c2d3e4f5a6b7c8d","language":"Go","supported":true,"declarations":[{"kind":"type","name":"Router","container":"","signature":"type Router struct","exported":true,"start_line":6,"end_line":8},{"kind":"method","name":"Handle","container":"Router","signature":"func (r *Router) Handle(pattern string)","exported":true,"start_line":10,"end_line":12}]}
 ```
 
+### `GET /api/v1/workspaces/{slug}/scm/declaration`
+
+Answers the declarations of one source file that have a name, each with
+its lines, so that an agent reads one function instead of the file. It
+reads one file and needs no index, so it works at any revision, a fork's
+own branches included.
+
+| Parameter | Meaning |
+|---|---|
+| `path` | required: the file |
+| `name` | required: the declaration's name, 1 to 200 characters, compared exactly and with case |
+| `container` | only the declarations of this container, such as a method's type, compared exactly; empty is no filter |
+| `kind` | only the declarations of this kind, one of the outline's kinds |
+| `ref` | the revision; default the default branch (for a fork, its base branch) |
+
+The answer has `path`, `resolved_sha`, `blob_sha` (the file's blob id),
+`language` and `declarations`: every declaration that matches, in line
+order, each with the [outline's](#get-apiv1workspacesslugscmoutline)
+members and `content`, the file's lines `start_line` to `end_line` with
+their line endings as stored. A declaration's lines begin at the line of
+its name: a leading comment, and a decorator, annotation or attribute on a
+line of its own, are outside them. A file with syntax errors is answered as
+far as it parses; a declaration whose last line is not known there has
+`end_line` `0` and `content` `null`.
+
+```json
+{"path":"svc.go","resolved_sha":"3d0c5a1f0b6e2d5c8a7f4e9b1c2d3e4f5a6b7c8d","blob_sha":"9b1c2d3e4f5a6b7c8d3d0c5a1f0b6e2d5c8a7f4e","language":"Go","declarations":[{"kind":"func","name":"Greet","container":"","signature":"func Greet() string","exported":true,"start_line":4,"end_line":6,"content":"func Greet() string {\n\treturn \"hi\"\n}\n"}]}
+```
+
+| Error | When |
+|---|---|
+| `400` `invalid_request` | no `path` or `name`, a `name` over 200 characters, a `kind` the outline does not have, or a `path` naming a directory or a submodule |
+| `404` `path_not_found` | the file does not exist at the revision |
+| `404` `declaration_not_found` | no declaration of the file matches |
+| `413` `payload_too_large` | the file is over 1 MiB; `error.size` is its size |
+| `422` `unsupported_language` | the file is in no language this hub can outline, or is a symbolic link; `error.details.language` is its language, `""` when unknown |
+| `422` `binary_file` | the file is binary |
+| `503` `scm_timeout` | the parse did not finish in time, or the hub was busy parsing other files: retry |
+
 ### `GET /api/v1/workspaces/{slug}/scm/code-index`
 
 Answers which commit the [code index](#the-code-index) of a workspace
@@ -3844,7 +3885,7 @@ it, or creates the branch there. See
 | `base_ref` | a revision naming the commit a new branch starts at; required when the branch does not exist, ignored when it does |
 | `message` | required, not empty |
 | `author` | `{"name", "email"}`; default the caller (for the admin token, the hub) |
-| `operations` | the file operations, at most 1,000, applied in order, each to the tree the one before left |
+| `operations` | the operations, at most 1,000, of which at most 100 declaration operations, applied in order, each to the tree the one before left |
 | `allow_empty` | `true` to make a commit that changes nothing; default `false` |
 | `change` | `{"target_branch", "title", "intent", "draft"}`: open a change with `branch` as its source |
 | `session_id` | the agent session the commit belongs to |
@@ -3855,6 +3896,25 @@ it, or creates the branch there. See
 | `delete` | `path` | removes the file; a directory left empty goes with it |
 | `move` | `from`, `to` | renames the file, keeping content and mode |
 | `chmod` | `path`, `mode` (`100644` or `100755`) | changes the mode alone |
+| `replace_declaration` | `path`, `name`, optional `container` and `kind`, `content` (UTF-8 text) | replaces the declaration's lines by `content` |
+| `delete_declaration` | `path`, `name`, optional `container` and `kind` | removes the declaration's lines |
+| `insert_declaration` | `path`, `content`, exactly one of `after` and `before`, each `{"name", "container", "kind"}` | inserts `content` on the line after the declaration's last line, or before its first, adding no blank line |
+
+**Declaration operations** change a file by the address of one of its
+declarations instead of sending the whole file, and are then a `put` of
+the result in every respect: the push rules, the events and the answer
+are those of a `put`, and nothing in them says how the file was changed.
+An address is `name`, with `container` and `kind` to tell apart what
+shares a name, compared as the
+[declaration read](#get-apiv1workspacesslugscmdeclaration) compares them;
+it must match exactly one declaration of the file as the operations before
+it left it, a `put` or a `move` among them. A declaration's lines are those
+the outline reports, so its leading comment is outside them; to change it
+too, use `put`. A `content` that does not end in a line ending gets the
+file's own, that of its first line (LF for a file with none). The file
+keeps its mode. The file must parse before the operation and after it;
+only syntax is checked, so a grammar older than the file's language can
+refuse a file the language accepts, and `put` is the way past it.
 
 Paths are relative to the root, and no segment may be `.git` or anything
 macOS or Windows would read as `.git`. The committer is always the hub
@@ -3902,14 +3962,25 @@ more), so a subscriber sees what was touched without reading the diff.
 | `201 Created` | the commit was made and the branch moved |
 | `200 OK` | a replay of an `Idempotency-Key`: the first answer |
 | `400` `invalid_request` | a missing or malformed member or operation; a branch that does not exist and no `base_ref`; a `change` object on a protected branch |
-| `400` `invalid_operation` | an operation does not apply to the tree, such as a `delete` of a missing path, a `move` onto an existing file, a `put` onto a directory or anything on a submodule; `error.details.index` is the zero-based index of the operation |
+| `400` `invalid_operation` | an operation does not apply to the tree, such as a `delete` of a missing path, a `move` onto an existing file, a `put` onto a directory, anything on a submodule, or a declaration operation on a path that is no file; `error.details.index` is the zero-based index of the operation |
 | `400` `empty_commit` | the operations change nothing and `allow_empty` is not `true` |
 | `400` `unknown_session` | the `session_id` is not accepted |
 | `403` | a push rule refuses the update |
 | `404` `ref_not_found` | `base_ref` names no commit |
 | `409` `ref_moved` | the branch exists and `expected_head_sha` is missing or stale |
 | `409` `ref_exists` | a new branch's name clashes with an existing one, one being a directory of the other (`feat` and `feat/x`) |
-| `413` `payload_too_large` | the body is over `[scm].max_commit_size` |
+| `413` `payload_too_large` | the body is over `[scm].max_commit_size`; or a declaration operation's file is over 1 MiB before or after it, `error.size` its size |
+| `404` `declaration_not_found` | a declaration operation's address matches no declaration |
+| `409` `ambiguous_declaration` | it matches several; `error.details.candidates` lists at most 20, each `{"kind", "name", "container", "signature", "start_line", "end_line"}`, in line order |
+| `422` `unsupported_language` | a declaration operation's file is in no language this hub can outline, or is a symbolic link; `error.details.language` is its language |
+| `422` `binary_file` | a declaration operation's file is binary |
+| `422` `unparseable_file` | a declaration operation's file has a syntax error before it; `error.details.line` is the first error's line |
+| `422` `syntax_error` | the file would have a syntax error after it; `error.details.errors` lists at most 20 positions, each `{"line", "column"}`, in the resulting file |
+| `503` `scm_timeout` | the declaration operations' parses did not finish within `[scm].read_timeout`, or the hub was busy parsing other files: retry |
+
+Every refusal of a declaration operation names it in `error.details`:
+`index`, its zero-based index, and `path`. Nothing is committed and no
+ref moves.
 
 ### `POST /api/v1/workspaces/{slug}/scm/refs`
 
