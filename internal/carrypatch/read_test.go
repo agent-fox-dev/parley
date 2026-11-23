@@ -78,8 +78,16 @@ func (h *readHub) put(t *testing.T, patches ...carrypatch.Patch) {
 	}
 }
 
-// at is 2026-11-16 at hh:mm UTC.
-func at(hh, mm int) time.Time { return time.Date(2026, 11, 16, hh, mm, 0, 0, time.UTC) }
+// fixtureDay is the start of yesterday, UTC: a fixture's time on it is in
+// the past of every hub's clock and within carrypatch.PurgeAge of it, so
+// the purge of the maintenance pass that runs at a hub's start never takes
+// a deleted patch a test stored.
+var fixtureDay = time.Now().UTC().Truncate(24 * time.Hour).Add(-24 * time.Hour)
+
+// at is hh:mm UTC on fixtureDay.
+func at(hh, mm int) time.Time {
+	return fixtureDay.Add(time.Duration(hh)*time.Hour + time.Duration(mm)*time.Minute)
+}
 
 // livePatch is the patch of branch at position pos of the workspace slug.
 func livePatch(slug, branch string, pos int) carrypatch.Patch {
