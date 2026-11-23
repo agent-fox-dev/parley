@@ -439,33 +439,59 @@ type stagedSource struct {
 // parses taking their places among those the hub runs at once; a request
 // whose work outlasts it is 503 scm_timeout. Nothing has been written to a
 // ref when any of these is answered.
-func (c *Component) resolveDeclarations(ctx context.Context, git *gitrepo.Repo, parent string, planned []plannedOperation) ([]gitrepo.Operation, error) {
+func (c *Component) resolveDeclarations(ctx context.Context, git *gitrepo.Repo, parent string, planned []plannedOperation) ([]gitrepo.Operation, []int, error) {
 	if !slices.ContainsFunc(planned, func(p plannedOperation) bool { return p.decl != nil }) {
-		ops := make([]gitrepo.Operation, len(planned))
+		ops, index := make([]gitrepo.Operation, len(planned)), make([]int, len(planned))
 		for i, p := range planned {
-			ops[i] = p.op
+			ops[i], index[i] = p.op, i
 		}
-		return ops, nil
+		return ops, index, nil
 	}
 	ctx, cancel := context.WithTimeoutCause(ctx, c.deps.ReadTimeout, errReadTimeout)
 	defer cancel()
-	ops, err := c.applyDeclarations(ctx, git, parent, planned)
-	if err != nil && context.Cause(ctx) == errReadTimeout {
-		return nil, server.NewError("scm_timeout", http.StatusServiceUnavailable,
+	ops, index, err := c.applyDeclarations(ctx, git, parent, planned)
+	var apiErr *server.Error
+	if err != nil && !errors.As(err, &apiErr) && context.Cause(ctx) == errReadTimeout {
+		return nil, nil, server.NewError("scm_timeout", http.StatusServiceUnavailable,
 			fmt.Sprintf("the declaration operations did not finish within the read timeout of %s", c.deps.ReadTimeout))
 	}
-	return ops, err
+	return ops, index, err
 }
 
-// applyDeclarations is resolveDeclarations within its deadline.
-func (c *Component) applyDeclarations(ctx context.Context, git *gitrepo.Repo, parent string, planned []plannedOperation) ([]gitrepo.Operation, error) {
-	ops := make([]gitrepo.Operation, 0, len(planned))
+// applyDeclarations is resolveDeclarations within its deadline. It also
+// returns, for each operation it returns, the index of the request's
+// operation that it stands for.
+//
+// The put of a declaration operation takes the place of the put of an
+// earlier one on the same file when no operation between them touches the
+// file, so that a request of many operations on one file holds one result
+// of it rather than one per operation.
+//
+// A declaration operation reads the files as the file operations before it
+// would leave them if they apply; when it is refused, those operations are
+// applied first, and one that does not apply is the answer instead, so the
+// request is refused for its first operation that fails, as without
+// declaration operations.
+func (c *Component) applyDeclarations(ctx context.Context, git *gitrepo.Repo, parent string, planned []plannedOperation) ([]gitrepo.Operation, []int, error) {
+	ops, index := make([]gitrepo.Operation, 0, len(planned)), make([]int, 0, len(planned))
 	staged := map[string]*stagedSource{}
+	// lastPut is the position in ops of the put of the last declaration
+	// operation on a file, while no operation after it touched the file.
+	lastPut := map[string]int{}
 	current := func(path string) *stagedSource {
 		if f, ok := staged[path]; ok {
 			return f
 		}
 		return &stagedSource{from: path}
+	}
+	refuse := func(err error) error {
+		if _, applyErr := git.ApplyOperations(ctx, parent, ops); applyErr != nil {
+			var opErr *gitrepo.OperationError
+			if errors.As(applyErr, &opErr) {
+				return operationRefusal(opErr, index)
+			}
+		}
+		return err
 	}
 	for i, p := range planned {
 		if p.decl == nil {
@@ -485,30 +511,43 @@ func (c *Component) applyDeclarations(ctx context.Context, git *gitrepo.Repo, pa
 				staged[op.Path] = &f
 			case gitrepo.OpMove:
 				f := *current(op.From)
-				staged[op.To] = &f
 				staged[op.From] = &stagedSource{gone: true}
+				staged[op.To] = &f
 			}
-			ops = append(ops, op)
+			for _, path := range []string{op.Path, op.From, op.To} {
+				delete(lastPut, path)
+			}
+			ops, index = append(ops, op), append(index, i)
 			continue
 		}
 		d := p.decl
 		f := current(d.path)
 		if err := c.load(ctx, git, parent, f); err != nil {
 			if errors.Is(err, errNoFile) {
-				return nil, server.NewError("invalid_operation", http.StatusBadRequest,
+				return nil, nil, refuse(server.NewError("invalid_operation", http.StatusBadRequest,
 					fmt.Sprintf("operation %d: %s is no file to change by its declarations", i, d.path)).
-					WithDetails(map[string]any{"index": i})
+					WithDetails(map[string]any{"index": i}))
 			}
-			return nil, err
+			return nil, nil, err
 		}
 		content, err := c.applyDeclaration(ctx, i, d, f)
 		if err != nil {
-			return nil, err
+			var apiErr *server.Error
+			if errors.As(err, &apiErr) {
+				return nil, nil, refuse(err)
+			}
+			return nil, nil, err
 		}
 		staged[d.path] = &stagedSource{loaded: true, content: content, mode: f.mode}
-		ops = append(ops, gitrepo.Operation{Op: gitrepo.OpPut, Path: d.path, Content: content, Mode: f.mode})
+		put := gitrepo.Operation{Op: gitrepo.OpPut, Path: d.path, Content: content, Mode: f.mode}
+		if k, ok := lastPut[d.path]; ok {
+			ops[k], index[k] = put, i
+			continue
+		}
+		lastPut[d.path] = len(ops)
+		ops, index = append(ops, put), append(index, i)
 	}
-	return ops, nil
+	return ops, index, nil
 }
 
 // errNoFile is load's report of a path that is no file.
@@ -618,4 +657,16 @@ func (c *Component) checkResult(ctx context.Context, index int, path, mode strin
 	return server.NewError("syntax_error", http.StatusUnprocessableEntity,
 		fmt.Sprintf("operation %d: %s would have a syntax error at line %d, column %d", index, path, first.Line, first.Column)).
 		WithDetails(where)
+}
+
+// operationRefusal is the 400 invalid_operation of opErr, an operation the
+// tree builder could not apply, named by the index of the request's
+// operation it stands for (index maps the one to the other).
+func operationRefusal(opErr *gitrepo.OperationError, index []int) *server.Error {
+	i := index[opErr.Index]
+	message := fmt.Sprintf("operation %d: %v", i, opErr.Err)
+	if opErr.Path != "" {
+		message = fmt.Sprintf("operation %d: %s: %v", i, opErr.Path, opErr.Err)
+	}
+	return server.NewError("invalid_operation", http.StatusBadRequest, message).WithDetails(map[string]any{"index": i})
 }

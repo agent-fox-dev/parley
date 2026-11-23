@@ -204,9 +204,9 @@ func TestDeclaration_ReadsTheCommitItsRefNames(t *testing.T) {
 			}
 		})
 	}
-	if _, a := declarationOf(t, w.world, "outline", "path=router.go&name=Second&ref=v1"); len(a.Declarations) == 1 &&
-		(a.Declarations[0].Content == nil || *a.Declarations[0].Content != "func Second() {}\n") {
-		t.Errorf("Second at v1: content %v, want that commit's line", a.Declarations[0].Content)
+	if _, a := declarationOf(t, w.world, "outline", "path=router.go&name=Second&ref=v1"); len(a.Declarations) != 1 ||
+		a.Declarations[0].Content == nil || *a.Declarations[0].Content != "func Second() {}\n" {
+		t.Errorf("Second at v1: %+v, want one declaration whose content is that commit's line", a.Declarations)
 	}
 
 	t.Run("on a fork", func(t *testing.T) {
@@ -219,11 +219,11 @@ func TestDeclaration_ReadsTheCommitItsRefNames(t *testing.T) {
 		gitrepotest.Git(t, forkRepo, "update-ref", "refs/heads/work", own)
 
 		r, a := declarationOf(t, w, "demo--t1", "path=a.go&name=Parent")
-		if r.status != http.StatusOK || a.ResolvedSHA != base || len(a.Declarations) != 1 || *a.Declarations[0].Content != "func Parent() {}\n" {
+		if r.status != http.StatusOK || a.ResolvedSHA != base || len(a.Declarations) != 1 || a.Declarations[0].Content == nil || *a.Declarations[0].Content != "func Parent() {}\n" {
 			t.Errorf("without a ref: %d %s, want the file of the fork's base branch at %s", r.status, r.body, base)
 		}
 		r, a = declarationOf(t, w, "demo--t1", "path=a.go&name=Parent&ref=work")
-		if r.status != http.StatusOK || a.ResolvedSHA != own || len(a.Declarations) != 1 || *a.Declarations[0].Content != "func Parent() { own() }\n" {
+		if r.status != http.StatusOK || a.ResolvedSHA != own || len(a.Declarations) != 1 || a.Declarations[0].Content == nil || *a.Declarations[0].Content != "func Parent() { own() }\n" {
 			t.Errorf("ref=work: %d %s, want the file of the fork's own branch at %s", r.status, r.body, own)
 		}
 	})

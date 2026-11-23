@@ -180,7 +180,7 @@ func (c *Component) createCommit(w http.ResponseWriter, r *http.Request, wr *wri
 	if err != nil {
 		return err
 	}
-	ops, err := c.resolveDeclarations(ctx, t.git, parent, planned)
+	ops, index, err := c.resolveDeclarations(ctx, t.git, parent, planned)
 	if err != nil {
 		return err
 	}
@@ -188,8 +188,7 @@ func (c *Component) createCommit(w http.ResponseWriter, r *http.Request, wr *wri
 	if err != nil {
 		var opErr *gitrepo.OperationError
 		if errors.As(err, &opErr) {
-			return server.NewError("invalid_operation", http.StatusBadRequest, opErr.Error()).
-				WithDetails(map[string]any{"index": opErr.Index})
+			return operationRefusal(opErr, index)
 		}
 		return err
 	}

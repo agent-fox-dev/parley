@@ -40,3 +40,18 @@ func ReplaceLines(src string, start, end int, content string) (string, bool) {
 	}
 	return string(spliceLines([]byte(src), from, to, []byte(content))), true
 }
+
+// InsertLines is src with content inserted after its line line, 1-based,
+// or before it, as an insert_declaration inserts it; ok is false when line
+// is not a line of src.
+func InsertLines(src string, line int, after bool, content string) (string, bool) {
+	from, to, ok := lineSpan([]byte(src), line, line)
+	if !ok {
+		return "", false
+	}
+	at := from
+	if after {
+		at = to
+	}
+	return string(spliceLines([]byte(src), at, at, []byte(content))), true
+}

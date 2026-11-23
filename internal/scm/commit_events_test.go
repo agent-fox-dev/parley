@@ -415,6 +415,13 @@ func TestCommitConsequences(t *testing.T) {
 				t.Fatalf("the %s's events %q, want [%s %s]", name, types, pushrule.EventPush, eventSCMCommit)
 			}
 		}
+		var pa, pb pushEvent
+		metadata(t, recsA[0], &pa)
+		metadata(t, recsB[0], &pb)
+		if pa.Before == nil || pb.Before == nil || *pa.Before != *pb.Before || pa.After == nil || *pa.After != a || pb.After == nil || *pb.After != b ||
+			pa.Created != pb.Created || pa.Forced != pb.Forced || pa.Direct != pb.Direct || pa.Via != pb.Via {
+			t.Errorf("push metadata %+v and %+v, want the same apart from the ref and the commit", pa, pb)
+		}
 		var ca, cb scmCommitEvent
 		metadata(t, recsA[1], &ca)
 		metadata(t, recsB[1], &cb)

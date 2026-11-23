@@ -3978,8 +3978,12 @@ more), so a subscriber sees what was touched without reading the diff.
 | `422` `syntax_error` | the file would have a syntax error after it; `error.details.errors` lists at most 20 positions, each `{"line", "column"}`, in the resulting file |
 | `503` `scm_timeout` | the declaration operations' parses did not finish within `[scm].read_timeout`, or the hub was busy parsing other files: retry |
 
-Every refusal of a declaration operation names it in `error.details`:
-`index`, its zero-based index, and `path`. Nothing is committed and no
+A refusal of a declaration operation names it: a malformed one in the
+message (`operation 2: …`), one on a path that is no file by
+`error.details.index`, and every refusal from `declaration_not_found` to
+`syntax_error` by `error.details.index` and `error.details.path`. A file
+operation earlier in the request that does not apply is the answer
+before any declaration operation after it. Nothing is committed and no
 ref moves.
 
 ### `POST /api/v1/workspaces/{slug}/scm/refs`

@@ -458,6 +458,29 @@ func equalJSON(a, b any) bool {
 	return true
 }
 
+func TestInsertLines_PutsTheContentOnLinesOfItsOwn(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, src string
+		line      int
+		after     bool
+		content   string
+		want      string
+	}{
+		{"after a line", "a\nb\n", 1, true, "x", "a\nx\nb\n"},
+		{"before a line", "a\nb\n", 2, false, "x\n", "a\nx\nb\n"},
+		{"after the last line, without a line ending", "a\nb", 2, true, "x", "a\nb\nx\n"},
+		{"after the last line of a CRLF file without a line ending", "a\r\nb", 2, true, "x", "a\r\nb\r\nx\r\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := scm.InsertLines(tc.src, tc.line, tc.after, tc.content)
+			if !ok || got != tc.want {
+				t.Errorf("InsertLines(%q, %d, %v, %q) = %q, %v; want %q", tc.src, tc.line, tc.after, tc.content, got, ok, tc.want)
+			}
+		})
+	}
+}
+
 func TestReplaceLines_EndsTheContentWithTheFilesOwnLineEnding(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {

@@ -282,6 +282,7 @@ func TestDeclarationCommit_EndsWhenItsParsesOutlastTheReadTimeout(t *testing.T) 
 		_ = json.Unmarshal(r.body, &r.json)
 		return r, nil
 	}
+	seq := w.lastSeq(t)
 	commitTimesOut := func(name string) {
 		t.Helper()
 		start := time.Now()
@@ -297,6 +298,9 @@ func TestDeclarationCommit_EndsWhenItsParsesOutlastTheReadTimeout(t *testing.T) 
 		}
 		if got := strings.TrimSpace(gitrepotest.Git(t, dir, "rev-parse", "main")); got != head {
 			t.Fatalf("%s: main moved to %s", name, got)
+		}
+		if types, _ := w.eventsAfter(t, seq); len(types) != 0 {
+			t.Errorf("%s: events %q, want none", name, types)
 		}
 	}
 	commitTimesOut("a parse that stalls")

@@ -961,7 +961,8 @@ order you give them, each to the files as the ones before left them.
 A declaration flag names a declaration as `<repo-path>#<name>`, split at
 the last `#`; a method is `<container>.<name>`, split at the last dot
 (`svc.go#Writer.Close`). The local file must be UTF-8 text, and follows the
-first `=` after the address, so its name may hold one. The flags carry no
+first `=` after the last `#` of the value, so its name may hold `=` but not
+`#`. The flags carry no
 kind: a name that is still ambiguous with its container is sent through
 [the REST route](api.md#post-apiv1workspacesslugscmcommits) with `kind`.
 The hub refuses an address that matches nothing (`declaration_not_found`)

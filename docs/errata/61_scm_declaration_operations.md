@@ -31,12 +31,33 @@ declaration operation into a `put` ahead of the tree builder, and the
 parent check of package 21 runs before it. They were recorded with
 `no_red`.
 
+## A missing path is `invalid_request`, as REQ-2.7 says
+
+The PRD's text says a declaration operation without `path` is "the
+existing `400 invalid_operation`"; the criterion that owns malformed
+declaration operations, and the check of a `put` without a path, answer
+`400 invalid_request`. The code follows the criterion
+(`fileOperation.plan` in `internal/scm/declaration.go`).
+
 ## Smaller choices
 
 - A declaration operation's content is inserted after a last line that
   has no line ending on a line of its own: the file's line ending is put
   between them, so that the two lines are not joined.
-- A declaration operation's own index is checked before the
-  operations before it are applied by the tree builder; a request whose
-  earlier file operation does not apply and whose later declaration
-  operation is refused answers the declaration operation's refusal.
+- A declaration operation reads its file as the file operations before it
+  would leave it if they apply. When it is refused, those operations are
+  applied first, and one that does not apply is the answer
+  (`invalid_operation` with its index), so a request is refused for its
+  first operation that fails.
+- The put of a declaration operation replaces the put of an earlier one on
+  the same file when nothing between them touches the file, so a request
+  of many operations on one file holds one result of it.
+- A refusal of a declaration operation is answered as it is even when the
+  read timeout ends meanwhile; only an error the deadline caused is
+  `503 scm_timeout`.
+- The `parley scm commit` declaration flags take the local file after the
+  first `=` that follows the last `#` of the value, as the package's task
+  says; a local file whose name holds `#` cannot be named.
+- The check of the commit timeout uses a read timeout of 300 ms and an
+  answer within 3 s, not 100 ms and 1 s, so that the git reads before the
+  parse fit on a loaded machine.

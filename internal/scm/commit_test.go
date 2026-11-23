@@ -401,6 +401,26 @@ func TestCommit(t *testing.T) {
 		if got := w.head(t, "gone"); got != head {
 			t.Errorf("gone moved to %s", got)
 		}
+
+		// An earlier file operation that does not apply is the answer, not
+		// the declaration operation after it.
+		for _, tc := range []struct {
+			name string
+			ops  []any
+		}{
+			{"a chmod of a missing path", []any{map[string]any{"op": "chmod", "path": "nope.go", "mode": "100755"},
+				map[string]any{"op": "replace_declaration", "path": "nope.go", "name": "F", "content": "x\n"}}},
+			{"a move onto an existing file", []any{map[string]any{"op": "move", "from": "api/old.go", "to": "README.md"},
+				map[string]any{"op": "replace_declaration", "path": "README.md", "name": "F", "content": "x\n"}}},
+			{"a move onto itself", []any{map[string]any{"op": "move", "from": "api/old.go", "to": "api/old.go"},
+				map[string]any{"op": "replace_declaration", "path": "api/old.go", "name": "F", "content": "x\n"}}},
+		} {
+			r := w.sendJSON(t, http.MethodPost, w.path, w.ownerKey, map[string]any{"branch": "gone", "expected_head_sha": head, "message": "m",
+				"operations": tc.ops})
+			if index, ok := errorDetails(r)["index"].(float64); r.status != http.StatusBadRequest || r.errorType() != "invalid_operation" || !ok || index != 0 {
+				t.Errorf("%s: %d %s, want 400 invalid_operation with details.index 0", tc.name, r.status, r.body)
+			}
+		}
 	})
 
 	t.Run("refuses a commit that changes nothing", func(t *testing.T) {
