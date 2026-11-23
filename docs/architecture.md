@@ -1812,6 +1812,9 @@ the command that started it instead of detaching into the background
 ([ADR 10](adr/10-keep-git-housekeeping-inside-the-command-that-starts-it.md)).
 No git process outlives the call that started it, so a stop leaves no
 orphan writing to a repository, and the container needs no init process.
+On macOS the hub starts git with `posix_spawn` instead of forking itself,
+which would cost it a page fault on every page it writes while git starts
+([ADR 12](adr/12-start-git-without-forking-the-hub-on-macos.md)).
 
 ### Across a restart
 
@@ -2076,6 +2079,7 @@ All packages are under `internal/` except the two programs.
 | `workspace` | Workspace records, settings, clone, sync, archive and delete |
 | `fork` | Task forks: creation, tokens, expiry |
 | `gitrepo` | Running the git command on the hub's bare repositories (`gitrepo/gitrepotest`: test repositories) |
+| `spawn` | Starting a process as `os/exec` does, without forking the hub on macOS |
 | `gitserver` | Git over HTTP for stock git clients (`gitserver/pushrule`: the rules every ref write passes) |
 | `scm` | The source control API: refs, trees, files, commits, outline, search |
 | `codeindex` | The tree and search index of each default branch's head |

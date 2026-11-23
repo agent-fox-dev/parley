@@ -4,7 +4,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/spawn"
 )
 
 // The diffs share one world: main gains b.txt and a longer a.txt (main1);
@@ -331,7 +331,7 @@ func applies(t *testing.T, dir, commit string, patch []byte) {
 		t.Fatal(err)
 	}
 	for _, args := range [][]string{{"read-tree", commit}, {"apply", "--check", "--cached", file}} {
-		cmd := exec.Command("git", args...)
+		cmd := spawn.Command("git", args...)
 		cmd.Env = append(os.Environ(), "GIT_DIR="+dir, "GIT_INDEX_FILE="+filepath.Join(tmp, "index"),
 			"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull)
 		if out, err := cmd.CombinedOutput(); err != nil {
