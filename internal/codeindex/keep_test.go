@@ -2,6 +2,7 @@ package codeindex_test
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"path/filepath"
 	"slices"
@@ -28,6 +29,55 @@ func TestKeep_HasTheIndexAfterARestartWithoutBuildingIt(t *testing.T) {
 		if n != 0 {
 			t.Errorf("parley_code_index_builds_total{outcome=%q} = %v after the restart, want 0", outcome, n)
 		}
+	}
+}
+
+func TestKeep_BuildsAPartialIndexAgainAsABuildAfterARestart(t *testing.T) {
+	t.Parallel()
+	s := newSeam()
+	w := newWorld(t, "[code_index]\nmax_files = 2\n[scm]\nread_timeout = \"1s\"\n", s.adjust)
+	files := map[string]string{}
+	for i := range 5 {
+		files[fmt.Sprintf("f%d.go", i)] = "package f\n\n// needle\n"
+	}
+	head := w.addWorkspace(t, "demo", files)
+	w.indexed(t, "demo")
+
+	// Every build of demo is held from here on: the index its build made
+	// answers without one.
+	release := s.hold(demoPart)
+	t.Cleanup(release)
+	if got, _ := w.search(t, "demo", "needle"); !got.Partial || str(got.IndexedSHA) != head {
+		t.Errorf("the search after the build answers %+v, want the partial index of %s", got, head)
+	}
+
+	// A partial index is not stored whole: the start queues its build, a
+	// job like any other, which a search waits for.
+	w.Restart(t)
+	s.waitBegan(t, demoPart)
+	if jobs := w.jobs(t, "demo"); !slices.Equal(jobs, []string{"running"}) {
+		t.Errorf("after the restart the code_index jobs of demo are %q, want the one build running", jobs)
+	}
+	if st := w.statusOf(t, "demo"); st.State != "building" {
+		t.Errorf("after the restart the state of demo is %s, want building", st.State)
+	}
+	a := w.ask(t, "demo", "code-search", "q=needle", w.key)
+	if r := a.refusal(); a.code != http.StatusServiceUnavailable || r.Error.ErrorType != "code_index_not_ready" ||
+		r.Error.State != "building" || a.header.Get("Retry-After") != "5" || str(r.Error.HeadSHA) != head {
+		t.Errorf("a search during the build = %d %s (Retry-After %q), want 503 code_index_not_ready, state building, Retry-After 5",
+			a.code, a.body, a.header.Get("Retry-After"))
+	}
+
+	release()
+	w.reaches(t, "demo", head)
+	if got, _ := w.search(t, "demo", "needle"); !got.Partial || str(got.IndexedSHA) != head {
+		t.Errorf("the search after the build answers %+v, want the partial index of %s", got, head)
+	}
+	if st := w.statusOf(t, "demo"); st.State != "ready" || !st.Partial {
+		t.Errorf("after the build the status of demo = %+v, want ready and partial", st)
+	}
+	if b := w.builds(t); b["partial"] != 1 || b["ok"] != 0 || b["failed"] != 0 {
+		t.Errorf("builds by outcome after the restart = %v, want the one partial build", b)
 	}
 }
 

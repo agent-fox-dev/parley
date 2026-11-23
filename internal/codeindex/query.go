@@ -169,7 +169,7 @@ func (c *Component) await(w http.ResponseWriter, r *http.Request, ws Workspace, 
 		if err != nil {
 			return Record{}, err
 		}
-		if rec.IndexedSHA != "" && c.onDisk(ws.Slug, rec.IndexedSHA) {
+		if rec.IndexedSHA != "" && c.onDisk(ws.Slug, rec.IndexedSHA) && c.usable(ws.Slug, rec) {
 			ok, err := c.notOlder(ctx, ws, rec.IndexedSHA, arrival, head)
 			if err != nil {
 				return Record{}, err
@@ -198,8 +198,8 @@ func (c *Component) await(w http.ResponseWriter, r *http.Request, ws Workspace, 
 			return Record{}, c.notReady(w, StateFailed, retry, head, rec)
 		default:
 			// No build is on its way: the notice of this head was lost, the
-			// index's files are gone, or the failed build is of an older
-			// head.
+			// index's files are gone, a partial index was not built since
+			// the hub started, or the failed build is of an older head.
 			if err := c.Queue(ctx, ws.Slug); err != nil {
 				return Record{}, err
 			}
