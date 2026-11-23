@@ -70,6 +70,31 @@ func TestSCMCommit_SendsTheOperationsInCommandLineOrder(t *testing.T) {
 		`{"op":"put","path":"bin.dat","content_base64":"`+base64.StdEncoding.EncodeToString(binary)+`"}]}`)
 }
 
+func TestSCMCommit_SendsTheDeclarationOperationsAmongTheOthers(t *testing.T) {
+	t.Parallel()
+	text := "func Greet() {}\n"
+	f := localFile(t, "greet.go", []byte(text))
+	odd := localFile(t, "a=b.go", []byte(text))
+	hub := newStubHub(t).answer(http.MethodPost, commitsPath, http.StatusCreated, commitAnswer)
+
+	code, stdout, stderr := runCLI(t, onHub(hub.URL, "scm", "commit", "w", "--branch", "b", "--expected-head", headSHA, "--message", "m",
+		"--put", "a.go="+f, "--replace-declaration", "api/g.go#Greet="+f, "--delete-declaration", "svc.go#Writer.Close",
+		"--insert-after", "api/g.go#Greet="+odd, "--insert-before", "docs/a#b.go#ns::Widget.draw="+f)...)
+
+	wantResult(t, code, stdout, stderr, commitAnswer)
+	sent := hub.recorded()
+	if len(sent) != 1 {
+		t.Fatalf("the hub got %d requests, want one POST", len(sent))
+	}
+	content := base64.StdEncoding.EncodeToString([]byte(text))
+	wantJSONBody(t, sent[0].body, `{"branch":"b","message":"m","expected_head_sha":"`+headSHA+`","operations":[`+
+		`{"op":"put","path":"a.go","content_base64":"`+content+`"},`+
+		`{"op":"replace_declaration","path":"api/g.go","name":"Greet","content":"func Greet() {}\n"},`+
+		`{"op":"delete_declaration","path":"svc.go","name":"Close","container":"Writer"},`+
+		`{"op":"insert_declaration","path":"api/g.go","content":"func Greet() {}\n","after":{"name":"Greet"}},`+
+		`{"op":"insert_declaration","path":"docs/a#b.go","content":"func Greet() {}\n","before":{"name":"draw","container":"ns::Widget"}}]}`)
+}
+
 func TestSCMCommit_ReadsTheBranchHeadFirst(t *testing.T) {
 	t.Parallel()
 	const refPath = "/api/v1/workspaces/w/scm/refs/feat%2Fx"
@@ -168,6 +193,8 @@ func TestSCMWrite_RefusesABadCommandLineBeforeAnyRequest(t *testing.T) {
 	commit := []string{"scm", "commit", "w", "--branch", "b", "--message", "m"}
 	with := func(args ...string) []string { return append(append([]string{}, commit...), args...) }
 	putRefused, moveRefused := `for "--put" flag`, `for "--move" flag`
+	replaceRefused, deleteRefused, afterRefused := `for "--replace-declaration" flag`, `for "--delete-declaration" flag`, `for "--insert-after" flag`
+	notText := localFile(t, "bin", []byte{0xff, 0xfe, 0x00})
 	tests := []struct {
 		args []string
 		// says is what the usage error's message holds.
@@ -185,6 +212,17 @@ func TestSCMWrite_RefusesABadCommandLineBeforeAnyRequest(t *testing.T) {
 		{with("--move", "=b"), moveRefused},
 		{with("--move", "a="), moveRefused},
 		{with("--delete", "x", "--put", "p="+file, "--move", "a"), moveRefused},
+		{with("--replace-declaration", "a.go="+file), replaceRefused},
+		{with("--replace-declaration", "a.go#="+file), replaceRefused},
+		{with("--replace-declaration", "#Greet="+file), replaceRefused},
+		{with("--replace-declaration", "a.go#Greet"), replaceRefused},
+		{with("--replace-declaration", "a.go#Greet="), replaceRefused},
+		{with("--replace-declaration", "a.go#Greet="+missing), replaceRefused},
+		{with("--replace-declaration", "a.go#Greet="+notText), replaceRefused},
+		{with("--replace-declaration", "a.go#.Greet="+file), replaceRefused},
+		{with("--delete-declaration", "a.go"), deleteRefused},
+		{with("--delete-declaration", "a.go#"), deleteRefused},
+		{with("--insert-after", "a.go#Greet"), afterRefused},
 		{[]string{"scm", "rebase", "w"}, "needs the argument <branch>"},
 		{[]string{"scm", "rebase", "w", "topic"}, "needs the flag --onto"},
 	}
