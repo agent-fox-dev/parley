@@ -231,6 +231,11 @@ func TestCommit(t *testing.T) {
 				t.Errorf("%s: the recorder saw %q, want [commit ref_moved]", tc.name, seen)
 			}
 		}
+		r := w.sendJSON(t, http.MethodPost, w.path, w.ownerKey, map[string]any{"branch": "stale", "expected_head_sha": w.m1, "message": "m",
+			"operations": []any{map[string]any{"op": "replace_declaration", "path": "api/old.go", "name": "Nope", "content": "x\n"}}})
+		if r.status != http.StatusConflict || r.errorType() != "ref_moved" || errorDetails(r)["current_sha"] != head {
+			t.Errorf("a declaration operation on a stale head: %d %s, want 409 ref_moved with current_sha %s before the address is judged", r.status, r.body, head)
+		}
 	})
 
 	t.Run("refuses a malformed request and moves no ref", func(t *testing.T) {
@@ -425,6 +430,26 @@ func TestCommit(t *testing.T) {
 			"message": "m", "operations": []any{put("README.md", "readme2\n"), put("new.txt", "x")}})
 		if r.status != http.StatusCreated {
 			t.Errorf("one operation that changes the tree: %d %s, want 201", r.status, r.body)
+		}
+
+		const g = "package api\n\nfunc G() {}\n"
+		r = w.sendJSON(t, http.MethodPost, w.path, w.ownerKey, map[string]any{"branch": "same", "base_ref": "main",
+			"message": "m", "operations": []any{put("api/g.go", g)}})
+		same, _ := answerCommit(r)["sha"].(string)
+		if r.status != http.StatusCreated {
+			t.Fatalf("a commit adding api/g.go: %d %s, want 201", r.status, r.body)
+		}
+		replace := map[string]any{"op": "replace_declaration", "path": "api/g.go", "name": "G", "content": "func G() {}\n"}
+		r = w.sendJSON(t, http.MethodPost, w.path, w.ownerKey, map[string]any{"branch": "same", "expected_head_sha": same,
+			"message": "m", "operations": []any{replace}})
+		if r.status != http.StatusBadRequest || r.errorType() != "empty_commit" || w.head(t, "same") != same {
+			t.Errorf("a replacement by the same lines: %d %s, want 400 empty_commit and the branch where it was", r.status, r.body)
+		}
+		r = w.sendJSON(t, http.MethodPost, w.path, w.ownerKey, map[string]any{"branch": "same", "expected_head_sha": same,
+			"message": "m", "operations": []any{replace}, "allow_empty": true})
+		tree := strings.TrimSpace(gitrepotest.Git(t, w.dir, "rev-parse", same+"^{tree}"))
+		if r.status != http.StatusCreated || answerCommit(r)["tree_sha"] != tree {
+			t.Errorf("the same with allow_empty: %d %s, want 201 with the parent's tree %s", r.status, r.body, tree)
 		}
 	})
 

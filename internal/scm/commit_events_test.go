@@ -387,6 +387,62 @@ func TestCommitConsequences(t *testing.T) {
 		}
 	})
 
+	t.Run("has the consequences of a put of the file it produces", func(t *testing.T) {
+		base := created(t, "a commit adding api/g.go", post(t, w.ownerKey, "cm", map[string]any{"branch": "decl-a", "base_ref": "main",
+			"message": "m", "operations": []any{put("api/g.go", "package api\n\nfunc G() {}\n")}}))
+		gitrepotest.Git(t, w.dir, "update-ref", "refs/heads/decl-b", base)
+		w.stage.reset()
+		pushed := len(w.pushes.wait(0))
+
+		seq := w.lastSeq(t)
+		ra := post(t, w.ownerKey, "cm", map[string]any{"branch": "decl-a", "expected_head_sha": base, "message": "m",
+			"operations": []any{map[string]any{"op": "replace_declaration", "path": "api/g.go", "name": "G", "content": "func G() int { return 1 }\n"}}})
+		a := created(t, "the replacement", ra)
+		recsA := w.recordsAfter(t, seq)
+		produced := string(gitrepotest.Blob(t, w.dir, a+":api/g.go"))
+
+		seq = w.lastSeq(t)
+		rb := post(t, w.ownerKey, "cm", map[string]any{"branch": "decl-b", "expected_head_sha": base, "message": "m",
+			"operations": []any{put("api/g.go", produced)}})
+		b := created(t, "the put", rb)
+		recsB := w.recordsAfter(t, seq)
+
+		if ta, tb := gitrepotest.Git(t, w.dir, "rev-parse", a+"^{tree}"), gitrepotest.Git(t, w.dir, "rev-parse", b+"^{tree}"); ta != tb {
+			t.Errorf("the trees differ: %s and %s", ta, tb)
+		}
+		for name, recs := range map[string][]event.Record{"replacement": recsA, "put": recsB} {
+			if types := eventTypes(recs); !slices.Equal(types, []string{pushrule.EventPush, eventSCMCommit}) {
+				t.Fatalf("the %s's events %q, want [%s %s]", name, types, pushrule.EventPush, eventSCMCommit)
+			}
+		}
+		var ca, cb scmCommitEvent
+		metadata(t, recsA[1], &ca)
+		metadata(t, recsB[1], &cb)
+		if !slices.Equal(ca.Files, []string{"api/g.go"}) || !slices.Equal(ca.Files, cb.Files) || ca.ParentSHA != cb.ParentSHA {
+			t.Errorf("commit metadata %+v and %+v, want both naming api/g.go alone on one parent", ca, cb)
+		}
+		var raw map[string]any
+		_ = json.Unmarshal(recsA[1].Metadata, &raw)
+		for k := range raw {
+			if !slices.Contains([]string{"branch", "sha", "parent_sha", "files", "truncated"}, k) {
+				t.Errorf("the replacement's commit event carries %q: %v", k, raw)
+			}
+		}
+		strip := func(r reply) string {
+			c := answerCommit(r)
+			return fmt.Sprint(c["stats"], c["parents"], c["message"], len(r.json), r.json["change"], r.json["change_error"])
+		}
+		if strip(ra) != strip(rb) || strings.Contains(string(ra.body), "declaration") {
+			t.Errorf("the answers differ beyond ids, shas, branch and times:\n%s\n%s", ra.body, rb.body)
+		}
+		if n := len(w.stage.reset()); n != 2 {
+			t.Errorf("the ref-updated stage ran %d times, want once for each commit", n)
+		}
+		if seen := w.pushes.wait(pushed + 2); len(seen) != pushed+2 {
+			t.Errorf("the post-push listener was told %d times, want %d", len(seen)-pushed, 2)
+		}
+	})
+
 	t.Run("leaves the post-push listeners to the ref writer", func(t *testing.T) {
 		old := w.branch(t, "work")
 		before := len(w.pushes.wait(0))

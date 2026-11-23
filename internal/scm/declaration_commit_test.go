@@ -1,11 +1,14 @@
 package scm_test
 
 import (
+	"context"
 	"net/http"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/agent-fox-dev/agentkit-go/outline"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/scm"
@@ -15,11 +18,17 @@ import (
 // method of one name.
 const declKinds = "package svc\n\ntype Close struct{}\n\nfunc (Close) Close() {}\n"
 
+// nearSize is the size of near.go on the main of the dc workspace, 100
+// bytes under the outline limit.
+const nearSize = 1<<20 - 100
+
 // declWorld is a commitWorld with the workspace dc of the owner, whose
 // main holds svc.go (declSvc), kinds.go (declKinds), many.go (25 functions
-// init), the executable bin/tool.go, docs/guide.md and the submodule entry
-// vendor/lib; dir is its git directory, main its main and path its commit
-// route.
+// init), the executable bin/tool.go, broken.go (declBroken), README.md,
+// docs/guide.md, the symlink link.go to svc.go, bin.go (a NUL in its first
+// bytes), big.go (one byte over 1 MiB), near.go (nearSize bytes, its last
+// line the function F) and the submodule entry vendor/lib; dir is its git
+// directory, main its main and path its commit route.
 type declWorld struct {
 	*commitWorld
 	dir, main, path string
@@ -34,6 +43,10 @@ func newDeclWorld(t *testing.T) *declWorld {
 	w.dir = w.addWorkspace(t, "dc", w.org, "commit refs/heads/main\n"+testCommitter+data("dc")+
 		file("svc.go", declSvc)+file("kinds.go", declKinds)+file("many.go", many)+file("docs/guide.md", "guide\n")+
 		"M 100755 inline bin/tool.go\n"+data("package main\n\nfunc main() {}\n")+
+		file("broken.go", declBroken)+file("README.md", "# dc\n")+"M 120000 inline link.go\n"+data("svc.go")+
+		file("bin.go", "pa\x00ckage a\n\nfunc F() {}\n")+
+		file("big.go", "package a\n\n// "+strings.Repeat("x", 1<<20+1-15)+"\n")+
+		file("near.go", "package a\n\n// "+strings.Repeat("x", nearSize-28)+"\n\nfunc F() {}\n")+
 		"M 160000 "+strings.Repeat("5", 40)+" vendor/lib\n\n")
 	w.main = strings.TrimSpace(gitrepotest.Git(t, w.dir, "rev-parse", "main"))
 	return w
@@ -287,6 +300,147 @@ func TestDeclarationCommit(t *testing.T) {
 			t.Errorf("kinds.go = %q, want %q", got, want)
 		}
 	})
+}
+
+// refused checks that r is the refusal status errorType of the operation
+// index on path, and that the branch name is still at head with no event
+// written since seq.
+func (w *declWorld) refused(t *testing.T, what string, r reply, status int, errorType string, index float64, path, name, head string, seq int64) map[string]any {
+	t.Helper()
+	d := errorDetails(r)
+	if r.status != status || r.errorType() != errorType || d["index"] != index || d["path"] != path {
+		t.Errorf("%s: %d %.400s, want %d %s with details index %v and path %s", what, r.status, r.body, status, errorType, index, path)
+	}
+	if got := w.branchHead(t, name); got != head {
+		t.Errorf("%s: the branch moved to %s", what, got)
+	}
+	if types, _ := w.eventsAfter(t, seq); len(types) != 0 {
+		t.Errorf("%s: events %q, want none", what, types)
+	}
+	return d
+}
+
+func TestDeclarationCommit_RefusesWhatDoesNotParse(t *testing.T) {
+	t.Parallel()
+	w := newDeclWorld(t)
+
+	t.Run("refuses a file that does not parse before the operation", func(t *testing.T) {
+		head := w.at(t, "unparseable")
+		out, err := outline.Outline(context.Background(), "/broken.go", []byte(declBroken), outline.Options{})
+		if err != nil || len(out.SyntaxErrors) == 0 {
+			t.Fatalf("the outline of broken.go: %v, %+v; want syntax errors", err, out.SyntaxErrors)
+		}
+		for _, name := range []string{"Whole", "Nope"} {
+			seq := w.lastSeq(t)
+			d := w.refused(t, "replace "+name, w.commit(t, "unparseable", head, replaceDecl("broken.go", name, "func X() {}\n")),
+				http.StatusUnprocessableEntity, "unparseable_file", 0, "broken.go", "unparseable", head, seq)
+			if d["line"] != float64(out.SyntaxErrors[0].Line) {
+				t.Errorf("replace %s: details.line %v, want the first error's line %d", name, d["line"], out.SyntaxErrors[0].Line)
+			}
+		}
+		repaired := strings.Replace(declBroken, "\treturn \"x\"\n", "\treturn \"x\"\n}\n", 1)
+		if r := w.commit(t, "unparseable", head, put("broken.go", repaired), replaceDecl("broken.go", "Whole", "func Whole() { _ = 0 }\n")); r.status != http.StatusCreated {
+			t.Errorf("a put that repairs broken.go, then a replacement in it: %d %s, want 201", r.status, r.body)
+		}
+	})
+
+	t.Run("refuses a result that does not parse and names its errors", func(t *testing.T) {
+		head := w.at(t, "syntax")
+		unbalanced := strings.Repeat("func (\n", 30)
+		for _, tc := range []struct {
+			name  string
+			ops   []any
+			index float64
+			most  int
+		}{
+			{"a replacement without its closing brace", []any{replaceDecl("svc.go", "Greet", "func Greet() string {\n\treturn \"x\"\n")}, 0, 20},
+			{"an insertion that does not parse", []any{insertDecl("svc.go", "after", map[string]any{"name": "Greet"}, "func (\n")}, 0, 20},
+			{"a valid operation, then one whose result does not parse", []any{replaceDecl("svc.go", "greet", "func greet() { _ = 1 }\n"),
+				replaceDecl("svc.go", "Greet", "func Greet( {\n")}, 1, 20},
+			{"30 unbalanced lines", []any{replaceDecl("svc.go", "Greet", unbalanced)}, 0, 20},
+		} {
+			seq := w.lastSeq(t)
+			d := w.refused(t, tc.name, w.commit(t, "syntax", head, tc.ops...), http.StatusUnprocessableEntity, "syntax_error", tc.index, "svc.go", "syntax", head, seq)
+			errs, _ := d["errors"].([]any)
+			if len(errs) == 0 || len(errs) > tc.most {
+				t.Errorf("%s: %d errors, want 1 to %d", tc.name, len(errs), tc.most)
+			}
+			last := [2]float64{}
+			for _, e := range errs {
+				m, _ := e.(map[string]any)
+				line, _ := m["line"].(float64)
+				column, _ := m["column"].(float64)
+				if line < 1 || column < 1 || line < last[0] || (line == last[0] && column < last[1]) || len(m) != 2 {
+					t.Errorf("%s: errors %v, want each {line, column}, 1-based, in position order", tc.name, errs)
+					break
+				}
+				last = [2]float64{line, column}
+			}
+		}
+		if r := w.commit(t, "syntax", head, deleteDecl("svc.go", "Writer", "kind", "type")); r.status != http.StatusCreated {
+			t.Errorf("deleting the type a method's receiver names, which still parses: %d %s, want 201", r.status, r.body)
+		}
+	})
+
+	t.Run("refuses a file in no language this hub can outline", func(t *testing.T) {
+		head := w.at(t, "language")
+		for _, path := range []string{"README.md", "docs/guide.md", "link.go"} {
+			seq := w.lastSeq(t)
+			d := w.refused(t, path, w.commit(t, "language", head, replaceDecl(path, "x", "y\n")),
+				http.StatusUnprocessableEntity, "unsupported_language", 0, path, "language", head, seq)
+			if language, ok := d["language"]; !ok || language != "" {
+				t.Errorf("%s: details.language %v (present %v), want \"\"", path, language, ok)
+			}
+		}
+	})
+
+	t.Run("refuses a binary file and one over the size limit before or after", func(t *testing.T) {
+		head := w.at(t, "size")
+		at := func(n int) string { return "func F() {} //" + strings.Repeat("y", n-15) + "\n" }
+		for _, tc := range []struct {
+			name, path, content string
+			status              int
+			errorType           string
+			size                float64
+		}{
+			{"a binary file", "bin.go", "func F() {}\n", http.StatusUnprocessableEntity, "binary_file", 0},
+			{"a file over 1 MiB", "big.go", "func F() {}\n", http.StatusRequestEntityTooLarge, "payload_too_large", 1<<20 + 1},
+			{"a result over 1 MiB", "near.go", at(1<<20 - nearSize + 13), http.StatusRequestEntityTooLarge, "payload_too_large", 1<<20 + 1},
+		} {
+			seq := w.lastSeq(t)
+			r := w.commit(t, "size", head, replaceDecl(tc.path, "F", tc.content))
+			w.refused(t, tc.name, r, tc.status, tc.errorType, 0, tc.path, "size", head, seq)
+			if e, _ := r.json["error"].(map[string]any); tc.size != 0 && e["size"] != tc.size {
+				t.Errorf("%s: size %v, want %v", tc.name, e["size"], tc.size)
+			}
+		}
+		if r := w.commit(t, "size", head, replaceDecl("near.go", "F", at(1<<20-nearSize+12))); r.status != http.StatusCreated {
+			t.Errorf("a result of exactly 1 MiB: %d %.300s, want 201", r.status, r.body)
+		}
+	})
+}
+
+// A hub built without cgo has no backend for Python: a declaration
+// operation on such a file is refused with its language.
+func TestDeclarationCommit_RefusesAFileThisBuildHasNoBackendFor(t *testing.T) {
+	t.Parallel()
+	w := newWriteWorld(t, "", func(d *scm.Deps) {
+		d.Outline = func(context.Context, string, []byte) (outline.File, error) {
+			return outline.File{Lang: outline.LangPython, Backend: outline.BackendNone, Decls: []outline.Decl{},
+				NotParsed: outline.NotParsedUnsupported, SyntaxErrors: []outline.SyntaxError{}}, nil
+		}
+	})
+	dir := w.addWorkspace(t, "py", w.org, "commit refs/heads/main\n"+testCommitter+"data 2\npy\nM 100644 inline app.py\ndata 22\ndef serve():\n    pass\n\n")
+	head := strings.TrimSpace(gitrepotest.Git(t, dir, "rev-parse", "main"))
+	r := w.sendJSON(t, http.MethodPost, scmPath("py", "/commits"), w.ownerKey, map[string]any{"branch": "main", "expected_head_sha": head,
+		"message": "m", "operations": []any{replaceDecl("app.py", "serve", "def serve():\n    return 1\n")}})
+	if d := errorDetails(r); r.status != http.StatusUnprocessableEntity || r.errorType() != "unsupported_language" || d["language"] != "Python" ||
+		d["index"] != float64(0) || d["path"] != "app.py" {
+		t.Errorf("%d %s, want 422 unsupported_language with details language Python, index 0 and path app.py", r.status, r.body)
+	}
+	if got := strings.TrimSpace(gitrepotest.Git(t, dir, "rev-parse", "main")); got != head {
+		t.Errorf("main moved to %s", got)
+	}
 }
 
 // equalJSON reports whether two decoded JSON values are equal.

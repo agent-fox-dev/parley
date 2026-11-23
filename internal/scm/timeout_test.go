@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,6 +17,7 @@ import (
 	"github.com/agent-fox-dev/agentkit-go/outline"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
+	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/scm"
 )
 
@@ -240,6 +242,89 @@ func TestDeclaration_AnswersATimeoutWhenTheParseOutlastsTheReadTimeout(t *testin
 	}
 	if d := time.Since(start); d >= 3*time.Second {
 		t.Errorf("answered after %v, want within 3s", d)
+	}
+}
+
+// A commit's declaration operations parse within one read timeout, and
+// take their places among the parses the hub runs at once: a commit whose
+// parses outlast it, or find no place within it, moves nothing.
+func TestDeclarationCommit_EndsWhenItsParsesOutlastTheReadTimeout(t *testing.T) {
+	var parses atomic.Int32
+	release := make(chan struct{})
+	w := newWriteWorld(t, "", func(d *scm.Deps) {
+		d.ReadTimeout = 300 * time.Millisecond
+		d.Outline = func(ctx context.Context, path string, src []byte) (outline.File, error) {
+			parses.Add(1)
+			<-release
+			return outline.Outline(ctx, path, src, outline.Options{})
+		}
+	})
+	free := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(free)
+	dir := w.addWorkspace(t, "slow", w.org, "commit refs/heads/main\n"+testCommitter+"data 2\nm1\nM 100644 inline a.go\ndata 23\npackage a\n\nfunc A() {}\n\n")
+	head := strings.TrimSpace(gitrepotest.Git(t, dir, "rev-parse", "main"))
+	body := map[string]any{"branch": "main", "expected_head_sha": head, "message": "m",
+		"operations": []any{map[string]any{"op": "replace_declaration", "path": "a.go", "name": "A", "content": "func A() { _ = 1 }\n"}}}
+	// send posts the commit, bounded on the client's side so that a commit
+	// that would wait for its parses for ever fails the test instead.
+	send := func() (reply, error) {
+		b, _ := json.Marshal(body)
+		req, _ := http.NewRequest(http.MethodPost, w.URL("/api/v1"+scmPath("slow", "/commits")), bytes.NewReader(b))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+w.ownerKey)
+		res, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+		if err != nil {
+			return reply{}, err
+		}
+		defer res.Body.Close()
+		r := reply{status: res.StatusCode, header: res.Header}
+		r.body, _ = io.ReadAll(res.Body)
+		_ = json.Unmarshal(r.body, &r.json)
+		return r, nil
+	}
+	commitTimesOut := func(name string) {
+		t.Helper()
+		start := time.Now()
+		r, err := send()
+		if err != nil {
+			t.Fatalf("%s: %v, want 503 scm_timeout", name, err)
+		}
+		if r.status != http.StatusServiceUnavailable || r.errorType() != "scm_timeout" {
+			t.Fatalf("%s: %d %s, want 503 scm_timeout", name, r.status, r.body)
+		}
+		if d := time.Since(start); d >= 3*time.Second {
+			t.Errorf("%s: answered after %v, want within 3s", name, d)
+		}
+		if got := strings.TrimSpace(gitrepotest.Git(t, dir, "rev-parse", "main")); got != head {
+			t.Fatalf("%s: main moved to %s", name, got)
+		}
+	}
+	commitTimesOut("a parse that stalls")
+
+	// The stalled parse keeps its place; outline reads take the others.
+	for deadline := time.Now().Add(30 * time.Second); parses.Load() < scm.DefaultMaxOutlines; {
+		if r, err := w.fetch(scmPath("slow", "/outline?path=a.go")); err != nil || r.status != http.StatusServiceUnavailable {
+			t.Fatalf("an outline read while the parses stall: %d %s (%v), want 503", r.status, r.body, err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d parses stalled within 30s, want %d", parses.Load(), scm.DefaultMaxOutlines)
+		}
+	}
+	commitTimesOut("no place among the parses")
+	if n := parses.Load(); n != scm.DefaultMaxOutlines {
+		t.Errorf("%d parses began, want %d: the commit found no place", n, scm.DefaultMaxOutlines)
+	}
+
+	free()
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		r, err := send()
+		if err == nil && r.status == http.StatusCreated {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("once the parses ended: %d %s, want 201", r.status, r.body)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

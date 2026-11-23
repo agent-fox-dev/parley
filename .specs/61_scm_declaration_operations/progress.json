@@ -3,7 +3,7 @@
   "spec_id": "61",
   "spec_name": "scm_declaration_operations",
   "schema_version": 3,
-  "updated_at": "2026-11-23T11:55:46Z",
+  "updated_at": "2026-11-23T12:11:57Z",
   "tasks": [
     {
       "id": 1,
@@ -416,7 +416,165 @@
     },
     {
       "id": 3,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-4.1",
+          "tests": [
+            {
+              "test": "./internal/scm:TestDeclarationCommit_RefusesWhatDoesNotParse/refuses_a_file_that_does_not_parse_before_the_operation",
+              "failed": {
+                "at": "2026-11-23T12:04:11Z",
+                "tree": "6e39a79bff9e0745081d6461aca840c279901960"
+              },
+              "passed": {
+                "at": "2026-11-23T12:11:53Z",
+                "tree": "3ca60e0c93a926d1773a63ba8c739ae5ac5bf6e8"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.2",
+          "tests": [
+            {
+              "test": "./internal/scm:TestDeclarationCommit_RefusesWhatDoesNotParse/refuses_a_result_that_does_not_parse_and_names_its_errors",
+              "failed": {
+                "at": "2026-11-23T12:04:11Z",
+                "tree": "6e39a79bff9e0745081d6461aca840c279901960"
+              },
+              "passed": {
+                "at": "2026-11-23T12:11:53Z",
+                "tree": "3ca60e0c93a926d1773a63ba8c739ae5ac5bf6e8"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.3",
+          "tests": [
+            {
+              "test": "./internal/scm:TestDeclarationCommit_RefusesWhatDoesNotParse/refuses_a_file_in_no_language_this_hub_can_outline",
+              "failed": {
+                "at": "2026-11-23T12:04:11Z",
+                "tree": "6e39a79bff9e0745081d6461aca840c279901960"
+              },
+              "passed": {
+                "at": "2026-11-23T12:11:53Z",
+                "tree": "3ca60e0c93a926d1773a63ba8c739ae5ac5bf6e8"
+              }
+            },
+            {
+              "test": "./internal/scm:TestDeclarationCommit_RefusesAFileThisBuildHasNoBackendFor",
+              "failed": {
+                "at": "2026-11-23T12:04:11Z",
+                "tree": "6e39a79bff9e0745081d6461aca840c279901960"
+              },
+              "passed": {
+                "at": "2026-11-23T12:11:53Z",
+                "tree": "3ca60e0c93a926d1773a63ba8c739ae5ac5bf6e8"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.4",
+          "tests": [
+            {
+              "test": "./internal/scm:TestDeclarationCommit_RefusesWhatDoesNotParse/refuses_a_binary_file_and_one_over_the_size_limit_before_or_after",
+              "failed": {
+                "at": "2026-11-23T12:04:11Z",
+                "tree": "6e39a79bff9e0745081d6461aca840c279901960"
+              },
+              "passed": {
+                "at": "2026-11-23T12:11:53Z",
+                "tree": "3ca60e0c93a926d1773a63ba8c739ae5ac5bf6e8"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.5",
+          "tests": [
+            {
+              "test": "./internal/scm:TestDeclarationCommit_EndsWhenItsParsesOutlastTheReadTimeout",
+              "failed": {
+                "at": "2026-11-23T12:04:11Z",
+                "tree": "6e39a79bff9e0745081d6461aca840c279901960"
+              },
+              "passed": {
+                "at": "2026-11-23T12:11:53Z",
+                "tree": "3ca60e0c93a926d1773a63ba8c739ae5ac5bf6e8"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.1",
+          "no_red": "task 2 turns a declaration operation into a put before the tree builder, so the events and the answer are already a put's; the task asks to confirm it by test",
+          "tests": [
+            {
+              "test": "./internal/scm:TestCommitConsequences/has_the_consequences_of_a_put_of_the_file_it_produces",
+              "passed": {
+                "at": "2026-11-23T12:11:53Z",
+                "tree": "3ca60e0c93a926d1773a63ba8c739ae5ac5bf6e8"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.2",
+          "no_red": "the commit route's empty-commit check compares trees after the operations; task 2's put of identical bytes already meets it",
+          "tests": [
+            {
+              "test": "./internal/scm:TestCommit/refuses_a_commit_that_changes_nothing",
+              "passed": {
+                "at": "2026-11-23T12:11:53Z",
+                "tree": "3ca60e0c93a926d1773a63ba8c739ae5ac5bf6e8"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.3",
+          "no_red": "the push rules see the paths the commit changes, which task 2's put already changes",
+          "tests": [
+            {
+              "test": "./internal/scm:TestPushRules_WithTheHubsEngine/holds_a_path-scoped_token_to_its_paths_and_names_the_first_outside_them",
+              "passed": {
+                "at": "2026-11-23T12:11:53Z",
+                "tree": "3ca60e0c93a926d1773a63ba8c739ae5ac5bf6e8"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.4",
+          "no_red": "the parent check of package 21 runs before task 2's resolution of declaration operations",
+          "tests": [
+            {
+              "test": "./internal/scm:TestCommit/refuses_a_head_the_caller_has_not_seen",
+              "passed": {
+                "at": "2026-11-23T12:11:53Z",
+                "tree": "3ca60e0c93a926d1773a63ba8c739ae5ac5bf6e8"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.5",
+          "no_red": "a declaration commit moves its branch through the same ref writer, whose version recording this test shows; PATH-1's smoke test in the integration task shows it end to end",
+          "tests": [
+            {
+              "test": "./internal/scm:TestCommitConsequences/names_the_version_the_ref_writer_reports_for_the_moved_branch",
+              "passed": {
+                "at": "2026-11-23T12:11:53Z",
+                "tree": "3ca60e0c93a926d1773a63ba8c739ae5ac5bf6e8"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 4,

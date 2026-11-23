@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"unicode/utf8"
 
 	"github.com/agent-fox-dev/agentkit-go/outline"
@@ -426,10 +427,38 @@ type stagedSource struct {
 // them, and the parent's file otherwise.
 //
 // A declaration operation on a path that is no file there is 400
-// invalid_operation; an address that names no declaration is 404
-// declaration_not_found and one that names several 409
-// ambiguous_declaration, each naming the operation's index and path.
+// invalid_operation. Then, each naming the operation's index and path: a
+// file that cannot be judged is refused before its address is (422
+// unsupported_language, 422 binary_file, 413 payload_too_large, 422
+// unparseable_file for a file with a syntax error); an address that names
+// no declaration is 404 declaration_not_found and one that names several
+// 409 ambiguous_declaration; a result over maxOutlineSize is 413
+// payload_too_large and one with a syntax error 422 syntax_error.
+//
+// The reads and parses of all the operations share one read timeout, the
+// parses taking their places among those the hub runs at once; a request
+// whose work outlasts it is 503 scm_timeout. Nothing has been written to a
+// ref when any of these is answered.
 func (c *Component) resolveDeclarations(ctx context.Context, git *gitrepo.Repo, parent string, planned []plannedOperation) ([]gitrepo.Operation, error) {
+	if !slices.ContainsFunc(planned, func(p plannedOperation) bool { return p.decl != nil }) {
+		ops := make([]gitrepo.Operation, len(planned))
+		for i, p := range planned {
+			ops[i] = p.op
+		}
+		return ops, nil
+	}
+	ctx, cancel := context.WithTimeoutCause(ctx, c.deps.ReadTimeout, errReadTimeout)
+	defer cancel()
+	ops, err := c.applyDeclarations(ctx, git, parent, planned)
+	if err != nil && context.Cause(ctx) == errReadTimeout {
+		return nil, server.NewError("scm_timeout", http.StatusServiceUnavailable,
+			fmt.Sprintf("the declaration operations did not finish within the read timeout of %s", c.deps.ReadTimeout))
+	}
+	return ops, err
+}
+
+// applyDeclarations is resolveDeclarations within its deadline.
+func (c *Component) applyDeclarations(ctx context.Context, git *gitrepo.Repo, parent string, planned []plannedOperation) ([]gitrepo.Operation, error) {
 	ops := make([]gitrepo.Operation, 0, len(planned))
 	staged := map[string]*stagedSource{}
 	current := func(path string) *stagedSource {
@@ -522,7 +551,13 @@ func (c *Component) applyDeclaration(ctx context.Context, index int, d *declarat
 		return nil, fmt.Errorf("outline %q: %w", d.path, err)
 	}
 	if refused != nil {
-		return nil, refused.apiError(nil)
+		return nil, refused.apiError(where)
+	}
+	if errs := src.file.SyntaxErrors; len(errs) > 0 {
+		where["line"] = errs[0].Line
+		return nil, server.NewError("unparseable_file", http.StatusUnprocessableEntity,
+			fmt.Sprintf("operation %d: %s has a syntax error on line %d, so its declarations cannot be addressed; write it whole with a put", index, d.path, errs[0].Line)).
+			WithDetails(where)
 	}
 	found := d.addr.find(src.file.Decls)
 	switch {
@@ -542,17 +577,45 @@ func (c *Component) applyDeclaration(ctx context.Context, index int, d *declarat
 	}
 	from, to, ok := lineSpan(f.content, found[0].StartLine, found[0].EndLine)
 	if !ok {
-		return nil, server.NewError("unparseable_file", http.StatusUnprocessableEntity,
-			fmt.Sprintf("operation %d: the end of %q in %s is not known", index, d.addr.Name, d.path))
+		return nil, fmt.Errorf("operation %d: the outline of %s gives %q the lines %d to %d, which the file does not have",
+			index, d.path, d.addr.Name, found[0].StartLine, found[0].EndLine)
 	}
-	switch d.op {
-	case opDeleteDeclaration:
-		return spliceLines(f.content, from, to, nil), nil
-	case opInsertDeclaration:
-		if d.after {
-			return spliceLines(f.content, to, to, d.content), nil
-		}
-		return spliceLines(f.content, from, from, d.content), nil
+	var result []byte
+	switch {
+	case d.op == opDeleteDeclaration:
+		result = spliceLines(f.content, from, to, nil)
+	case d.op == opInsertDeclaration && d.after:
+		result = spliceLines(f.content, to, to, d.content)
+	case d.op == opInsertDeclaration:
+		result = spliceLines(f.content, from, from, d.content)
+	default:
+		result = spliceLines(f.content, from, to, d.content)
 	}
-	return spliceLines(f.content, from, to, d.content), nil
+	return result, c.checkResult(ctx, index, d.path, f.mode, result)
+}
+
+// checkResult refuses result, the bytes the declaration operation index
+// leaves in the file path whose mode is mode, when it is over
+// maxOutlineSize or does not parse.
+func (c *Component) checkResult(ctx context.Context, index int, path, mode string, result []byte) error {
+	where := map[string]any{"index": index, "path": path}
+	src, refused, err := c.outlineSource(ctx, path, mode, result)
+	if err != nil {
+		return fmt.Errorf("outline %q: %w", path, err)
+	}
+	if refused != nil {
+		return refused.apiError(where)
+	}
+	if len(src.file.SyntaxErrors) == 0 {
+		return nil
+	}
+	errs := make([]map[string]any, len(src.file.SyntaxErrors))
+	for i, e := range src.file.SyntaxErrors {
+		errs[i] = map[string]any{"line": e.Line, "column": e.Column}
+	}
+	where["errors"] = errs
+	first := src.file.SyntaxErrors[0]
+	return server.NewError("syntax_error", http.StatusUnprocessableEntity,
+		fmt.Sprintf("operation %d: %s would have a syntax error at line %d, column %d", index, path, first.Line, first.Column)).
+		WithDetails(where)
 }
