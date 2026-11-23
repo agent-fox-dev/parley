@@ -84,7 +84,7 @@ func TestRead_EndsAReadThatOutlastsTheReadTimeout(t *testing.T) {
 		d.Open = func(context.Context, string) (scm.Repository, error) { return stalledRepo{ended: &ended}, nil }
 	})
 	for _, rt := range scmRoutes {
-		if !slices.Contains([]string{"tree", "file", "diff", "compare", "blame", "search", "outline"}, rt.op) {
+		if !slices.Contains([]string{"tree", "file", "diff", "compare", "blame", "search", "outline", "declaration"}, rt.op) {
 			continue
 		}
 		t.Run(rt.op, func(t *testing.T) {
@@ -218,6 +218,28 @@ func TestOutline_AnswersATimeoutWhenTheParseOutlastsTheReadTimeout(t *testing.T)
 			t.Fatalf("once the stalled parse ended: %d %s (%v), want 200", r.status, r.body, err)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// The declaration route parses as the outline route does, so a parse that
+// outlasts the read timeout ends the read there too.
+func TestDeclaration_AnswersATimeoutWhenTheParseOutlastsTheReadTimeout(t *testing.T) {
+	release := make(chan struct{})
+	w := newWorld(t, func(d *scm.Deps) {
+		d.ReadTimeout = 300 * time.Millisecond
+		d.Outline = func(ctx context.Context, path string, src []byte) (outline.File, error) {
+			<-release
+			return outline.Outline(ctx, path, src, outline.Options{})
+		}
+	})
+	t.Cleanup(sync.OnceFunc(func() { close(release) }))
+	start := time.Now()
+	r, err := w.fetch(scmPath("demo", "/declaration?path=g.go&name=Hello"))
+	if err != nil || r.status != http.StatusServiceUnavailable || r.errorType() != "scm_timeout" {
+		t.Fatalf("%d %s (%v), want 503 scm_timeout", r.status, r.body, err)
+	}
+	if d := time.Since(start); d >= 3*time.Second {
+		t.Errorf("answered after %v, want within 3s", d)
 	}
 }
 

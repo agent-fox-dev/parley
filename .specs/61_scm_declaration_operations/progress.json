@@ -3,11 +3,207 @@
   "spec_id": "61",
   "spec_name": "scm_declaration_operations",
   "schema_version": 3,
-  "updated_at": "",
+  "updated_at": "2026-11-23T11:45:41Z",
   "tasks": [
     {
       "id": 1,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-1.1",
+          "tests": [
+            {
+              "test": "./internal/scm:TestDeclaration_AnswersTheDeclarationsOfANameWithTheirLines",
+              "failed": {
+                "at": "2026-11-23T11:41:05Z",
+                "tree": "4ba8d9cfbbd1265675e9030e972a383f68b94ecf"
+              },
+              "passed": {
+                "at": "2026-11-23T11:45:35Z",
+                "tree": "268105cb7dc60faabc5d13252c32e0d96525d267"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.2",
+          "tests": [
+            {
+              "test": "./internal/scm:TestDeclaration_NarrowsTheMatchesByContainerAndKind",
+              "failed": {
+                "at": "2026-11-23T11:41:05Z",
+                "tree": "4ba8d9cfbbd1265675e9030e972a383f68b94ecf"
+              },
+              "passed": {
+                "at": "2026-11-23T11:45:35Z",
+                "tree": "268105cb7dc60faabc5d13252c32e0d96525d267"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.3",
+          "tests": [
+            {
+              "test": "./internal/scm:TestDeclaration_ReadsTheCommitItsRefNames",
+              "failed": {
+                "at": "2026-11-23T11:41:05Z",
+                "tree": "4ba8d9cfbbd1265675e9030e972a383f68b94ecf"
+              },
+              "passed": {
+                "at": "2026-11-23T11:45:35Z",
+                "tree": "268105cb7dc60faabc5d13252c32e0d96525d267"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.4",
+          "tests": [
+            {
+              "test": "./internal/scm:TestDeclaration_RefusesANameTheFileDoesNotDeclare",
+              "failed": {
+                "at": "2026-11-23T11:41:05Z",
+                "tree": "4ba8d9cfbbd1265675e9030e972a383f68b94ecf"
+              },
+              "passed": {
+                "at": "2026-11-23T11:45:35Z",
+                "tree": "268105cb7dc60faabc5d13252c32e0d96525d267"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.5",
+          "tests": [
+            {
+              "test": "./internal/scm:TestDeclaration_RefusesAFileItCannotOutline",
+              "failed": {
+                "at": "2026-11-23T11:41:05Z",
+                "tree": "4ba8d9cfbbd1265675e9030e972a383f68b94ecf"
+              },
+              "passed": {
+                "at": "2026-11-23T11:45:35Z",
+                "tree": "268105cb7dc60faabc5d13252c32e0d96525d267"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.6",
+          "tests": [
+            {
+              "test": "./internal/scm:TestDeclaration_RefusesWhatItCannotReadBeforeParsing",
+              "failed": {
+                "at": "2026-11-23T11:41:05Z",
+                "tree": "4ba8d9cfbbd1265675e9030e972a383f68b94ecf"
+              },
+              "passed": {
+                "at": "2026-11-23T11:45:35Z",
+                "tree": "268105cb7dc60faabc5d13252c32e0d96525d267"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.7",
+          "tests": [
+            {
+              "test": "./internal/scm:TestDeclaration_AnswersAFileWithSyntaxErrorsAsFarAsItsOutlineGoes",
+              "failed": {
+                "at": "2026-11-23T11:41:05Z",
+                "tree": "4ba8d9cfbbd1265675e9030e972a383f68b94ecf"
+              },
+              "passed": {
+                "at": "2026-11-23T11:45:35Z",
+                "tree": "268105cb7dc60faabc5d13252c32e0d96525d267"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.8",
+          "tests": [
+            {
+              "test": "./internal/scm:TestRead_ServesEveryReaderOnEveryReadableWorkspace",
+              "failed": {
+                "at": "2026-11-23T11:41:05Z",
+                "tree": "4ba8d9cfbbd1265675e9030e972a383f68b94ecf"
+              },
+              "passed": {
+                "at": "2026-11-23T11:45:35Z",
+                "tree": "268105cb7dc60faabc5d13252c32e0d96525d267"
+              }
+            },
+            {
+              "test": "./internal/scm:TestRead_RefusesACallerWhoMayNotReadWithoutOpeningTheRepository",
+              "failed": {
+                "at": "2026-11-23T11:41:05Z",
+                "tree": "4ba8d9cfbbd1265675e9030e972a383f68b94ecf"
+              },
+              "passed": {
+                "at": "2026-11-23T11:45:35Z",
+                "tree": "268105cb7dc60faabc5d13252c32e0d96525d267"
+              }
+            },
+            {
+              "test": "./internal/scm:TestRead_AnswersAnyOtherReadWithATagToRevalidate",
+              "failed": {
+                "at": "2026-11-23T11:41:05Z",
+                "tree": "4ba8d9cfbbd1265675e9030e972a383f68b94ecf"
+              },
+              "passed": {
+                "at": "2026-11-23T11:45:35Z",
+                "tree": "268105cb7dc60faabc5d13252c32e0d96525d267"
+              }
+            },
+            {
+              "test": "./internal/scm:TestRead_EndsAReadThatOutlastsTheReadTimeout",
+              "failed": {
+                "at": "2026-11-23T11:41:05Z",
+                "tree": "4ba8d9cfbbd1265675e9030e972a383f68b94ecf"
+              },
+              "passed": {
+                "at": "2026-11-23T11:45:35Z",
+                "tree": "268105cb7dc60faabc5d13252c32e0d96525d267"
+              }
+            },
+            {
+              "test": "./internal/scm:TestRead_ReportsEachRequestOnceToTheRecorder",
+              "failed": {
+                "at": "2026-11-23T11:41:05Z",
+                "tree": "4ba8d9cfbbd1265675e9030e972a383f68b94ecf"
+              },
+              "passed": {
+                "at": "2026-11-23T11:45:35Z",
+                "tree": "268105cb7dc60faabc5d13252c32e0d96525d267"
+              }
+            },
+            {
+              "test": "./internal/scm:TestDeclaration_AnswersATimeoutWhenTheParseOutlastsTheReadTimeout",
+              "failed": {
+                "at": "2026-11-23T11:41:05Z",
+                "tree": "4ba8d9cfbbd1265675e9030e972a383f68b94ecf"
+              },
+              "passed": {
+                "at": "2026-11-23T11:45:35Z",
+                "tree": "268105cb7dc60faabc5d13252c32e0d96525d267"
+              }
+            },
+            {
+              "test": "./internal/metrics:TestNew_ExportsEveryCatalogueMetricAtZero",
+              "failed": {
+                "at": "2026-11-23T11:41:05Z",
+                "tree": "4ba8d9cfbbd1265675e9030e972a383f68b94ecf"
+              },
+              "passed": {
+                "at": "2026-11-23T11:45:35Z",
+                "tree": "268105cb7dc60faabc5d13252c32e0d96525d267"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 2,

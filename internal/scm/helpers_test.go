@@ -135,13 +135,15 @@ type world struct {
 	id   map[string]string
 }
 
-// demoStream is demo's history: c1 and c2 on main, each writing f.txt;
+// demoStream is demo's history: c1 and c2 on main, each writing f.txt,
+// c2 adding g.go too;
 // c3 on feature/x, on top of c2, adding x.txt; the branches dev and
 // release at c1 and topic at c2; the lightweight tag v1 at c1 and the
 // annotated tag v2 at c2; refs/parley/changes/12/3 at c3; and refs/notes/x,
 // a namespace the reads do not list, at c1.
 const demoStream = "commit refs/heads/main\nmark :1\n" + testCommitter + "data 2\nc1\nM 100644 inline f.txt\ndata 3\nc1\n\n" +
-	"commit refs/heads/main\nmark :2\n" + testCommitter + "data 2\nc2\nfrom :1\nM 100644 inline f.txt\ndata 3\nc2\n\n" +
+	"commit refs/heads/main\nmark :2\n" + testCommitter + "data 2\nc2\nfrom :1\nM 100644 inline f.txt\ndata 3\nc2\n" +
+	"M 100644 inline g.go\ndata 27\npackage g\n\nfunc Hello() {}\n\n" +
 	"commit refs/heads/feature/x\nmark :3\n" + testCommitter + "data 2\nc3\nfrom :2\nM 100644 inline x.txt\ndata 3\nc3\n\n" +
 	"reset refs/heads/dev\nfrom :1\n\nreset refs/heads/release\nfrom :1\n\nreset refs/heads/topic\nfrom :2\n\n" +
 	"reset refs/tags/v1\nfrom :1\n\ntag v2\nfrom :2\ntagger T <t@example.invalid> 1700000000 +0000\ndata 2\nv2\n" +
@@ -212,9 +214,9 @@ func newComposedWorld(t testing.TB, toml string, compose func(*hub.Composition),
 // readWorld is the world the tests that only read share, built once for the
 // package: a world as newWorld makes it, its rate limit off since every
 // test that reads sends with the same keys, with the owner's workspaces hist,
-// tree, files, diff, cmp, blame, search and outline added. hist, diff, blame
-// and outline are the ids addHistory, addDiff, addBlame and addOutline
-// return; tree, files, cmp and search the git directories of those
+// tree, files, diff, cmp, blame, search, outline and decl added. hist, diff,
+// blame and outline are the ids addHistory, addDiff, addBlame and addOutline
+// return, and decl the main addDeclarations returns; tree, files, cmp and search the git directories of those
 // workspaces, files a tree workspace holding fileExtras too; and searchMain
 // the id of search's main. Its tests change nothing in it and read neither
 // its observations nor its opens.
@@ -222,6 +224,7 @@ type readWorld struct {
 	*world
 	hist, diff, blame        map[string]string
 	outline                  map[string]string
+	decl                     string
 	tree, files, cmp, search string
 	searchMain               string
 }
@@ -246,6 +249,7 @@ func readOnlyWorld(t *testing.T) *readWorld {
 		w.tree, w.files, w.cmp = w.addTree(tb, "tree"), w.addTree(tb, "files", fileExtras...), w.addCompare(tb)
 		w.search, w.searchMain = w.addSearch(tb)
 		w.outline = w.addOutline(tb)
+		w.decl = w.addDeclarations(tb)
 		readOnly.w = w
 	})
 	if readOnly.failure != nil {
@@ -639,6 +643,7 @@ var scmRoutes = []struct{ op, ok, bad string }{
 	{"blame", "/blame?path=f.txt", "/blame?path=nope.txt"},
 	{"search", "/search?q=c1", "/search"},
 	{"outline", "/outline?path=f.txt", "/outline?path=nope.txt"},
+	{"declaration", "/declaration?path=g.go&name=Hello", "/declaration?path=nope.txt&name=x"},
 }
 
 // observations is a request recorder that keeps what it was told, each
