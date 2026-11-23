@@ -861,10 +861,10 @@ func (h *createHub) principal(t *testing.T) identity.Principal {
 // next pass, and waits until that pass has run.
 func (h *createHub) pass(t *testing.T, d time.Duration) {
 	t.Helper()
-	eventually(t, "the provisioner to wait", func() bool { return h.timers.live(sandbox.ProvisionInterval) > 0 })
+	hubtest.Eventually(t, "the provisioner to wait", func() bool { return h.timers.live(sandbox.ProvisionInterval) > 0 })
 	before := h.timers.created(sandbox.ProvisionInterval)
 	h.clock.Advance(d)
-	eventually(t, "the provisioner's pass", func() bool { return h.timers.created(sandbox.ProvisionInterval) > before })
+	hubtest.Eventually(t, "the provisioner's pass", func() bool { return h.timers.created(sandbox.ProvisionInterval) > before })
 }
 
 // record is the workspace record slug of kind of dana in acme, with the
@@ -1518,25 +1518,12 @@ func (p *pause) wait(ctx context.Context, op string) error {
 	}
 }
 
-// eventually waits up to 5 s, polling, for cond to hold, and fails the
-// test then.
-func eventually(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("waited 5 s for %s", what)
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-}
-
 // settled waits until the sandbox id is no longer provisioning and returns
 // its record.
 func (h *createHub) settled(t *testing.T, id string) sandbox.Record {
 	t.Helper()
 	var rec sandbox.Record
-	eventually(t, "sandbox "+id+" to leave provisioning", func() bool {
+	hubtest.Eventually(t, "sandbox "+id+" to leave provisioning", func() bool {
 		var err error
 		rec, err = sandbox.Get(context.Background(), h.Store.Main(), id)
 		if err != nil {
@@ -1552,7 +1539,7 @@ func (h *createHub) settled(t *testing.T, id string) sandbox.Record {
 func (h *createHub) settledObject(t *testing.T, slug, id string) map[string]any {
 	t.Helper()
 	var o map[string]any
-	eventually(t, "sandbox "+id+" to leave provisioning", func() bool {
+	hubtest.Eventually(t, "sandbox "+id+" to leave provisioning", func() bool {
 		o = decoded(t, h.call(t, http.MethodGet, "/workspaces/"+slug+"/sandboxes/"+id, h.key, nil), http.StatusOK)
 		return o["state"] != sandbox.StateProvisioning
 	})
@@ -3455,7 +3442,7 @@ func (h *logHub) round(t *testing.T) {
 func (h *logHub) follow(t *testing.T, id string) {
 	t.Helper()
 	h.round(t)
-	eventually(t, "the collector to read both logs of "+id, func() bool { return h.logStreams(id) == 2 })
+	hubtest.Eventually(t, "the collector to read both logs of "+id, func() bool { return h.logStreams(id) == 2 })
 }
 
 // logStreams is the number of open log streams of the sandbox id.
@@ -3511,7 +3498,7 @@ func (h *logHub) emit(id string, stream runtime.OutputStream, text string) {
 func (h *logHub) pass(t *testing.T) {
 	t.Helper()
 	from := h.passes.Load()
-	eventually(t, "a maintenance pass", func() bool { return h.passes.Load() >= from+2 })
+	hubtest.Eventually(t, "a maintenance pass", func() bool { return h.passes.Load() >= from+2 })
 }
 
 // logsAs sends GET …/logs?query for the sandbox id of ws with cred as the
@@ -4471,7 +4458,7 @@ func (h *collectorHub) denials(t *testing.T, id string) []hubEvent {
 // reported waits until the sandbox id has n parley.sandbox.deny events.
 func (h *collectorHub) reported(t *testing.T, id string, n int) {
 	t.Helper()
-	eventually(t, fmt.Sprintf("%d denial events of %s", n, id), func() bool { return len(h.denials(t, id)) >= n })
+	hubtest.Eventually(t, fmt.Sprintf("%d denial events of %s", n, id), func() bool { return len(h.denials(t, id)) >= n })
 }
 
 // followed are the ids of the sandboxes with an open log stream, sorted, a

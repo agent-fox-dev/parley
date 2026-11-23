@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/store"
+
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 )
@@ -133,7 +135,7 @@ func keyExpiry(days int, now time.Time) *time.Time {
 // expiresAt as its expiry, in tx.
 func setKeySecret(ctx context.Context, tx *sql.Tx, keyID, hash string, expiresAt *time.Time) error {
 	if _, err := tx.ExecContext(ctx, `UPDATE api_keys SET secret_hash = ?, expires_at = ? WHERE key_id = ?`,
-		hash, nanos(expiresAt), keyID); err != nil {
+		hash, store.Nanos(expiresAt), keyID); err != nil {
 		return fmt.Errorf("refresh API key %s: %w", keyID, err)
 	}
 	return nil

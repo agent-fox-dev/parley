@@ -21,7 +21,6 @@ import (
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/workspace"
-	"github.com/google/uuid"
 )
 
 // The values of a profile's hub_access.
@@ -317,7 +316,7 @@ func (s *Service) checkSession(ctx context.Context, in CreateInput, id *string) 
 	}
 	unknown := server.NewError("unknown_session", http.StatusBadRequest, fmt.Sprintf("session_id: no session %q", *id))
 	l := s.sessionLinker()
-	if l == nil || !isUUID(*id) {
+	if l == nil || !server.IsUUID(*id) {
 		return nil, unknown
 	}
 	got, err := l.Check(ctx, in.Caller, *id, in.Workspace.Slug)
@@ -328,13 +327,6 @@ func (s *Service) checkSession(ctx context.Context, in CreateInput, id *string) 
 		return nil, fmt.Errorf("check session %q: %w", *id, err)
 	}
 	return &got, nil
-}
-
-// isUUID reports whether s is a UUID in its 36-character form, the one form
-// a session id is written in.
-func isUUID(s string) bool {
-	_, err := uuid.Parse(s)
-	return len(s) == 36 && err == nil
 }
 
 // newRecord is the record of the sandbox req asks the caller for on in's

@@ -192,12 +192,8 @@ func (c *Cmd) Start() error {
 	} else if child[2], err = c.childOutput(c.Stderr, nil, &closeAfterStart); err != nil {
 		return fail(err)
 	}
-	env := c.Env
-	if env == nil {
-		env = c.Environ()
-	}
 	group := c.SysProcAttr != nil && c.SysProcAttr.Setpgid
-	pid, err := spawn(c.Path, c.Args, dedupEnv(env), c.Dir, child, group)
+	pid, err := spawn(c.Path, c.Args, c.Environ(), c.Dir, child, group)
 	if err != nil {
 		return fail(&fs.PathError{Op: "fork/exec", Path: c.Path, Err: err})
 	}
@@ -409,32 +405,6 @@ func sameWriter(a, b io.Writer) (same bool) {
 		}
 	}()
 	return a == b
-}
-
-// dedupEnv is env with each variable once, at its last value, as os/exec
-// passes an environment on.
-func dedupEnv(env []string) []string {
-	seen := make(map[string]bool, len(env))
-	out := make([]string, 0, len(env))
-	for i := len(env) - 1; i >= 0; i-- {
-		kv := env[i]
-		key := kv
-		for j := 1; j < len(kv); j++ {
-			if kv[j] == '=' {
-				key = kv[:j]
-				break
-			}
-		}
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		out = append(out, kv)
-	}
-	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
-		out[i], out[j] = out[j], out[i]
-	}
-	return out
 }
 
 // limitedBuffer keeps the first limit bytes written to it.

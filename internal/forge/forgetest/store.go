@@ -109,19 +109,6 @@ func (f *Fake) Issue(repo string, number int64) (Issue, bool) {
 	return c, true
 }
 
-// AddLabel stores label in the repository repo, in place of the one with
-// its name.
-func (f *Fake) AddLabel(repo string, label Label) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	r := f.repository(repo)
-	if i := r.label(label.Name); i >= 0 {
-		r.labels[i] = label
-		return
-	}
-	r.labels = append(r.labels, label)
-}
-
 // SetLabels makes labels the labels of the repository repo, in place of
 // those it has: none when no label is given.
 func (f *Fake) SetLabels(repo string, labels ...Label) {

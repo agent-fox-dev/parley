@@ -34,7 +34,7 @@ func TestFollow_BuildsAWorkspaceOnceItHasItsRepository(t *testing.T) {
 	}
 
 	// No further request: the clone itself asks for the build.
-	eventually(t, "the index of the cloned workspace", func() bool { return w.record(t, "demo").IndexedSHA != "" })
+	hubtest.Eventually(t, "the index of the cloned workspace", func() bool { return w.record(t, "demo").IndexedSHA != "" })
 	if rec := w.reaches(t, "demo", origin.Head("main")); rec.FilesIndexed == 0 {
 		t.Errorf("the record = %+v, want the files of the origin's main indexed", rec)
 	}
@@ -54,7 +54,7 @@ func TestFollow_KeepsOnePendingBuildBesideTheRunningOne(t *testing.T) {
 	b := w.commit(t, "demo", "main", map[string]string{"b.go": "package a\n"})
 	c := w.commit(t, "demo", "main", map[string]string{"c.go": "package a\n"})
 	d := w.commit(t, "demo", "main", map[string]string{"d.go": "package a\n"})
-	eventually(t, "one build running and one waiting", func() bool {
+	hubtest.Eventually(t, "one build running and one waiting", func() bool {
 		return slices.Equal(w.jobs(t, "demo"), []string{"running", "queued"})
 	})
 	if rec := w.record(t, "demo"); rec.IndexedSHA != "" {

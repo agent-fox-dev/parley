@@ -12,9 +12,10 @@ import (
 	"testing"
 	"time"
 
+	"uuid"
+
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/identity"
-	"github.com/google/uuid"
 )
 
 // The scopes of a PAT the webhook routes ask for.
@@ -419,7 +420,7 @@ func TestAccess_LetsOnlyTheOwnerAndTheAdminTokenUseTheRoutes(t *testing.T) {
 				t.Errorf("%s with id abc = %d %s, want 400 invalid_request", r.name, status, raw)
 			}
 		}
-		unknown := routeCalls(demo, uuid.NewString(), delivery, nil)[2:]
+		unknown := routeCalls(demo, uuid.NewV4().String(), delivery, nil)[2:]
 		foreign := routeCalls(demo, elsewhere, delivery, nil)[2:]
 		for i := range unknown {
 			s1, b1 := w.Call(t, unknown[i].method, unknown[i].path, w.ownerKey, unknown[i].body)

@@ -7,6 +7,8 @@ import (
 	"slices"
 	"sync"
 	"time"
+
+	"github.com/agent-fox-dev/parley/internal/store"
 )
 
 // The store has no hook that runs after a commit, so the component learns of
@@ -301,7 +303,7 @@ func (c *Component) readCommitted(ctx context.Context, from int64, wantRecords b
 	var last int64
 	var recs []Record
 	counts := map[string]int64{}
-	err := c.snapshot(ctx, func(tx *sql.Tx) error {
+	err := store.ReadTx(ctx, c.deps.Store.Main(), func(tx *sql.Tx) error {
 		if err := tx.QueryRowContext(ctx, `SELECT last_seq FROM hub_event_seq`).Scan(&last); err != nil {
 			return err
 		}

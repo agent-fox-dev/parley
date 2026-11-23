@@ -15,7 +15,6 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
-	"uuid"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/event"
@@ -156,7 +155,7 @@ var createMembers = []createMember{
 	}},
 	{"session_id", func(_ *Component, req *createRequest, raw json.RawMessage, _ time.Time) error {
 		return readString(raw, &req.SessionID, func(s string) error {
-			if !isUUID(s) {
+			if !server.IsUUID(s) {
 				return errors.New("must be a UUID")
 			}
 			return nil
@@ -169,14 +168,6 @@ var createMembers = []createMember{
 		req.Sandbox = raw
 		return nil
 	}},
-}
-
-// isUUID reports whether s is a UUID in its 36-character form, groups of
-// 8, 4, 4, 4 and 12 hexadecimal digits joined by hyphens, the one form a
-// session id is written in.
-func isUUID(s string) bool {
-	_, err := uuid.Parse(s)
-	return len(s) == 36 && err == nil
 }
 
 // readString reads the member raw, a string, into dst, and judges it by

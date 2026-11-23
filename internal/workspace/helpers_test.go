@@ -26,7 +26,6 @@ import (
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/secret"
-	"github.com/agent-fox-dev/parley/internal/spawn"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -789,17 +788,6 @@ func (l *runLog) snapshot() (started, finished []string, most int) {
 	return append([]string(nil), l.started...), append([]string(nil), l.finished...), l.most
 }
 
-// eventually waits up to 10 s for cond to hold and fails the test, naming
-// what, when it does not.
-func eventually(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	for deadline := time.Now().Add(10 * time.Second); !cond(); time.Sleep(5 * time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatalf("%s: not within 10 s", what)
-		}
-	}
-}
-
 // insertRecord stores a repository workspace of the user u with status,
 // origin url and creation time created, as the store holds it after a
 // create.
@@ -1060,17 +1048,11 @@ func (h *swapHook) count(branch string) int {
 // goroutine, and the output is "" then.
 func gitFrom(t *testing.T, dir, stdin string, args ...string) string {
 	t.Helper()
-	cmd := spawn.Command("git", args...)
-	cmd.Env = append(os.Environ(), "GIT_DIR="+dir, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull,
-		"GIT_AUTHOR_NAME=Writer", "GIT_AUTHOR_EMAIL=writer@example.invalid",
-		"GIT_COMMITTER_NAME=Writer", "GIT_COMMITTER_EMAIL=writer@example.invalid")
-	cmd.Stdin = strings.NewReader(stdin)
-	out, err := cmd.CombinedOutput()
+	out, err := gitrepotest.Run(dir, stdin, args...)
 	if err != nil {
-		t.Errorf("git %v in %s: %v: %s", args, dir, err, out)
-		return ""
+		t.Errorf("in %s: %v", dir, err)
 	}
-	return strings.TrimSpace(string(out))
+	return out
 }
 
 // ref is the object id of the ref name of the repository at dir, "" when
@@ -1694,7 +1676,7 @@ func (w *world) checkEvent(t *testing.T, typ string, n int, slug, actorType, act
 func (w *world) cloned(t *testing.T, slug string) workspace.Workspace {
 	t.Helper()
 	var rec workspace.Workspace
-	eventually(t, "the clone work of "+slug+" ends", func() bool {
+	hubtest.Eventually(t, "the clone work of "+slug+" ends", func() bool {
 		rec, _ = w.workspace(t, slug)
 		return rec.Status == workspace.StatusReady || rec.Status == workspace.StatusFailed
 	})

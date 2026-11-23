@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/agent-fox-dev/parley/internal/server"
 )
 
 // RunOf is the run id of the session id, for the record of what is done in
@@ -14,7 +16,7 @@ import (
 // opened without a run id: neither is an error. Ids are compared in lower
 // case.
 func (c *Component) RunOf(ctx context.Context, id string) (runID string, found bool, err error) {
-	if !isUUID(id) {
+	if !server.IsUUID(id) {
 		return "", false, nil
 	}
 	id = strings.ToLower(id)

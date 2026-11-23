@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/workspace"
@@ -186,7 +188,7 @@ func TestSyncRoute_CompletesAfterDisconnect(t *testing.T) {
 	s.postSyncAndLeave(t, s.uKey, syncSlug, started)
 	close(release)
 
-	eventually(t, "the sync records its completion", func() bool {
+	hubtest.Eventually(t, "the sync records its completion", func() bool {
 		rec, _ := s.workspace(t, syncSlug)
 		return rec.LastSyncAt != nil
 	})

@@ -44,7 +44,7 @@ func (c *Component) list(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	if f.SessionID, err = oneParam(query, "session_id", isUUID, "a UUID"); err != nil {
+	if f.SessionID, err = oneParam(query, "session_id", server.IsUUID, "a UUID"); err != nil {
 		return err
 	}
 	var pos Position

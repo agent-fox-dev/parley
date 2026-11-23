@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/agent-fox-dev/parley/internal/server"
 )
 
 // ErrUnknownSession is the refusal of a session id that names no session,
@@ -133,7 +135,7 @@ func (c *Component) Record(ctx context.Context, tx *sql.Tx, l Link) error {
 	if err := l.validate(); err != nil {
 		return err
 	}
-	if !isUUID(l.SessionID) {
+	if !server.IsUUID(l.SessionID) {
 		return ErrUnknownSession
 	}
 	l.SessionID = strings.ToLower(l.SessionID)

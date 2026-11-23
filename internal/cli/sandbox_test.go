@@ -25,6 +25,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+
 	"golang.org/x/net/websocket"
 )
 
@@ -785,18 +787,6 @@ func compactLines(t *testing.T, lines []string) string {
 	return out.String()
 }
 
-// eventually fails the test unless cond holds within 5 seconds.
-func eventually(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("waited 5 s for %s", what)
-		}
-		time.Sleep(time.Millisecond)
-	}
-}
-
 // background runs parley with args and opts in a goroutine; the channel
 // gives its exit status.
 func background(opts options, stdout, stderr io.Writer, args ...string) <-chan int {
@@ -898,7 +888,7 @@ func TestSandboxLogs_PrintsEachLineAsOneCompactJSONObject(t *testing.T) {
 		var stdout, stderr syncBuffer
 
 		done := background(opts, &stdout, &stderr, onHub(hub.URL, "sandbox", "logs", "demo", "sbx_1", "--follow", "--tail", "1")...)
-		eventually(t, "the first line", func() bool { return len(nonEmptyLines(stdout.String())) == 1 })
+		hubtest.Eventually(t, "the first line", func() bool { return len(nonEmptyLines(stdout.String())) == 1 })
 		close(stored)
 		code := exitOf(t, done)
 
@@ -1026,7 +1016,7 @@ func TestSandboxShell_RelaysATerminalOverAWebSocket(t *testing.T) {
 		if _, err := typed.Write([]byte("ls\n")); err != nil {
 			t.Fatal(err)
 		}
-		eventually(t, "the echo on stdout", func() bool { return stdout.String() == "ls\n" })
+		hubtest.Eventually(t, "the echo on stdout", func() bool { return stdout.String() == "ls\n" })
 		close(term.exit)
 
 		if code := exitOf(t, done); code != 0 || stderr.String() != "" {

@@ -6,7 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
-	"uuid"
+
+	"github.com/agent-fox-dev/parley/internal/server"
 )
 
 // UserBySelector returns the user the selector sel names, or ErrNotFound.
@@ -16,23 +17,13 @@ import (
 // letter case included.
 func UserBySelector(ctx context.Context, q Querier, sel string) (User, error) {
 	switch {
-	case isUUID(sel):
+	case server.IsUUID(sel):
 		return UserByID(ctx, q, sel)
 	case strings.Contains(sel, "@"):
 		return userWhere(ctx, q, `email = ?`, sel)
 	default:
 		return UserByUsername(ctx, q, sel)
 	}
-}
-
-// isUUID reports whether s is a UUID in its hyphenated form, the form of
-// every id the hub draws.
-func isUUID(s string) bool {
-	if len(s) != 36 {
-		return false
-	}
-	_, err := uuid.Parse(s)
-	return err == nil
 }
 
 // userPosition is the position of a user in the list of users: newest

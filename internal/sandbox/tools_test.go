@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
@@ -255,7 +257,7 @@ func TestToolList_ChangesNothingAndNeedsNoPlaceAmongTheCommands(t *testing.T) {
 	h.cmds.set("block", h.cmds.blocking("", ""))
 	id := h.tooled(t, nil)
 	running := h.execing(t.Context(), id, map[string]any{"command": []string{"block"}}, nil)
-	eventually(t, "the command to wait", func() bool { _, _, waiting, _ := h.cmds.counts(); return waiting == 1 })
+	hubtest.Eventually(t, "the command to wait", func() bool { _, _, waiting, _ := h.cmds.counts(); return waiting == 1 })
 	before := storedRecord(t, h.Hub, id).LastActivityAt
 	h.clock.Advance(5 * 1e9)
 

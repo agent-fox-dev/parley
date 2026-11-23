@@ -90,7 +90,7 @@ func (s *Stream) read() {
 			if kind == "hub_event" {
 				e := Event{Seq: id, At: time.Now()}
 				_ = json.Unmarshal([]byte(data), &e.Record)
-				e.Type = str(e.Record["type"])
+				e.Type = Str(e.Record["type"])
 				s.mu.Lock()
 				s.events = append(s.events, e)
 				s.mu.Unlock()

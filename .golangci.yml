@@ -28,7 +28,7 @@ linters:
         path: "_test\\.go"
         source: "\\.Close\\(\\)"
       # Repository-specific: the test code predates the linter and ignores
-      # errors and leaves helpers unused in many places. Production code is held
-      # to the full rule set above.
-      - linters: [errcheck, unused]
+      # errors in many places. Production code is held to the full rule set
+      # above.
+      - linters: [errcheck]
         path: "_test\\.go"

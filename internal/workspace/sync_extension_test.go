@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
@@ -141,7 +143,7 @@ func TestSyncExtension_StagesRunInOrder(t *testing.T) {
 	})
 	s.postSyncAndLeave(t, s.uKey, syncSlug, started)
 	close(release)
-	eventually(t, "the sync completes after the disconnect", func() bool { return len(s.eventsOf(t, syncEvent)) == 2 })
+	hubtest.Eventually(t, "the sync completes after the disconnect", func() bool { return len(s.eventsOf(t, syncEvent)) == 2 })
 	calls, stages = ext.recorded()
 	if !slices.Equal(stages, []string{"first", "second", "first", "second"}) {
 		t.Fatalf("stages called %v, want [first second] for each sync", stages)

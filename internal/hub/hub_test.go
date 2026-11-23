@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/hub"
@@ -54,7 +56,7 @@ func TestRun_RunsTheStartStagesInOrderAndListensLast(t *testing.T) {
 	}
 	r := runHub(t, hub.Options{WorkDir: dir, Compose: compose})
 
-	eventually(t, "the second start hook runs", func() bool { return len(log.calls()) == 2 })
+	hubtest.Eventually(t, "the second start hook runs", func() bool { return len(log.calls()) == 2 })
 	if conn, err := net.Dial("tcp", addr); err == nil {
 		conn.Close()
 		t.Errorf("a connection to %s was accepted while a start hook was running", addr)
@@ -66,7 +68,7 @@ func TestRun_RunsTheStartStagesInOrderAndListensLast(t *testing.T) {
 	close(releaseHook)
 	r.listening = r.stderr.waitForMsg(t, "listening")
 	r.addr = r.listening["addr"].(string)
-	eventually(t, "the first maintenance pass starts", func() bool { return len(log.calls()) >= 3 })
+	hubtest.Eventually(t, "the first maintenance pass starts", func() bool { return len(log.calls()) >= 3 })
 	if got := log.calls(); !slices.Equal(got[:3], []string{"h1", "h2", "pass"}) {
 		t.Errorf("calls = %v, want h1, h2, pass first", got)
 	}
@@ -491,7 +493,7 @@ func TestRun_LogsAFailingMaintenanceTaskAtEveryPassAndKeepsServing(t *testing.T)
 		}
 		return errs
 	}
-	eventually(t, "three passes with a failing task", func() bool {
+	hubtest.Eventually(t, "three passes with a failing task", func() bool {
 		return rows("later_pass") >= 3 && rows("recorded_pass") >= 3 && len(failures()) >= 3
 	})
 

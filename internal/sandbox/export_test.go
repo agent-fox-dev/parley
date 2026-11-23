@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
@@ -70,7 +71,20 @@ func DecisionTurns(s *Service, id string) int {
 
 // PolicyFollowers returns the ids of the sandboxes whose policy log the
 // collector c follows: those of its followers that have not stopped.
-func PolicyFollowers(c *PolicyCollector) []string { return c.following() }
+func PolicyFollowers(c *PolicyCollector) []string {
+	c.pass.Lock()
+	defer c.pass.Unlock()
+	var out []string
+	for id, f := range c.followers {
+		select {
+		case <-f.done:
+		default:
+			out = append(out, id)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
 
 // ReportDenial stores the denial e of the sandbox rec, with its log taken
 // up to e, and writes its event when it is the sandbox's first of its

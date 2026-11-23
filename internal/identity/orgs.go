@@ -9,6 +9,8 @@ import (
 	"time"
 	"uuid"
 
+	"github.com/agent-fox-dev/parley/internal/server"
+
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 )
 
@@ -120,7 +122,7 @@ ORDER BY created_at, user_id`, orgID)
 // slug. The comparison is exact, letter case included, so an org's name
 // never names it.
 func OrgBySelector(ctx context.Context, q Querier, sel string) (Org, error) {
-	if isUUID(sel) {
+	if server.IsUUID(sel) {
 		return OrgByID(ctx, q, sel)
 	}
 	return OrgBySlug(ctx, q, sel)

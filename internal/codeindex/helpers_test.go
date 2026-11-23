@@ -102,19 +102,7 @@ func (w *world) pass(t *testing.T) {
 	// The pass under way may have run the task before the call; the one
 	// after it has not.
 	want := w.passes.Load() + 2
-	eventually(t, "two more maintenance passes", func() bool { return w.passes.Load() >= want })
-}
-
-// eventually waits up to 20 s for cond.
-func eventually(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("waited 20 s for %s", what)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	hubtest.Eventually(t, "two more maintenance passes", func() bool { return w.passes.Load() >= want })
 }
 
 // addWorkspace adds the ready repository workspace slug of the owner in
@@ -277,7 +265,7 @@ func (w *world) indexed(t *testing.T, slug string) codeindex.Record {
 // and none of its builds is pending, and returns its record.
 func (w *world) reaches(t *testing.T, slug, sha string) codeindex.Record {
 	t.Helper()
-	eventually(t, "the index of "+slug+" to hold "+sha, func() bool {
+	hubtest.Eventually(t, "the index of "+slug+" to hold "+sha, func() bool {
 		return w.record(t, slug).IndexedSHA == sha && len(w.jobs(t, slug)) == 0
 	})
 	return w.record(t, slug)

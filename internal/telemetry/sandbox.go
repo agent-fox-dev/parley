@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"time"
+	"uuid"
 
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 )
@@ -182,7 +183,7 @@ func (c *Component) recordSandboxUse(ctx context.Context, u SandboxUse, op Sandb
 	now := c.deps.Now().UTC().Truncate(time.Second)
 	e := runEvent{
 		head: head{
-			ID: newID(), Workspace: u.Workspace, RunID: runID,
+			ID: uuid.NewV4().String(), Workspace: u.Workspace, RunID: runID,
 			Timestamp: clientTime(u.StartedAt.UTC().Truncate(time.Microsecond)), IngestedAt: timefmt.Time(now),
 		},
 		EventType: op.eventType(),

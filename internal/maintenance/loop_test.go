@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+
 	"github.com/agent-fox-dev/parley/internal/maintenance"
 )
 
@@ -33,10 +35,10 @@ func TestLoop_RunsAPassAtOnceAndOneAtEachTick(t *testing.T) {
 	ticks := make(chan time.Time)
 	startLoop(t, maintenance.New(reg, discardLogger()), ticks)
 
-	eventually(t, "the first pass runs without a tick", func() bool { return count.Load() == 1 })
+	hubtest.Eventually(t, "the first pass runs without a tick", func() bool { return count.Load() == 1 })
 	for want := int32(2); want <= 3; want++ {
 		sendTick(t, ticks)
-		eventually(t, "a tick starts one pass", func() bool { return count.Load() == want })
+		hubtest.Eventually(t, "a tick starts one pass", func() bool { return count.Load() == want })
 	}
 	if maintenance.Interval != time.Hour {
 		t.Errorf("Interval = %v, want 1h", maintenance.Interval)
@@ -109,7 +111,7 @@ func TestLoop_LogsAFailingTaskAndGoesOn(t *testing.T) {
 			ticks := make(chan time.Time)
 			startLoop(t, maintenance.New(reg, slog.New(slog.NewJSONHandler(&out, nil))), ticks)
 
-			eventually(t, "the first pass ends", func() bool { return len(log.calls()) == 3 })
+			hubtest.Eventually(t, "the first pass ends", func() bool { return len(log.calls()) == 3 })
 			if got := log.calls(); !slices.Equal(got, []string{"retention", "claim_cleanup", "fork_expiry"}) {
 				t.Errorf("calls = %v, want [retention claim_cleanup fork_expiry]", got)
 			}
@@ -130,7 +132,7 @@ func TestLoop_LogsAFailingTaskAndGoesOn(t *testing.T) {
 			}
 
 			sendTick(t, ticks)
-			eventually(t, "the next pass calls the failing task again", func() bool {
+			hubtest.Eventually(t, "the next pass calls the failing task again", func() bool {
 				return countOf(log.calls(), "claim_cleanup") == 2
 			})
 		})
@@ -161,7 +163,7 @@ func TestLoop_DropsATickThatArrivesWhileAPassRuns(t *testing.T) {
 	ticks := make(chan time.Time)
 	startLoop(t, maintenance.New(reg, discardLogger()), ticks)
 
-	eventually(t, "the first pass starts", func() bool { return calls.Load() == 1 })
+	hubtest.Eventually(t, "the first pass starts", func() bool { return calls.Load() == 1 })
 	sendTick(t, ticks)
 	sendTick(t, ticks)
 	close(release)
@@ -170,7 +172,7 @@ func TestLoop_DropsATickThatArrivesWhileAPassRuns(t *testing.T) {
 		t.Errorf("calls after ticks during the pass = %d, want 1", n)
 	}
 	sendTick(t, ticks)
-	eventually(t, "a tick after the pass starts the next", func() bool { return calls.Load() == 2 })
+	hubtest.Eventually(t, "a tick after the pass starts the next", func() bool { return calls.Load() == 2 })
 	if h := highest.Load(); h != 1 {
 		t.Errorf("highest number of concurrent calls = %d, want 1", h)
 	}
@@ -382,16 +384,4 @@ func (b *syncBuffer) recordsAt(t *testing.T, level string) []map[string]any {
 		}
 	}
 	return recs
-}
-
-// eventually polls cond every few milliseconds for up to 5 s.
-func eventually(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("%s: not within 5 s", what)
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
 }

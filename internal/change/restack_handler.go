@@ -83,7 +83,7 @@ func (c *Component) restackRoute(w http.ResponseWriter, r *http.Request) error {
 			return err
 		}
 		var body map[string]json.RawMessage
-		if err := decodeOptional(r, &body); err != nil {
+		if err := server.DecodeOptionalJSON(r, &body); err != nil {
 			return err
 		}
 		named, err := member[string](body, "session_id", "a string")

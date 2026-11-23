@@ -16,13 +16,16 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/agent-fox-dev/parley/internal/store"
+
+	"uuid"
+
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
-	"github.com/google/uuid"
 )
 
 // The types of the events the changes of a subscription write.
@@ -331,7 +334,7 @@ func (c *Component) create(w http.ResponseWriter, r *http.Request, q request) er
 	}
 	now := c.deps.Clock.Now().UTC().Truncate(time.Second)
 	sub := Subscription{
-		ID: uuid.NewString(), Workspace: slug, URL: in.rawURL, Types: in.types, IncludeForks: in.includeForks,
+		ID: uuid.NewV4().String(), Workspace: slug, URL: in.rawURL, Types: in.types, IncludeForks: in.includeForks,
 		Description: in.description, State: StateActive, CreatedBy: createdBy(caller), CreatedAt: now, UpdatedAt: now,
 	}
 	ctx := r.Context()
@@ -804,7 +807,7 @@ func scanSubscription(row interface{ Scan(dest ...any) error }) (Subscription, e
 		return Subscription{}, fmt.Errorf("the types of event webhook %s: %w", s.ID, err)
 	}
 	s.CreatedAt, s.UpdatedAt = time.Unix(0, createdAt).UTC(), time.Unix(0, updatedAt).UTC()
-	s.LastDeliveryAt, s.FailingSince = timeOf(lastDelivery), timeOf(failingSince)
+	s.LastDeliveryAt, s.FailingSince = store.TimeOf(lastDelivery), store.TimeOf(failingSince)
 	if createdBy.Valid {
 		s.CreatedBy = &createdBy.String
 	}
@@ -819,12 +822,4 @@ func nanosOrNil(t *time.Time) any {
 		return nil
 	}
 	return t.UnixNano()
-}
-
-func timeOf(n sql.NullInt64) *time.Time {
-	if !n.Valid {
-		return nil
-	}
-	t := time.Unix(0, n.Int64).UTC()
-	return &t
 }

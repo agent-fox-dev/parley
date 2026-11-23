@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 )
@@ -107,7 +109,7 @@ func TestGet_WaitFor(t *testing.T) {
 			before := h.timers.created(tc.wait)
 			answered := h.getting(ctx, sandboxPath("demo", id)+"?"+tc.query, h.key)
 			if tc.held {
-				eventually(t, "the request to wait", func() bool { return h.timers.created(tc.wait) > before })
+				hubtest.Eventually(t, "the request to wait", func() bool { return h.timers.created(tc.wait) > before })
 				select {
 				case a := <-answered:
 					t.Fatalf("answered %d %s before the wait ended", a.status, a.body)
@@ -139,7 +141,7 @@ func TestGet_WaitFor(t *testing.T) {
 		other := h.seedRecord(t, "demo", sandbox.StateReady, nil)
 		before := h.timers.created(30 * time.Second)
 		answered := h.getting(ctx, sandboxPath("demo", id)+"?wait_for=ready&wait=30", h.key)
-		eventually(t, "the request to wait", func() bool { return h.timers.created(30*time.Second) > before })
+		hubtest.Eventually(t, "the request to wait", func() bool { return h.timers.created(30*time.Second) > before })
 		// A change that notified no read: the move of the other sandbox
 		// notifies them.
 		if _, err := h.Store.Main().Exec(`UPDATE sandboxes SET state = ? WHERE id = ?`, sandbox.StateReady, id); err != nil {
@@ -183,12 +185,12 @@ func TestGet_WaitFor(t *testing.T) {
 		const wait = 45 * time.Second
 		cctx, cancel := context.WithCancel(ctx)
 		answered := h.getting(cctx, sandboxPath("demo", id)+"?wait_for=ready&wait=45", h.key)
-		eventually(t, "the request to wait", func() bool { return h.timers.live(wait) == 1 })
+		hubtest.Eventually(t, "the request to wait", func() bool { return h.timers.live(wait) == 1 })
 		cancel()
 		if a := <-answered; a.status != 0 {
 			t.Errorf("a cancelled request got %d %s", a.status, a.body)
 		}
-		eventually(t, "the handler to stop waiting once its request was cancelled", func() bool { return h.timers.live(wait) == 0 })
+		hubtest.Eventually(t, "the handler to stop waiting once its request was cancelled", func() bool { return h.timers.live(wait) == 0 })
 	})
 }
 
@@ -208,7 +210,7 @@ func TestGet_RefusesBadWait(t *testing.T) {
 	decoded(t, h.call(t, http.MethodGet, sandboxPath("demo", id)+"?wait_for=ready&wait=60", h.key, nil), http.StatusOK)
 	before := h.timers.created(time.Second)
 	answered := h.getting(context.Background(), sandboxPath("demo", id)+"?wait_for=ended&wait=1", h.key)
-	eventually(t, "the request to wait", func() bool { return h.timers.created(time.Second) > before })
+	hubtest.Eventually(t, "the request to wait", func() bool { return h.timers.created(time.Second) > before })
 	h.clock.Advance(time.Second)
 	select {
 	case a := <-answered:

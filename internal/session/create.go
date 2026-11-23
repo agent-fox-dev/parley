@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+	"uuid"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/identity"
@@ -148,7 +149,7 @@ func openInput(body map[string]json.RawMessage) (row, error) {
 		return row{}, err
 	}
 	if in.ID == "" {
-		in.ID = newID()
+		in.ID = uuid.NewV4().String()
 	}
 	if in.RunID, err = runIDOf(body); err != nil {
 		return row{}, err

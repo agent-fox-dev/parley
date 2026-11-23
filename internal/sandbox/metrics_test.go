@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
 )
@@ -56,7 +58,7 @@ func TestMetrics_CreatesAndStates(t *testing.T) {
 
 	// A provisioning is counted once its ending transaction has committed,
 	// so the record can show the state before the count is made.
-	eventually(t, "the three provisionings to be counted", func() bool {
+	hubtest.Eventually(t, "the three provisionings to be counted", func() bool {
 		var n float64
 		for _, v := range h.rec.values(sandbox.CreatesMetric) {
 			n += v
@@ -89,7 +91,7 @@ func TestMetrics_CountsToolCallsByToolAndOutcome(t *testing.T) {
 	}
 	_, waiting, _ := h.held()
 	answered := h.sending(context.Background(), http.MethodPost, toolPath(id, "read_file"), h.key, map[string]any{"timeout": "10s"}, nil)
-	eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
+	hubtest.Eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
 	h.clock.Advance(10 * time.Second)
 	receive(t, answered)
 

@@ -232,7 +232,7 @@ func RecordsOwnedOrIn(ctx context.Context, q Querier, ownerID string, orgIDs []s
 	if len(orgIDs) > 0 {
 		where += ` OR org_id IN (` + placeholders(len(orgIDs)) + `)`
 	}
-	return listRecords(ctx, q, where, append([]any{ownerID}, anys(orgIDs)...))
+	return listRecords(ctx, q, where, append([]any{ownerID}, store.Args(orgIDs)...))
 }
 
 // ForksOf lists, by slug, the forks whose parent is one of parents. No
@@ -241,7 +241,7 @@ func ForksOf(ctx context.Context, q Querier, parents []string) ([]Record, error)
 	if len(parents) == 0 {
 		return nil, nil
 	}
-	return listRecords(ctx, q, `parent_slug IN (`+placeholders(len(parents))+`)`, anys(parents))
+	return listRecords(ctx, q, `parent_slug IN (`+placeholders(len(parents))+`)`, store.Args(parents))
 }
 
 // listRecords reads the records that match where, ordered by slug.
@@ -268,15 +268,6 @@ func listRecords(ctx context.Context, q Querier, where string, args []any) ([]Re
 // placeholders returns n comma-separated parameters.
 func placeholders(n int) string {
 	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
-}
-
-// anys converts ss to query arguments.
-func anys(ss []string) []any {
-	out := make([]any, len(ss))
-	for i, s := range ss {
-		out[i] = s
-	}
-	return out
 }
 
 // RecordReader is what the rule reads records through, so that a test can

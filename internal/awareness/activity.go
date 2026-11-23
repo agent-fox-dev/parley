@@ -364,7 +364,7 @@ func activityQueryOf(v url.Values, now time.Time) (ActivityQuery, error) {
 		}
 	}
 	if v.Has("exclude_change") {
-		n, ok := positive(v.Get("exclude_change"))
+		n, ok := server.Positive(v.Get("exclude_change"))
 		if !ok {
 			return ActivityQuery{}, server.InvalidRequest("exclude_change must be a positive integer")
 		}

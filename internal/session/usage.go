@@ -11,6 +11,9 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+	"uuid"
+
+	"github.com/agent-fox-dev/parley/internal/store"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/server"
@@ -158,7 +161,7 @@ func usageInput(body map[string]json.RawMessage) (Usage, error) {
 		return Usage{}, err
 	}
 	if u.ID == "" {
-		u.ID = newID()
+		u.ID = uuid.NewV4().String()
 	}
 	counts := []struct {
 		name string
@@ -298,7 +301,7 @@ func (c *Component) usageRoute(w http.ResponseWriter, r *http.Request) error {
 	// while reports arrive.
 	var items []Usage
 	var totals TokenSummary
-	err = snapshot(ctx, c.deps.Store.Main(), func(tx *sql.Tx) error {
+	err = store.ReadTx(ctx, c.deps.Store.Main(), func(tx *sql.Tx) error {
 		var err error
 		if items, err = listUsage(ctx, tx, s.ID, ascending, continuing, after, page.Limit+1); err != nil {
 			return err

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
-	"strings"
 
 	"github.com/agent-fox-dev/parley/internal/server"
 )
@@ -71,7 +70,7 @@ func (c *Component) overlapsRoute(w http.ResponseWriter, r *http.Request) error 
 		return err
 	}
 	workspace := actedOn(r)
-	number, ok := positive(server.Param(r, "number"))
+	number, ok := server.Positive(server.Param(r, "number"))
 	if !ok {
 		return server.NewError(errChangeNotFound, http.StatusNotFound, "no such change")
 	}
@@ -102,13 +101,3 @@ func positionOf(e Entry) overlapPosition {
 // errChangeNotFound is the error type of a :number that names no change of
 // the workspace a route acts on.
 const errChangeNotFound = "change_not_found"
-
-// positive is s as a positive integer in decimal digits, and false for
-// anything else, such as 0, -1, +1 or 1.5.
-func positive(s string) (int64, bool) {
-	if s == "" || strings.Trim(s, "0123456789") != "" {
-		return 0, false
-	}
-	n, err := strconv.ParseInt(s, 10, 64)
-	return n, err == nil && n > 0
-}

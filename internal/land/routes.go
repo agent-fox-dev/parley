@@ -5,13 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
-	"uuid"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/change"
@@ -58,23 +56,6 @@ func errLandNotFound(workspace, id string) error {
 	return server.NewError("land_not_found", http.StatusNotFound, fmt.Sprintf("%s has no land attempt %q", workspace, id))
 }
 
-// positive is s as a positive integer in decimal digits, and false for
-// anything else, such as 0, -1, +1 or 1.5.
-func positive(s string) (int64, bool) {
-	if s == "" || strings.Trim(s, "0123456789") != "" {
-		return 0, false
-	}
-	n, err := strconv.ParseInt(s, 10, 64)
-	return n, err == nil && n > 0
-}
-
-// isUUID reports whether s is a UUID in its 36-character form, the one
-// form an attempt's id is written in.
-func isUUID(s string) bool {
-	_, err := uuid.Parse(s)
-	return len(s) == 36 && err == nil
-}
-
 // secondsOf is created_at, stored in nanoseconds, at the resolution the
 // attempt object shows it, so that the lists' order is the order of the
 // values the caller sees, and ties among them go by id.
@@ -97,7 +78,7 @@ func (c *Component) changeLands(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	slug := server.Param(r, "slug")
-	number, ok := positive(server.Param(r, "number"))
+	number, ok := server.Positive(server.Param(r, "number"))
 	if !ok {
 		return change.ErrChangeNotFound
 	}
@@ -173,7 +154,7 @@ func (c *Component) writeList(w http.ResponseWriter, r *http.Request, page serve
 // token is bound to, calling on the fork's parent, is 403 token_bound.
 func (c *Component) getLand(w http.ResponseWriter, r *http.Request) error {
 	slug, id := server.Param(r, "slug"), server.Param(r, "id")
-	if !isUUID(id) {
+	if !server.IsUUID(id) {
 		return errLandNotFound(slug, id)
 	}
 	a, found, err := readAttempt(r.Context(), c.deps.Store.Main(), slug, id)
@@ -223,16 +204,9 @@ func parseLand(r *http.Request) (landRequest, error) {
 		}
 		req.wait = time.Duration(n) * time.Second
 	}
-	raw, err := io.ReadAll(r.Body)
-	if err != nil {
-		return req, server.InvalidRequest("request body could not be read")
-	}
 	body := map[string]json.RawMessage{}
-	if len(bytes.TrimSpace(raw)) > 0 {
-		r.Body = io.NopCloser(bytes.NewReader(raw))
-		if err := server.DecodeJSON(r, &body); err != nil {
-			return req, err
-		}
+	if err := server.DecodeOptionalJSON(r, &body); err != nil {
+		return req, err
 	}
 	for name, raw := range body {
 		// A null is no value of any member's type.
@@ -283,7 +257,7 @@ func parseLand(r *http.Request) (landRequest, error) {
 func (c *Component) landRoute(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	slug := server.Param(r, "slug")
-	number, ok := positive(server.Param(r, "number"))
+	number, ok := server.Positive(server.Param(r, "number"))
 	if !ok {
 		return change.ErrChangeNotFound
 	}

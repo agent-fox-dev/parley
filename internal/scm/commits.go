@@ -3,7 +3,8 @@ package scm
 import (
 	"context"
 	"net/http"
-	"time"
+
+	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/server"
@@ -199,5 +200,5 @@ func (c *Component) commitObjects(ctx context.Context, rd *read, commits []gitre
 }
 
 func newSignature(s gitrepo.Signature) signature {
-	return signature{Name: s.Name, Email: s.Email, Time: s.Time.UTC().Format(time.RFC3339)}
+	return signature{Name: s.Name, Email: s.Email, Time: timefmt.Format(s.Time)}
 }

@@ -197,7 +197,7 @@ func (h *Hub) RegisterWithin(limit time.Duration, owner *User, slug string, o *O
 	}
 	h.Call(http.MethodPost, "/api/v1/workspaces", owner.Key, body).Want(h.t, http.StatusCreated)
 	ws := h.WaitReadyWithin(limit, owner.Key, slug)
-	return &Workspace{Slug: slug, Remote: str(ws["hub_url"]), Owner: owner, Origin: o, Body: ws}
+	return &Workspace{Slug: slug, Remote: Str(ws["hub_url"]), Owner: owner, Origin: o, Body: ws}
 }
 
 // Register registers slug, owned by owner, from the origin o, with the
@@ -253,7 +253,7 @@ func (h *Hub) Fork(credential, parent string, permissions []string, extra map[st
 	r := h.Call(http.MethodPost, "/api/v1/workspaces/"+parent+"/forks", credential, body).Want(h.t, http.StatusCreated)
 	ws, _ := r.Body["workspace"].(map[string]any)
 	token, _ := r.Body["token"].(map[string]any)
-	return &Fork{Slug: str(ws["slug"]), Remote: str(r.Body["remote"]), Token: str(token["token"]), Body: r.Body}
+	return &Fork{Slug: Str(ws["slug"]), Remote: Str(r.Body["remote"]), Token: Str(token["token"]), Body: r.Body}
 }
 
 // PushToOrigin sends the hub's branch of ws to the workspace's origin, which

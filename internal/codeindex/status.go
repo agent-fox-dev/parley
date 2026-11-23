@@ -3,8 +3,9 @@ package codeindex
 import (
 	"context"
 	"net/http"
-	"time"
 	"unicode/utf8"
+
+	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/jobs"
@@ -123,7 +124,7 @@ func (c *Component) Status(ctx context.Context, ws Workspace) (Status, error) {
 	if rec.IndexedSHA != "" {
 		st.IndexedSHA, st.Partial, st.FilesIndexed = &rec.IndexedSHA, rec.Partial, rec.FilesIndexed
 		if rec.BuiltAt != nil {
-			st.BuiltAt = new(rec.BuiltAt.UTC().Format(time.RFC3339))
+			st.BuiltAt = new(timefmt.Format(*rec.BuiltAt))
 		}
 	}
 	if rec.Error != "" {

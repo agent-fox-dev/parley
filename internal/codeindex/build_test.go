@@ -137,7 +137,7 @@ func TestBuild_KeepsAPartialIndexWhenABoundStopsIt(t *testing.T) {
 
 			// The head stays, so the partial index is not built again.
 			w.queue(t, "demo")
-			eventually(t, "the queued build to end", func() bool { return len(w.jobs(t, "demo")) == 0 })
+			hubtest.Eventually(t, "the queued build to end", func() bool { return len(w.jobs(t, "demo")) == 0 })
 			if again := w.record(t, "demo"); !again.BuiltAt.Equal(*rec.BuiltAt) || w.builds(t)["partial"] != 1 {
 				t.Errorf("after one more queued build the record was built at %s and builds are %v; want %s and still one",
 					again.BuiltAt, w.builds(t), rec.BuiltAt)
@@ -172,7 +172,7 @@ func newClockedWorld(t *testing.T, s *seam) *clockedWorld {
 func (c *clockedWorld) noticed(t *testing.T, slug string, put map[string]string) string {
 	t.Helper()
 	sha := c.commit(t, slug, "main", put)
-	eventually(t, "the notice of the commit to queue a build of "+slug, func() bool {
+	hubtest.Eventually(t, "the notice of the commit to queue a build of "+slug, func() bool {
 		return slices.Contains(c.jobs(t, slug), jobs.StatusQueued)
 	})
 	return sha
@@ -184,7 +184,7 @@ func (c *clockedWorld) run(t *testing.T, slug string) {
 	if err := c.jobq.Pass(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, "the builds of "+slug+" to end", func() bool {
+	hubtest.Eventually(t, "the builds of "+slug+" to end", func() bool {
 		for _, status := range c.jobs(t, slug) {
 			if status == jobs.StatusRunning {
 				return false
@@ -287,7 +287,7 @@ func TestBuild_RunsAtMostTheConfiguredWorkersAtOnce(t *testing.T) {
 		}
 		return running, queued
 	}
-	eventually(t, "two builds to run and three to wait", func() bool { r, q := count(); return len(r) == 2 && q == 3 })
+	hubtest.Eventually(t, "two builds to run and three to wait", func() bool { r, q := count(); return len(r) == 2 && q == 3 })
 	// The queue passes again and again; no third build may begin.
 	time.Sleep(300 * time.Millisecond)
 	running, queued := count()
@@ -296,7 +296,7 @@ func TestBuild_RunsAtMostTheConfiguredWorkersAtOnce(t *testing.T) {
 	}
 
 	release[running[0]]()
-	eventually(t, "a third build to begin", func() bool {
+	hubtest.Eventually(t, "a third build to begin", func() bool {
 		r, q := count()
 		return len(r) == 2 && q == 2
 	})

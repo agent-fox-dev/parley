@@ -5,22 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
-
-// positive is s as a positive integer in decimal digits, and false for
-// anything else, such as 0, -1, +1 or 1.5.
-func positive(s string) (int64, bool) {
-	if s == "" || strings.Trim(s, "0123456789") != "" {
-		return 0, false
-	}
-	n, err := strconv.ParseInt(s, 10, 64)
-	return n, err == nil && n > 0
-}
 
 // confinedTo is the fork a request's token is bound to when it calls on the
 // fork's parent, where it reaches only the changes whose source is the
@@ -42,7 +31,7 @@ func confinedTo(r *http.Request) (string, bool) {
 // parent, a change whose source is not the fork.
 func (c *Component) changeOf(r *http.Request, q Querier) (Change, error) {
 	slug := server.Param(r, "slug")
-	number, ok := positive(server.Param(r, "number"))
+	number, ok := server.Positive(server.Param(r, "number"))
 	if !ok {
 		return Change{}, ErrChangeNotFound
 	}
@@ -115,7 +104,7 @@ func (c *Component) getVersion(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	raw := server.Param(r, "version")
-	number, ok := positive(raw)
+	number, ok := server.Positive(raw)
 	switch {
 	case raw == "latest":
 		number = ch.Version

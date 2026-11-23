@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
 )
@@ -189,7 +191,7 @@ func TestExec_KillsACommandThatOutlastsItsTimeout(t *testing.T) {
 			}
 			_, _, _, kills := h.cmds.counts()
 			answered := h.execing(context.Background(), id, body, nil)
-			eventually(t, "the command to wait", func() bool { _, _, waiting, _ := h.cmds.counts(); return waiting == 1 })
+			hubtest.Eventually(t, "the command to wait", func() bool { _, _, waiting, _ := h.cmds.counts(); return waiting == 1 })
 			h.clock.Advance(row.limit - time.Second)
 			select {
 			case a := <-answered:
@@ -297,7 +299,7 @@ func TestExec_KillsTheCommandWhenTheCallerLeavesOrTheHubStops(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	answered := h.execing(ctx, id, block, nil)
-	eventually(t, "the command to wait", func() bool { _, _, waiting, _ := h.cmds.counts(); return waiting == 1 })
+	hubtest.Eventually(t, "the command to wait", func() bool { _, _, waiting, _ := h.cmds.counts(); return waiting == 1 })
 	cancel()
 	left := time.Now()
 	for _, _, _, kills := h.cmds.counts(); kills != 1; _, _, _, kills = h.cmds.counts() {
@@ -315,7 +317,7 @@ func TestExec_KillsTheCommandWhenTheCallerLeavesOrTheHubStops(t *testing.T) {
 	}
 
 	answered = h.execing(context.Background(), id, block, nil)
-	eventually(t, "the command to wait", func() bool { _, _, waiting, _ := h.cmds.counts(); return waiting == 1 })
+	hubtest.Eventually(t, "the command to wait", func() bool { _, _, waiting, _ := h.cmds.counts(); return waiting == 1 })
 	h.Stop()
 	if code := h.ExitCode(t, 10*time.Second); code != 0 {
 		t.Fatalf("the hub stopped with %d, want 0", code)
@@ -339,7 +341,7 @@ func TestExec_RefusesACommandOverTheSandboxLimit(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	block := map[string]any{"command": []string{"block"}}
 	collected, streamed := h.execing(ctx, id, block, nil), h.execing(ctx, id, block, eventStream)
-	eventually(t, "both commands to wait", func() bool { _, _, waiting, _ := h.cmds.counts(); return waiting == 2 })
+	hubtest.Eventually(t, "both commands to wait", func() bool { _, _, waiting, _ := h.cmds.counts(); return waiting == 2 })
 	defer func() {
 		cancel()
 		<-collected
@@ -383,7 +385,7 @@ func TestExec_StopsCountingACommandOnceItEnded(t *testing.T) {
 	t.Run("beside the main process and a terminal", next)
 	// waitBlocked waits until a command of block waits.
 	waitBlocked := func(t *testing.T) {
-		eventually(t, "the command to wait", func() bool { _, _, waiting, _ := h.cmds.counts(); return waiting == 1 })
+		hubtest.Eventually(t, "the command to wait", func() bool { _, _, waiting, _ := h.cmds.counts(); return waiting == 1 })
 	}
 	for _, row := range []struct {
 		name string
@@ -407,7 +409,7 @@ func TestExec_StopsCountingACommandOnceItEnded(t *testing.T) {
 			<-answered
 			// The hub releases the place after the caller saw the
 			// connection end; ask until it has.
-			eventually(t, "an exec to be accepted", func() bool {
+			hubtest.Eventually(t, "an exec to be accepted", func() bool {
 				return h.exec(t, id, map[string]any{"command": []string{"true"}}, nil).status == http.StatusOK
 			})
 		}},
@@ -633,7 +635,7 @@ func TestExec_StreamKillsTheCommandWhenTheCallerLeavesOrTheHubStops(t *testing.T
 	}
 	// The one place of the sandbox is free again once the hub saw the
 	// caller leave.
-	eventually(t, "an exec to be accepted", func() bool {
+	hubtest.Eventually(t, "an exec to be accepted", func() bool {
 		return h.exec(t, id, map[string]any{"command": []string{"true"}}, nil).status == http.StatusOK
 	})
 

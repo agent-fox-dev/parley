@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"path"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -101,6 +102,17 @@ func MatchedRoute(r *http.Request) (Matched, bool) {
 func Param(r *http.Request, name string) string {
 	m, _ := MatchedRoute(r)
 	return m.Params[name]
+}
+
+// Positive is s as a positive integer in decimal digits, and false for
+// anything else, such as 0, -1, +1, 1.5 or a number beyond the range of
+// int64.
+func Positive(s string) (int64, bool) {
+	if s == "" || strings.Trim(s, "0123456789") != "" {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	return n, err == nil && n > 0
 }
 
 // Register adds rt to the REST API under /api/v1. It panics when the route

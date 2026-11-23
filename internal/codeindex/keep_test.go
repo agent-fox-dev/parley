@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+
+	"github.com/agent-fox-dev/parley/internal/hubtest"
 )
 
 func TestKeep_HasTheIndexAfterARestartWithoutBuildingIt(t *testing.T) {
@@ -157,7 +159,7 @@ func TestKeep_RemovesTheIndexOfAWorkspaceWhoseSettingIsTurnedOff(t *testing.T) {
 	s.waitBegan(t, held)
 	// One more waits beside the build that runs.
 	w.commit(t, "demo", "main", map[string]string{"c.go": "package a\n"})
-	eventually(t, "a build waiting beside the running one", func() bool { return len(w.jobs(t, "demo")) == 2 })
+	hubtest.Eventually(t, "a build waiting beside the running one", func() bool { return len(w.jobs(t, "demo")) == 2 })
 
 	status, body := w.Call(t, http.MethodPatch, "/api/v1/workspaces/demo", w.key, map[string]any{"settings": map[string]any{"code_index": false}})
 	if status != http.StatusOK {

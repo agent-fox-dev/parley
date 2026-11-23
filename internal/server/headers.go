@@ -2,11 +2,10 @@ package server
 
 import (
 	"context"
-	"crypto/rand"
-	"fmt"
 	"net/http"
 	"strings"
 	"time"
+	"uuid"
 )
 
 type requestIDKey struct{}
@@ -28,8 +27,8 @@ func (s *Server) stamp(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		id := r.Header.Get("X-Request-ID")
-		if !isUUID(id) {
-			id = newUUID()
+		if !IsUUID(id) {
+			id = uuid.NewV4().String()
 		}
 		h := w.Header()
 		h.Set("X-Request-ID", id)
@@ -57,9 +56,9 @@ func (s *Server) stamp(next http.Handler) http.Handler {
 	})
 }
 
-// isUUID reports whether v is a UUID in its 36-character hyphenated
+// IsUUID reports whether v is a UUID in its 36-character hyphenated
 // hexadecimal form, of any version and in either letter case.
-func isUUID(v string) bool {
+func IsUUID(v string) bool {
 	if len(v) != 36 {
 		return false
 	}
@@ -77,17 +76,6 @@ func isUUID(v string) bool {
 		}
 	}
 	return true
-}
-
-// newUUID returns a random (version 4) UUID in lower case.
-func newUUID() string {
-	var b [16]byte
-	// crypto/rand.Read never returns an error; it ends the program when the
-	// system's random source fails.
-	_, _ = rand.Read(b[:])
-	b[6] = b[6]&0x0f | 0x40
-	b[8] = b[8]&0x3f | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 // statusWriter records the status a handler answers with, for the access log

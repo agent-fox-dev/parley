@@ -80,7 +80,7 @@ func parseFilter(q url.Values) (filter, error) {
 	}
 	if q.Has("session_id") {
 		id := q.Get("session_id")
-		if !isUUID(id) {
+		if !server.IsUUID(id) {
 			return filter{}, server.InvalidRequest("session_id must be a UUID")
 		}
 		f.SessionID = strings.ToLower(id)

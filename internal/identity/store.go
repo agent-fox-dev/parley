@@ -10,6 +10,8 @@ import (
 	"time"
 	"uuid"
 
+	"github.com/agent-fox-dev/parley/internal/store"
+
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 
@@ -201,7 +203,7 @@ func IssueAPIKey(ctx context.Context, tx *sql.Tx, userID string, expiresDays int
 		rec.ExpiresAt = &at
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO api_keys (key_id, user_id, secret_hash, expires_days, expires_at, created_at)
-VALUES (?, ?, ?, ?, ?, ?)`, rec.KeyID, rec.UserID, rec.hash, rec.ExpiresDays, nanos(rec.ExpiresAt), rec.CreatedAt.UnixNano())
+VALUES (?, ?, ?, ?, ?, ?)`, rec.KeyID, rec.UserID, rec.hash, rec.ExpiresDays, store.Nanos(rec.ExpiresAt), rec.CreatedAt.UnixNano())
 	if err != nil {
 		return "", APIKey{}, fmt.Errorf("store an API key: %w", err)
 	}
@@ -268,7 +270,7 @@ func StorePAT(ctx context.Context, tx *sql.Tx, spec PATSpec) (string, PAT, error
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO pats (token_id, user_id, secret_hash, name, permissions, paths, workspace, expires_at, created_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, rec.TokenID, rec.UserID, rec.hash, rec.Name, string(perms), paths, workspace,
-		nanos(rec.ExpiresAt), rec.CreatedAt.UnixNano())
+		store.Nanos(rec.ExpiresAt), rec.CreatedAt.UnixNano())
 	if err != nil {
 		return "", PAT{}, fmt.Errorf("store a PAT: %w", err)
 	}
@@ -386,13 +388,6 @@ func nullTime(n sql.NullInt64) *time.Time {
 	}
 	t := fromNanos(n.Int64)
 	return &t
-}
-
-func nanos(t *time.Time) sql.NullInt64 {
-	if t == nil {
-		return sql.NullInt64{}
-	}
-	return sql.NullInt64{Int64: t.UnixNano(), Valid: true}
 }
 
 func utc(t *time.Time) *time.Time {

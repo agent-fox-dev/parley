@@ -51,14 +51,14 @@ type diffQuery struct {
 func readDiffQuery(q url.Values) (diffQuery, error) {
 	d := diffQuery{globs: q["path"], patches: true}
 	if q.Has("version") && q.Get("version") != "latest" {
-		n, ok := positive(q.Get("version"))
+		n, ok := server.Positive(q.Get("version"))
 		if !ok {
 			return d, server.InvalidRequest("version must be a positive integer or latest")
 		}
 		d.version = n
 	}
 	if q.Has("against") {
-		n, ok := positive(q.Get("against"))
+		n, ok := server.Positive(q.Get("against"))
 		if !ok {
 			return d, server.InvalidRequest("against must be a positive integer")
 		}

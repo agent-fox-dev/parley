@@ -105,6 +105,23 @@ func checkContentType(header, routeType string) error {
 	return nil
 }
 
+// DecodeOptionalJSON is DecodeJSON for a body that may be absent: no body,
+// or one of white space only, leaves v as it is.
+func DecodeOptionalJSON(r *http.Request, v any) error {
+	body, ok := bufferedBody(r)
+	if !ok {
+		var err error
+		if body, err = io.ReadAll(r.Body); err != nil {
+			return InvalidRequest("request body could not be read")
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return nil
+	}
+	return DecodeJSON(r, v)
+}
+
 // DecodeJSON decodes the body of r, which must be one JSON object, into v,
 // a pointer. Members v does not know are ignored. An empty body, a body that
 // is not valid JSON or not an object, or one with anything but white space
